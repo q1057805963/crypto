@@ -104,6 +104,7 @@ class AnomalyDetector:
         warmup_seconds: int,
         alert_cooldown_seconds: int,
         thresholds: dict,
+        symbol_thresholds: dict | None = None,
     ) -> None:
         self.windows = {symbol.upper(): SymbolWindow(window_seconds) for symbol in symbols}
         self.started_at = time()
@@ -111,6 +112,7 @@ class AnomalyDetector:
         self.warmup_seconds = warmup_seconds
         self.alert_cooldown_seconds = alert_cooldown_seconds
         self.thresholds = thresholds
+        self.symbol_thresholds: dict = symbol_thresholds or {}
         self.last_alert_at: dict[str, float] = {}
 
     def set_symbols(self, symbols: list[str]) -> None:
@@ -121,6 +123,12 @@ class AnomalyDetector:
             if symbol not in wanted:
                 del self.windows[symbol]
                 self.last_alert_at.pop(symbol, None)
+
+    def set_symbol_threshold(self, symbol: str, score: float) -> None:
+        self.symbol_thresholds[symbol.upper()] = {"anomaly_score": score}
+
+    def remove_symbol_threshold(self, symbol: str) -> None:
+        self.symbol_thresholds.pop(symbol.upper(), None)
 
     def update(self, trade: dict) -> AnomalyEvent | None:
         symbol = trade["symbol"].upper()
@@ -190,7 +198,13 @@ class AnomalyDetector:
         if not metrics or metrics["trade_count_1m"] < 3:
             return None
 
-        if metrics["score"] < float(self.thresholds.get("anomaly_score", 70)):
+        threshold = float(
+            self.symbol_thresholds.get(symbol, {}).get(
+                "anomaly_score",
+                self.thresholds.get("anomaly_score", 70),
+            )
+        )
+        if metrics["score"] < threshold:
             return None
 
         return AnomalyEvent(

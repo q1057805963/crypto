@@ -6,19 +6,33 @@ from monitor.anomaly import AnomalyEvent
 
 
 class TelegramAlert:
-    def __init__(self, enabled: bool, bot_token: str, chat_id: str) -> None:
-        self.enabled = enabled and bool(bot_token) and bool(chat_id)
+    def __init__(self, enabled: bool, bot_token: str, chat_ids: list[str]) -> None:
+        self.requested_enabled = bool(enabled)
         self.bot_token = bot_token
-        self.chat_id = chat_id
+        self.chat_ids = [cid.strip() for cid in chat_ids if cid.strip()]
+        self.enabled = self.requested_enabled and bool(bot_token) and len(self.chat_ids) > 0
 
     def send(self, event: AnomalyEvent) -> None:
         if not self.enabled:
             return
-
         text = self._format(event)
+        for chat_id in self.chat_ids:
+            self._send_to(chat_id, text)
+
+    def set_chat_ids(self, chat_ids: list[str]) -> None:
+        self.chat_ids = [cid.strip() for cid in chat_ids if cid.strip()]
+        self.enabled = self.requested_enabled and bool(self.bot_token) and len(self.chat_ids) > 0
+
+    def set_config(self, enabled: bool, bot_token: str, chat_ids: list[str]) -> None:
+        self.requested_enabled = bool(enabled)
+        self.bot_token = bot_token
+        self.chat_ids = [cid.strip() for cid in chat_ids if cid.strip()]
+        self.enabled = self.requested_enabled and bool(bot_token) and len(self.chat_ids) > 0
+
+    def _send_to(self, chat_id: str, text: str) -> None:
         payload = json.dumps(
             {
-                "chat_id": self.chat_id,
+                "chat_id": chat_id,
                 "text": text,
                 "disable_web_page_preview": True,
             }
@@ -28,12 +42,11 @@ class TelegramAlert:
             data=payload,
             headers={"Content-Type": "application/json"},
         )
-
         try:
             with urlopen(request, timeout=10):
                 return
         except Exception as exc:
-            logging.warning("Telegram alert failed: %s", exc)
+            logging.warning("Telegram alert to %s failed: %s", chat_id, exc)
 
     @staticmethod
     def _format(event: AnomalyEvent) -> str:

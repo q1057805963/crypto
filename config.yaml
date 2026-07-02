@@ -26,7 +26,19 @@ storage:
 telegram:
   enabled: false
   bot_token: ''
-  chat_id: ''
+  chat_ids: []
+symbol_thresholds: {}
+ai:
+  enabled: false
+  provider: anthropic
+  api_key: ''
+  model: deepseek-v4-pro
+  base_url: https://api.deepseek.com/anthropic
+  activation_threshold: 60
+  cache_ttl_seconds: 300
+  retry_cooldown_seconds: 120
+  request_timeout_seconds: 30
+  max_tokens: 500
 dashboard:
   enabled: true
   host: 127.0.0.1
