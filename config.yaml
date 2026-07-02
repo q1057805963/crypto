@@ -1,0 +1,38 @@
+exchange: binance_usdm
+data_source: rest
+rest_poll_interval_seconds: 5
+rest_per_symbol_delay_ms: 150
+oi_poll_interval_seconds: 30
+funding_poll_interval_seconds: 60
+symbols:
+- BNBUSDT
+- BTCUSDT
+- DOGEUSDT
+- ETHUSDT
+- SOLUSDT
+- XRPUSDT
+- HYPEUSDT
+window_seconds: 300
+warmup_seconds: 60
+alert_cooldown_seconds: 120
+storage:
+  enabled: true
+  path: data/monitor.db
+telegram:
+  enabled: false
+  bot_token: ''
+  chat_id: ''
+dashboard:
+  enabled: true
+  host: 127.0.0.1
+  port: 8765
+thresholds:
+  price_move_pct_1m: 0.8
+  price_move_pct_5m: 1.8
+  volume_multiplier: 3.0
+  taker_buy_ratio_high: 0.7
+  taker_buy_ratio_low: 0.3
+  min_quote_volume_1m: 500000
+  anomaly_score: 70
+  oi_change_pct_5m: 1.5
+  funding_rate_abs: 0.0005

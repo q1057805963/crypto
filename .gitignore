@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+data/
+monitor.out
+monitor.err
+monitor.log
+
+deploy/linux/crypto-futures-monitor.env
+

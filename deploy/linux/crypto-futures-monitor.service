@@ -1,0 +1,16 @@
+[Unit]
+Description=Crypto Futures Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/crypto-futures-monitor
+EnvironmentFile=/opt/crypto-futures-monitor/deploy/linux/crypto-futures-monitor.env
+ExecStart=/opt/crypto-futures-monitor/.venv/bin/python /opt/crypto-futures-monitor/main.py --config /opt/crypto-futures-monitor/config.yaml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
