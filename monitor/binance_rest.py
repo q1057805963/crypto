@@ -15,8 +15,10 @@ class BinanceFuturesTickerPoller:
         per_symbol_delay_ms: int,
         oi_poll_interval_seconds: float,
         funding_poll_interval_seconds: float,
+        microstructure_state=None,
     ) -> None:
         self._lock = threading.Lock()
+        self.microstructure_state = microstructure_state
         self.symbols: set[str] = set()
         self.poll_interval_seconds = poll_interval_seconds
         self.per_symbol_delay_seconds = max(per_symbol_delay_ms, 0) / 1000
@@ -129,7 +131,7 @@ class BinanceFuturesTickerPoller:
             "quote_volume_24h": quote_volume_24h,
         }
 
-        return {
+        trade = {
             "symbol": symbol,
             "event_time": event_time,
             "price": price,
@@ -140,3 +142,6 @@ class BinanceFuturesTickerPoller:
             "open_interest": self._open_interest.get(symbol, 0.0),
             "funding_rate": self._funding_rate.get(symbol, 0.0),
         }
+        if self.microstructure_state:
+            trade.update(self.microstructure_state.snapshot(symbol, event_time))
+        return trade

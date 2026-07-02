@@ -11,6 +11,7 @@ from monitor.anomaly import AnomalyDetector
 from monitor.binance_rest import BinanceFuturesTickerPoller
 from monitor.binance_ws import BinanceFuturesAggTradeStream
 from monitor.dashboard import DashboardServer, DashboardState
+from monitor.microstructure import BinanceFuturesMicrostructureStream, MarketMicrostructureState
 from monitor.storage import AlertStore
 from monitor.telegram import TelegramAlert
 
@@ -92,10 +93,26 @@ async def run(config: dict) -> None:
     store = None
     storage_config = config.get("storage", {})
     if storage_config.get("enabled", True):
-        store = AlertStore(str(storage_config.get("path", "data/monitor.db")))
+        store = AlertStore(
+            str(storage_config.get("path", "data/monitor.db")),
+            snapshot_interval_seconds=int(storage_config.get("snapshot_interval_seconds", 60)),
+        )
+
+    microstructure_config = config.get("microstructure", {})
+    microstructure_state = MarketMicrostructureState(config["symbols"])
+    microstructure_stream = None
+    if microstructure_config.get("enabled", True):
+        microstructure_stream = BinanceFuturesMicrostructureStream(
+            config["symbols"],
+            depth_levels=int(microstructure_config.get("depth_levels", 10)),
+            depth_interval=str(microstructure_config.get("depth_interval", "500ms")),
+        )
 
     if config.get("data_source", "rest") == "websocket":
-        stream = BinanceFuturesAggTradeStream(config["symbols"])
+        stream = BinanceFuturesAggTradeStream(
+            config["symbols"],
+            microstructure_state=microstructure_state,
+        )
     else:
         stream = BinanceFuturesTickerPoller(
             config["symbols"],
@@ -105,6 +122,7 @@ async def run(config: dict) -> None:
             funding_poll_interval_seconds=float(
                 config.get("funding_poll_interval_seconds", 60)
             ),
+            microstructure_state=microstructure_state,
         )
     dashboard_state = DashboardState(
         config["symbols"],
@@ -117,6 +135,9 @@ async def run(config: dict) -> None:
             config["symbols"] = symbols
             detector.set_symbols(symbols)
             stream.set_symbols(symbols)
+            microstructure_state.set_symbols(symbols)
+            if microstructure_stream:
+                microstructure_stream.set_symbols(symbols)
             dashboard_state.set_symbols(symbols)
             save_config(Path(config.get("_config_path", "config.yaml")), config)
 
@@ -135,17 +156,29 @@ async def run(config: dict) -> None:
         ", ".join(config["symbols"]),
         config.get("data_source", "rest"),
     )
-    async for trade in stream.listen():
-        event = detector.update(trade)
-        snapshot = detector.snapshot(trade["symbol"])
-        if snapshot:
-            dashboard_state.update_snapshot(snapshot)
-        if event:
-            alert.send(event)
-            telegram_alert.send(event)
-            if store:
-                store.record_event(event)
-            dashboard_state.add_event(event)
+    background_tasks = []
+    if microstructure_stream:
+        background_tasks.append(asyncio.create_task(microstructure_stream.run(microstructure_state)))
+
+    try:
+        async for trade in stream.listen():
+            event = detector.update(trade)
+            snapshot = detector.snapshot(trade["symbol"])
+            if snapshot:
+                dashboard_state.update_snapshot(snapshot)
+                if store:
+                    store.record_snapshot(snapshot)
+            if event:
+                alert.send(event)
+                telegram_alert.send(event)
+                if store:
+                    store.record_event(event)
+                dashboard_state.add_event(event)
+    finally:
+        for task in background_tasks:
+            task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
 
 
 def parse_args() -> argparse.Namespace:

@@ -46,5 +46,7 @@ class TelegramAlert:
             f"1分钟: {event.price_move_pct_1m:+.3f}% | 5分钟: {event.price_move_pct_5m:+.3f}%\n"
             f"1分钟成交额: {event.quote_volume_1m:,.0f} USDT\n"
             f"OI变化: {event.oi_change_pct_5m:+.3f}% | 资金费率: {event.funding_rate:.4%}\n"
+            f"多头爆仓1m: {event.long_liquidation_quote_1m:,.0f} | 空头爆仓1m: {event.short_liquidation_quote_1m:,.0f}\n"
+            f"点差: {event.spread_bps:.2f} bps | 深度下降: {event.depth_drop_pct_1m:.1f}%\n"
             f"\n触发原因:\n{reasons}\n\n观察建议:\n{suggestions}"
         )

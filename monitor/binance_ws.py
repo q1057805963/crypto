@@ -7,7 +7,8 @@ import websockets
 
 
 class BinanceFuturesAggTradeStream:
-    def __init__(self, symbols: list[str]) -> None:
+    def __init__(self, symbols: list[str], microstructure_state=None) -> None:
+        self.microstructure_state = microstructure_state
         self.set_symbols(symbols)
 
     def set_symbols(self, symbols: list[str]) -> None:
@@ -53,7 +54,7 @@ class BinanceFuturesAggTradeStream:
         is_buyer_maker = bool(data["m"])
         side = "sell" if is_buyer_maker else "buy"
 
-        return {
+        trade = {
             "symbol": data["s"],
             "event_time": data["E"] / 1000,
             "price": price,
@@ -62,3 +63,6 @@ class BinanceFuturesAggTradeStream:
             "side": side,
             "trade_id": data["a"],
         }
+        if self.microstructure_state:
+            trade.update(self.microstructure_state.snapshot(trade["symbol"], trade["event_time"]))
+        return trade

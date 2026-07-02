@@ -44,6 +44,14 @@ class DashboardState:
                 "open_interest": 0,
                 "oi_change_pct_5m": 0,
                 "funding_rate": 0,
+                "spread_bps": 0,
+                "depth_imbalance": 0,
+                "bid_depth_notional": 0,
+                "ask_depth_notional": 0,
+                "depth_drop_pct_1m": 0,
+                "long_liquidation_quote_1m": 0,
+                "short_liquidation_quote_1m": 0,
+                "liquidation_total_quote_1m": 0,
                 "risk_level": "低风险",
                 "bias": "观察：暂无明确方向",
                 "confidence": 0,
@@ -75,6 +83,14 @@ class DashboardState:
                         "open_interest": 0,
                         "oi_change_pct_5m": 0,
                         "funding_rate": 0,
+                        "spread_bps": 0,
+                        "depth_imbalance": 0,
+                        "bid_depth_notional": 0,
+                        "ask_depth_notional": 0,
+                        "depth_drop_pct_1m": 0,
+                        "long_liquidation_quote_1m": 0,
+                        "short_liquidation_quote_1m": 0,
+                        "liquidation_total_quote_1m": 0,
                         "risk_level": "低风险",
                         "bias": "观察：暂无明确方向",
                         "confidence": 0,
@@ -581,8 +597,8 @@ INDEX_HTML = """<!doctype html>
               <th>1分钟成交额</th>
               <th>放大倍数</th>
               <th>OI 5分钟</th>
-              <th>资金费率</th>
-              <th>主动买入</th>
+              <th>爆仓1m</th>
+              <th>点差</th>
             </tr>
           </thead>
           <tbody id="symbols"></tbody>
@@ -644,6 +660,12 @@ INDEX_HTML = """<!doctype html>
       return `<span class="${cls}">${number >= 0 ? "+" : ""}${number.toFixed(4)}%</span>`;
     }
 
+    function fmtBps(value) {
+      const number = Number(value || 0);
+      const cls = number >= 4 ? "down" : number >= 2 ? "mixed" : "muted";
+      return `<span class="${cls}">${number.toFixed(2)}</span>`;
+    }
+
     function riskClass(level) {
       if (level && level.includes("高")) return "risk-high";
       if (level && level.includes("中")) return "risk-mid";
@@ -673,6 +695,8 @@ INDEX_HTML = """<!doctype html>
       if (Math.abs(Number(symbol.price_move_pct_1m || 0)) >= 0.8) return "急动";
       if (Number(symbol.volume_multiplier || 0) >= 3) return "放量";
       if (Math.abs(Number(symbol.oi_change_pct_5m || 0)) >= 0.3) return "OI";
+      if (Number(symbol.liquidation_total_quote_1m || 0) >= 250000) return "爆仓";
+      if (Number(symbol.spread_bps || 0) >= 4 || Number(symbol.depth_drop_pct_1m || 0) >= 18) return "盘口";
       if (Math.abs(Number(symbol.funding_rate || 0)) >= 0.0005) return "费率";
       if (Number(symbol.score || 0) > 0) return "监测";
       return "静默";
@@ -708,8 +732,8 @@ INDEX_HTML = """<!doctype html>
           <td>${fmtNumber(symbol.quote_volume_1m, 0)}</td>
           <td class="${rowClass(symbol)}">${fmtNumber(symbol.volume_multiplier, 2)}x</td>
           <td>${fmtPct(symbol.oi_change_pct_5m)}</td>
-          <td>${fmtFunding(symbol.funding_rate)}</td>
-          <td>${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%</td>
+          <td>${fmtNumber(symbol.liquidation_total_quote_1m, 0)}</td>
+          <td>${fmtBps(symbol.spread_bps)}</td>
         </tr>
       `).join("");
 
@@ -746,6 +770,14 @@ INDEX_HTML = """<!doctype html>
           <div class="metric"><div class="metric-label">量能倍数</div><div class="metric-value ${rowClass(symbol)}">${fmtNumber(symbol.volume_multiplier, 2)}x</div></div>
           <div class="metric"><div class="metric-label">OI 5分钟</div><div class="metric-value">${fmtPct(symbol.oi_change_pct_5m)}</div></div>
           <div class="metric"><div class="metric-label">资金费率</div><div class="metric-value">${fmtFunding(symbol.funding_rate)}</div></div>
+          <div class="metric"><div class="metric-label">多头爆仓 1m</div><div class="metric-value">${fmtNumber(symbol.long_liquidation_quote_1m, 0)}</div></div>
+          <div class="metric"><div class="metric-label">空头爆仓 1m</div><div class="metric-value">${fmtNumber(symbol.short_liquidation_quote_1m, 0)}</div></div>
+          <div class="metric"><div class="metric-label">盘口点差</div><div class="metric-value">${fmtBps(symbol.spread_bps)} bps</div></div>
+          <div class="metric"><div class="metric-label">盘口深度下降</div><div class="metric-value">${fmtNumber(symbol.depth_drop_pct_1m, 1)}%</div></div>
+          <div class="metric"><div class="metric-label">买盘深度</div><div class="metric-value">${fmtNumber(symbol.bid_depth_notional, 0)}</div></div>
+          <div class="metric"><div class="metric-label">卖盘深度</div><div class="metric-value">${fmtNumber(symbol.ask_depth_notional, 0)}</div></div>
+          <div class="metric"><div class="metric-label">盘口失衡</div><div class="metric-value">${fmtNumber(Number(symbol.depth_imbalance || 0) * 100, 1)}%</div></div>
+          <div class="metric"><div class="metric-label">主动买入</div><div class="metric-value">${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%</div></div>
         </div>
         <div class="detail-block">
           <div class="detail-title">触发原因</div>

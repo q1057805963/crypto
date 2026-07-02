@@ -17,6 +17,14 @@ class AnomalyEvent:
     open_interest: float
     oi_change_pct_5m: float
     funding_rate: float
+    spread_bps: float
+    depth_imbalance: float
+    bid_depth_notional: float
+    ask_depth_notional: float
+    depth_drop_pct_1m: float
+    long_liquidation_quote_1m: float
+    short_liquidation_quote_1m: float
+    liquidation_total_quote_1m: float
     risk_level: str
     bias: str
     confidence: float
@@ -40,6 +48,14 @@ class SymbolSnapshot:
     open_interest: float
     oi_change_pct_5m: float
     funding_rate: float
+    spread_bps: float
+    depth_imbalance: float
+    bid_depth_notional: float
+    ask_depth_notional: float
+    depth_drop_pct_1m: float
+    long_liquidation_quote_1m: float
+    short_liquidation_quote_1m: float
+    liquidation_total_quote_1m: float
     risk_level: str
     bias: str
     confidence: float
@@ -154,6 +170,14 @@ class AnomalyDetector:
             open_interest=round(metrics["open_interest"], 4),
             oi_change_pct_5m=round(metrics["oi_change_pct_5m"], 3),
             funding_rate=round(metrics["funding_rate"], 8),
+            spread_bps=round(metrics["spread_bps"], 3),
+            depth_imbalance=round(metrics["depth_imbalance"], 3),
+            bid_depth_notional=round(metrics["bid_depth_notional"], 2),
+            ask_depth_notional=round(metrics["ask_depth_notional"], 2),
+            depth_drop_pct_1m=round(metrics["depth_drop_pct_1m"], 3),
+            long_liquidation_quote_1m=round(metrics["long_liquidation_quote_1m"], 2),
+            short_liquidation_quote_1m=round(metrics["short_liquidation_quote_1m"], 2),
+            liquidation_total_quote_1m=round(metrics["liquidation_total_quote_1m"], 2),
             risk_level=metrics["risk_level"],
             bias=metrics["bias"],
             confidence=round(metrics["confidence"], 1),
@@ -182,6 +206,14 @@ class AnomalyDetector:
             open_interest=round(metrics["open_interest"], 4),
             oi_change_pct_5m=round(metrics["oi_change_pct_5m"], 3),
             funding_rate=round(metrics["funding_rate"], 8),
+            spread_bps=round(metrics["spread_bps"], 3),
+            depth_imbalance=round(metrics["depth_imbalance"], 3),
+            bid_depth_notional=round(metrics["bid_depth_notional"], 2),
+            ask_depth_notional=round(metrics["ask_depth_notional"], 2),
+            depth_drop_pct_1m=round(metrics["depth_drop_pct_1m"], 3),
+            long_liquidation_quote_1m=round(metrics["long_liquidation_quote_1m"], 2),
+            short_liquidation_quote_1m=round(metrics["short_liquidation_quote_1m"], 2),
+            liquidation_total_quote_1m=round(metrics["liquidation_total_quote_1m"], 2),
             risk_level=metrics["risk_level"],
             bias=metrics["bias"],
             confidence=round(metrics["confidence"], 1),
@@ -203,6 +235,14 @@ class AnomalyDetector:
         open_interest_5m_ago = window.first_value_since(now, self.window_seconds, "open_interest")
         oi_change_pct_5m = self._pct_change(open_interest_5m_ago, open_interest)
         funding_rate = float(trades_1m[-1].get("funding_rate") or 0)
+        spread_bps = float(trades_1m[-1].get("spread_bps") or 0)
+        depth_imbalance = float(trades_1m[-1].get("depth_imbalance") or 0)
+        bid_depth_notional = float(trades_1m[-1].get("bid_depth_notional") or 0)
+        ask_depth_notional = float(trades_1m[-1].get("ask_depth_notional") or 0)
+        depth_drop_pct_1m = float(trades_1m[-1].get("depth_drop_pct_1m") or 0)
+        long_liquidation_quote_1m = float(trades_1m[-1].get("long_liquidation_quote_1m") or 0)
+        short_liquidation_quote_1m = float(trades_1m[-1].get("short_liquidation_quote_1m") or 0)
+        liquidation_total_quote_1m = float(trades_1m[-1].get("liquidation_total_quote_1m") or 0)
 
         quote_volume_1m = sum(trade["quote_quantity"] for trade in trades_1m)
         quote_volume_window = sum(trade["quote_quantity"] for trade in window.trades)
@@ -224,11 +264,32 @@ class AnomalyDetector:
             taker_buy_ratio=taker_buy_ratio,
             oi_change_pct_5m=oi_change_pct_5m,
             funding_rate=funding_rate,
+            spread_bps=spread_bps,
+            depth_imbalance=depth_imbalance,
+            depth_drop_pct_1m=depth_drop_pct_1m,
+            long_liquidation_quote_1m=long_liquidation_quote_1m,
+            short_liquidation_quote_1m=short_liquidation_quote_1m,
         )
         direction = self._direction(price_move_pct_1m, buy_volume_1m, sell_volume_1m)
-        bias = self._bias(direction, price_move_pct_5m, oi_change_pct_5m, funding_rate)
+        bias = self._bias(
+            direction,
+            price_move_pct_5m,
+            oi_change_pct_5m,
+            funding_rate,
+            long_liquidation_quote_1m,
+            short_liquidation_quote_1m,
+            spread_bps,
+            depth_drop_pct_1m,
+        )
         risk_level = self._risk_level(score)
-        confidence = self._confidence(score, open_interest, funding_rate, reasons)
+        confidence = self._confidence(
+            score,
+            open_interest,
+            funding_rate,
+            reasons,
+            liquidation_total_quote_1m,
+            spread_bps,
+        )
         suggestions = self._suggestions(
             bias=bias,
             direction=direction,
@@ -237,6 +298,10 @@ class AnomalyDetector:
             volume_multiplier=volume_multiplier,
             oi_change_pct_5m=oi_change_pct_5m,
             funding_rate=funding_rate,
+            depth_drop_pct_1m=depth_drop_pct_1m,
+            long_liquidation_quote_1m=long_liquidation_quote_1m,
+            short_liquidation_quote_1m=short_liquidation_quote_1m,
+            spread_bps=spread_bps,
         )
 
         return {
@@ -254,6 +319,14 @@ class AnomalyDetector:
             "open_interest": open_interest,
             "oi_change_pct_5m": oi_change_pct_5m,
             "funding_rate": funding_rate,
+            "spread_bps": spread_bps,
+            "depth_imbalance": depth_imbalance,
+            "bid_depth_notional": bid_depth_notional,
+            "ask_depth_notional": ask_depth_notional,
+            "depth_drop_pct_1m": depth_drop_pct_1m,
+            "long_liquidation_quote_1m": long_liquidation_quote_1m,
+            "short_liquidation_quote_1m": short_liquidation_quote_1m,
+            "liquidation_total_quote_1m": liquidation_total_quote_1m,
             "risk_level": risk_level,
             "bias": bias,
             "confidence": confidence,
@@ -270,6 +343,11 @@ class AnomalyDetector:
         taker_buy_ratio: float,
         oi_change_pct_5m: float,
         funding_rate: float,
+        spread_bps: float,
+        depth_imbalance: float,
+        depth_drop_pct_1m: float,
+        long_liquidation_quote_1m: float,
+        short_liquidation_quote_1m: float,
     ) -> tuple[float, list[str]]:
         reasons = []
         score = 0.0
@@ -284,6 +362,10 @@ class AnomalyDetector:
         buy_ratio_low = float(self.thresholds.get("taker_buy_ratio_low", 0.3))
         oi_threshold = float(self.thresholds.get("oi_change_pct_5m", 1.5))
         funding_threshold = float(self.thresholds.get("funding_rate_abs", 0.0005))
+        liquidation_threshold = float(self.thresholds.get("liquidation_quote_1m", 250000))
+        spread_threshold = float(self.thresholds.get("spread_bps", 4.0))
+        depth_imbalance_threshold = float(self.thresholds.get("depth_imbalance_abs", 0.18))
+        depth_drop_threshold = float(self.thresholds.get("depth_drop_pct_1m", 18.0))
 
         if abs(price_move_pct_1m) >= price_1m_threshold:
             score += min(abs(price_move_pct_1m) / price_1m_threshold * 24, 24) * liquidity_factor
@@ -312,6 +394,31 @@ class AnomalyDetector:
             score += min(abs(funding_rate) / funding_threshold * 6, 6)
             side = "偏多拥挤" if funding_rate > 0 else "偏空拥挤"
             reasons.append(f"资金费率{side} {funding_rate:.4%}")
+
+        liquidation_total_quote_1m = long_liquidation_quote_1m + short_liquidation_quote_1m
+        if liquidation_total_quote_1m >= liquidation_threshold:
+            score += min(liquidation_total_quote_1m / liquidation_threshold * 16, 16)
+            if long_liquidation_quote_1m > short_liquidation_quote_1m * 1.2:
+                reasons.append(f"多头爆仓放大 {long_liquidation_quote_1m:,.0f} USDT")
+            elif short_liquidation_quote_1m > long_liquidation_quote_1m * 1.2:
+                reasons.append(f"空头爆仓放大 {short_liquidation_quote_1m:,.0f} USDT")
+            else:
+                reasons.append(f"双向爆仓放大 {liquidation_total_quote_1m:,.0f} USDT")
+
+        if spread_bps >= spread_threshold:
+            score += min(spread_bps / spread_threshold * 8, 8)
+            reasons.append(f"盘口点差扩大 {spread_bps:.2f} bps")
+
+        if abs(depth_imbalance) >= depth_imbalance_threshold:
+            score += min(abs(depth_imbalance) / depth_imbalance_threshold * 6, 6)
+            if depth_imbalance > 0:
+                reasons.append(f"买盘深度占优 {depth_imbalance:+.2f}")
+            else:
+                reasons.append(f"卖盘深度占优 {depth_imbalance:+.2f}")
+
+        if depth_drop_pct_1m >= depth_drop_threshold:
+            score += min(depth_drop_pct_1m / depth_drop_threshold * 12, 12)
+            reasons.append(f"盘口深度下降 {depth_drop_pct_1m:.1f}%")
 
         if quote_volume_1m < min_quote_volume_1m:
             reasons.append("1分钟成交额偏低，信号降权")
@@ -348,7 +455,17 @@ class AnomalyDetector:
         price_move_pct_5m: float,
         oi_change_pct_5m: float,
         funding_rate: float,
+        long_liquidation_quote_1m: float,
+        short_liquidation_quote_1m: float,
+        spread_bps: float,
+        depth_drop_pct_1m: float,
     ) -> str:
+        if depth_drop_pct_1m >= 20 and spread_bps >= 4:
+            return "插针风险：盘口明显变薄"
+        if direction == "up" and short_liquidation_quote_1m > max(long_liquidation_quote_1m * 1.2, 0):
+            return "偏多：疑似空头回补/逼空"
+        if direction == "down" and long_liquidation_quote_1m > max(short_liquidation_quote_1m * 1.2, 0):
+            return "偏空：疑似多头踩踏"
         if direction == "up" and oi_change_pct_5m >= 0.3:
             return "偏多：疑似新增资金推动"
         if direction == "down" and oi_change_pct_5m >= 0.3:
@@ -369,12 +486,18 @@ class AnomalyDetector:
         open_interest: float,
         funding_rate: float,
         reasons: list[str],
+        liquidation_total_quote_1m: float,
+        spread_bps: float,
     ) -> float:
         confidence = 25 + min(score * 0.55, 55) + min(len(reasons) * 4, 12)
         if open_interest:
             confidence += 5
         if funding_rate:
             confidence += 3
+        if liquidation_total_quote_1m:
+            confidence += 4
+        if spread_bps:
+            confidence += 2
         return min(confidence, 95)
 
     @staticmethod
@@ -386,6 +509,10 @@ class AnomalyDetector:
         volume_multiplier: float,
         oi_change_pct_5m: float,
         funding_rate: float,
+        depth_drop_pct_1m: float,
+        long_liquidation_quote_1m: float,
+        short_liquidation_quote_1m: float,
+        spread_bps: float,
     ) -> list[str]:
         suggestions = []
 
@@ -406,6 +533,14 @@ class AnomalyDetector:
 
         if abs(funding_rate) >= 0.0005:
             suggestions.append("资金费率偏离，说明多空拥挤，注意反向清算或插针")
+
+        if long_liquidation_quote_1m > short_liquidation_quote_1m * 1.2 and long_liquidation_quote_1m > 0:
+            suggestions.append("多头爆仓占优，留意是否出现被动砸盘后的超跌反弹")
+        elif short_liquidation_quote_1m > long_liquidation_quote_1m * 1.2 and short_liquidation_quote_1m > 0:
+            suggestions.append("空头爆仓占优，若价格仍能站稳，逼空延续概率会更高")
+
+        if depth_drop_pct_1m >= 18 or spread_bps >= 4:
+            suggestions.append("盘口正在变薄，追单前先确认点差和挂单深度是否恢复")
 
         if abs(price_move_pct_1m) >= 1 and abs(price_move_pct_5m) >= 2:
             suggestions.append("短周期波动已经较大，若参与需降低仓位并预设失效位置")

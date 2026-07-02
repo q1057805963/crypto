@@ -6,7 +6,7 @@ Deployment and Telegram guide:
 
 - [docs/DEPLOY.md](/C:/Users/Admin/Documents/Codex/2026-07-02/wo-x/outputs/crypto-futures-monitor/docs/DEPLOY.md)
 
-这个版本先做一件事：读取 Binance Futures 公开行情，监控配置里的 USDT 永续合约，按 1 分钟和 5 分钟滚动窗口计算价格、成交量、主动买卖失衡，并在控制台和本地 UI 输出异常提醒。
+这个版本会读取 Binance Futures 公开行情和微结构信号，监控配置里的 USDT 永续合约，按滚动窗口计算价格、成交量、持仓量、爆仓和盘口变化，并在控制台、Telegram 和本地 UI 输出异常提醒。
 
 ## 安装
 
@@ -50,11 +50,15 @@ BTC, ETH, SOL
 - `data_source`: 数据源，`rest` 为 REST 轮询，`websocket` 为 Binance 推送流
 - `rest_poll_interval_seconds`: REST 轮询间隔
 - `rest_per_symbol_delay_ms`: REST 模式下，每个合约请求之间的间隔
+- `oi_poll_interval_seconds`: OI 拉取间隔
+- `funding_poll_interval_seconds`: 资金费率拉取间隔
+- `microstructure`: 爆仓流和盘口深度配置
 - `window_seconds`: 长窗口，默认 300 秒
 - `warmup_seconds`: 启动后先收集数据的时间
 - `alert_cooldown_seconds`: 同一合约重复报警间隔
 - `thresholds`: 异常判断阈值
 - `dashboard`: 本地 Web 面板配置，可调整端口或关闭
+- `storage.snapshot_interval_seconds`: SQLite 快照落库间隔
 
 ## 当前异常逻辑
 
@@ -64,6 +68,12 @@ BTC, ETH, SOL
 - 5 分钟价格涨跌幅
 - 1 分钟成交额相对近 5 分钟均值的放大倍数
 - 1 分钟主动买入 / 主动卖出比例
+- OI 5 分钟变化
+- 资金费率偏离
+- 1 分钟爆仓总额
+- 盘口点差扩大
+- 盘口深度下降
+- 买卖盘深度失衡
 - 最低 1 分钟成交额过滤，避免小额噪音
 
 当前默认使用 REST 轮询源，适合本机网络对 Binance WebSocket 推送不稳定的情况。切换到 `data_source: websocket` 后，主动买卖比例会更接近真实逐笔成交。
@@ -78,6 +88,8 @@ BTC, ETH, SOL
 - `资金费率`: 多空拥挤度参考。正值偏多拥挤，负值偏空拥挤；极端值要警惕反向清算或插针。
 - `风险`: 根据价格、成交额、主动方向、OI、资金费率综合分层。
 - `倾向`: 对当前异动的简短交易语义解释，例如“偏多：疑似新增资金推动”。
+- `爆仓1m`: 最近 1 分钟的爆仓总额，能帮助识别踩踏和逼空。
+- `点差`: 盘口最优买卖价之间的差异，过大通常意味着流动性变差。
 
 ## 专业化能力
 
@@ -88,6 +100,8 @@ BTC, ETH, SOL
 - 置信度：根据触发原因数量和数据完整度估算
 - 观察建议：给出下一步应该看什么，而不是直接给买卖建议
 - 报警复盘：默认保存到 `data/monitor.db`
+- 历史快照：默认保存 `signal_snapshots`，便于后续做复盘和阈值优化
+- 微结构信号：爆仓流、轻量盘口深度、点差、深度失衡
 - Telegram 推送：配置后自动发送异常提醒
 
 ## Telegram 推送
@@ -224,6 +238,7 @@ REST 模式只适合监控少量自选合约，不建议高频全市场扫描。
 - 默认 5 秒一轮
 - 每个合约请求之间默认间隔 150ms
 - 用 `quoteVolume` 差值估算窗口成交额
+- 爆仓流和盘口深度走独立 WebSocket 辅助流
 
 推荐：
 
@@ -237,8 +252,7 @@ REST 模式只适合监控少量自选合约，不建议高频全市场扫描。
 
 ## 下一步
 
-- 接入持仓量 Open Interest
-- 接入爆仓流
-- 接入盘口深度变化
-- 加 SQLite 保存历史信号
-- 加 Telegram 或企业微信推送
+- 加报警结果回写，统计 5m/15m/1h 后续表现
+- 增加全市场候选池扫描，把潜在异动币自动加入观察池
+- 把 REST 主行情逐步切换为更完整的 WebSocket 实时流
+- 增加深度异常和爆仓链路的单独开关与阈值调参界面
