@@ -243,10 +243,14 @@ INDEX_HTML = """<!doctype html>
     * { box-sizing: border-box; }
     body {
       margin: 0;
+      height: 100vh;
       background: var(--bg);
       color: var(--text);
+      display: flex;
+      flex-direction: column;
       font-family: Inter, "Segoe UI", Arial, sans-serif;
       letter-spacing: 0;
+      overflow: hidden;
     }
 
     header {
@@ -323,16 +327,26 @@ INDEX_HTML = """<!doctype html>
     main {
       display: grid;
       grid-template-columns: minmax(0, 1fr) 380px;
+      grid-template-rows: minmax(0, 1fr);
       gap: 18px;
+      flex: 1;
+      min-height: 0;
+      overflow: hidden;
       padding: 18px;
     }
 
     section {
       min-width: 0;
+      min-height: 0;
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
       overflow: hidden;
+    }
+
+    .market {
+      display: flex;
+      flex-direction: column;
     }
 
     .section-title {
@@ -376,7 +390,11 @@ INDEX_HTML = """<!doctype html>
       background: rgba(100, 168, 255, .05);
     }
     tbody tr.selected {
-      background: rgba(100, 168, 255, .08);
+      background: rgba(100, 168, 255, .14);
+      box-shadow: inset 3px 0 0 var(--blue);
+    }
+    tbody tr.selected td {
+      background: rgba(100, 168, 255, .03);
     }
     .symbol { font-weight: 700; }
     .cell-sub {
@@ -435,6 +453,13 @@ INDEX_HTML = """<!doctype html>
     .events {
       display: flex;
       flex-direction: column;
+      height: 100%;
+    }
+
+    .side-scroll {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: auto;
     }
 
     .detail {
@@ -455,8 +480,28 @@ INDEX_HTML = """<!doctype html>
       font-weight: 750;
     }
 
+    .detail-meta {
+      min-width: 0;
+    }
+
+    .detail-price-wrap {
+      margin-top: 10px;
+    }
+
+    .detail-price-label {
+      color: var(--muted);
+      font-size: 11px;
+      margin-bottom: 4px;
+    }
+
+    .detail-price {
+      font-size: 24px;
+      font-weight: 750;
+      line-height: 1.1;
+    }
+
     .detail-bias {
-      margin-top: 4px;
+      margin-top: 8px;
       color: var(--muted);
       font-size: 12px;
       line-height: 1.45;
@@ -511,8 +556,13 @@ INDEX_HTML = """<!doctype html>
     }
 
     .event-list {
+      min-height: 0;
+    }
+
+    .table-wrap {
+      flex: 1 1 auto;
+      min-height: 0;
       overflow: auto;
-      max-height: calc(100vh - 520px);
     }
 
     .event {
@@ -551,8 +601,14 @@ INDEX_HTML = """<!doctype html>
     }
 
     @media (max-width: 980px) {
-      main { grid-template-columns: 1fr; }
-      .event-list { max-height: none; }
+      body { overflow: auto; }
+      main {
+        grid-template-columns: 1fr;
+        overflow: visible;
+      }
+      .events {
+        height: auto;
+      }
     }
 
     @media (max-width: 720px) {
@@ -562,7 +618,6 @@ INDEX_HTML = """<!doctype html>
       }
       main { padding: 10px; }
       section { border-radius: 6px; }
-      .table-wrap { overflow-x: auto; }
       table { min-width: 1080px; }
     }
   </style>
@@ -578,7 +633,7 @@ INDEX_HTML = """<!doctype html>
   </header>
 
   <main>
-    <section>
+    <section class="market">
       <div class="section-title">
         <span>USDT 永续合约</span>
         <span id="count">0 个合约</span>
@@ -611,12 +666,14 @@ INDEX_HTML = """<!doctype html>
         <span>合约详情</span>
         <span id="source-label">REST</span>
       </div>
-      <div class="detail" id="detail"></div>
-      <div class="section-title">
-        <span>最近报警</span>
-        <span id="alert-count">0</span>
+      <div class="side-scroll" id="side-scroll">
+        <div class="detail" id="detail"></div>
+        <div class="section-title">
+          <span>最近报警</span>
+          <span id="alert-count">0</span>
+        </div>
+        <div class="event-list" id="events"></div>
       </div>
-      <div class="event-list" id="events"></div>
     </section>
   </main>
 
@@ -709,6 +766,13 @@ INDEX_HTML = """<!doctype html>
       return "muted";
     }
 
+    function valueClass(value) {
+      const number = Number(value || 0);
+      if (number > 0) return "up";
+      if (number < 0) return "down";
+      return "muted";
+    }
+
     function renderSymbols(symbols) {
       countEl.textContent = `${symbols.length} 个合约`;
       if (!selectedSymbol && symbols.length) {
@@ -757,8 +821,12 @@ INDEX_HTML = """<!doctype html>
       const suggestions = (symbol.suggestions || []).length ? symbol.suggestions : ["保持观察，等待价格、量能或 OI 形成共振"];
       detailEl.innerHTML = `
         <div class="detail-head">
-          <div>
+          <div class="detail-meta">
             <div class="detail-symbol">${symbol.symbol}</div>
+            <div class="detail-price-wrap">
+              <div class="detail-price-label">当前价格</div>
+              <div class="detail-price ${valueClass(symbol.price_move_pct_1m)}">${fmtNumber(symbol.price, 8)}</div>
+            </div>
             <div class="detail-bias">${symbol.bias || "观察：暂无明确方向"}</div>
           </div>
           <span class="score">${fmtNumber(symbol.score, 1)}</span>
