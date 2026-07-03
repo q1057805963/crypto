@@ -1336,6 +1336,46 @@ INDEX_HTML = """<!doctype html>
       display: none;
     }
 
+    .metric-summary {
+      display: none;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+      margin-top: 2px;
+    }
+
+    .collapsible.collapsed .metric-summary {
+      display: grid;
+    }
+
+    .summary-chip {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      height: 30px;
+      padding: 0 9px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: rgba(255, 255, 255, .02);
+      font-size: 12px;
+    }
+
+    .summary-label {
+      min-width: 0;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .summary-value {
+      flex: 0 0 auto;
+      color: var(--text);
+      font-weight: 750;
+      white-space: nowrap;
+    }
+
     .section-title.collapsible-title {
       padding: 12px 16px;
     }
@@ -2565,6 +2605,27 @@ INDEX_HTML = """<!doctype html>
       updateCollapseButton(eventsCollapseBtn, collapsed);
     }
 
+    function renderMetricSummary(symbol) {
+      const items = [
+        ["风险", `<span class="${riskClass(symbol.risk_level)}">${esc(symbol.risk_level || "低风险")}</span>`],
+        ["置信度", `${fmtNumber(symbol.confidence, 1)}%`],
+        ["1m成交额", fmtNumber(symbol.quote_volume_1m, 0)],
+        ["量能", `<span class="${rowClass(symbol)}">${fmtNumber(symbol.volume_multiplier, 2)}x</span>`],
+        ["OI 5m", fmtPct(symbol.oi_change_pct_5m)],
+        ["爆仓", `<span class="${liquidationStatusClass(symbol)}">${liquidationStatusText(symbol)}</span>`]
+      ];
+      return `
+        <div class="metric-summary">
+          ${items.map(([label, value]) => `
+            <div class="summary-chip">
+              <span class="summary-label">${esc(label)}</span>
+              <span class="summary-value">${value}</span>
+            </div>
+          `).join("")}
+        </div>
+      `;
+    }
+
     function renderSymbols(symbols) {
       lastSymbols = symbols || [];
       countEl.textContent = `${symbols.length} 个合约`;
@@ -2640,7 +2701,8 @@ INDEX_HTML = """<!doctype html>
           <span class="score">${fmtNumber(symbol.score, 1)}</span>
         </div>
         <div class="detail-block collapsible${collapseClass("detail_metrics")}">
-          <div class="collapse-bar">${collapseHead("detail_metrics", "核心指标", "17项")}</div>
+          <div class="collapse-bar">${collapseHead("detail_metrics", "核心指标", "折叠显示6项 / 展开17项")}</div>
+          ${renderMetricSummary(symbol)}
           <div class="collapsible-body">
             <div class="metric-grid">
               <div class="metric"><div class="metric-label">风险</div><div class="metric-value ${riskClass(symbol.risk_level)}">${esc(symbol.risk_level || "低风险")}</div></div>
