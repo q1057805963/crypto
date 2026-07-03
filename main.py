@@ -17,6 +17,7 @@ from monitor.microstructure import BinanceFuturesMicrostructureStream, MarketMic
 from monitor.okx_rest import OkxSwapTickerPoller
 from monitor.storage import AlertStore
 from monitor.telegram import TelegramAlert, normalize_telegram_users
+from monitor.telegram_bot import TelegramBotResponder
 from monitor.user_config import UserConfigStore
 
 
@@ -70,6 +71,7 @@ def apply_env_overrides(config: dict) -> dict:
     ai = dict(config.get("ai", {}))
     auth = dict(config.get("auth", {}))
     microstructure = dict(config.get("microstructure", {}))
+    telegram_bot = dict(config.get("telegram_bot", {}))
 
     if "CFM_EXCHANGE" in os.environ:
         config["exchange"] = os.environ["CFM_EXCHANGE"]
@@ -144,6 +146,24 @@ def apply_env_overrides(config: dict) -> dict:
             os.environ["CFM_REST_LIQUIDATION_POLL_INTERVAL_SECONDS"]
         )
 
+    if "CFM_TELEGRAM_BOT_RESPONDER_ENABLED" in os.environ:
+        telegram_bot["enabled"] = _env_flag(
+            "CFM_TELEGRAM_BOT_RESPONDER_ENABLED",
+            bool(telegram_bot.get("enabled", True)),
+        )
+    if "CFM_TELEGRAM_BOT_POLL_INTERVAL_SECONDS" in os.environ:
+        telegram_bot["poll_interval_seconds"] = float(
+            os.environ["CFM_TELEGRAM_BOT_POLL_INTERVAL_SECONDS"]
+        )
+    if "CFM_TELEGRAM_BOT_REQUEST_TIMEOUT_SECONDS" in os.environ:
+        telegram_bot["request_timeout_seconds"] = int(
+            os.environ["CFM_TELEGRAM_BOT_REQUEST_TIMEOUT_SECONDS"]
+        )
+    if "CFM_TELEGRAM_BOT_AI_COOLDOWN_SECONDS" in os.environ:
+        telegram_bot["ai_cooldown_seconds"] = int(
+            os.environ["CFM_TELEGRAM_BOT_AI_COOLDOWN_SECONDS"]
+        )
+
     ai_key = os.environ.get("CFM_AI_API_KEY")
     if ai_key is None:
         ai_key = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
@@ -194,6 +214,7 @@ def apply_env_overrides(config: dict) -> dict:
     config["ai"] = ai
     config["auth"] = auth
     config["microstructure"] = microstructure
+    config["telegram_bot"] = telegram_bot
     return config
 
 
@@ -331,6 +352,7 @@ async def run(config: dict) -> None:
         exchange=exchange,
     )
 
+    dashboard = None
     dashboard_config = config.get("dashboard", {})
     if dashboard_config.get("enabled", True):
         def apply_user_runtime_config() -> None:
@@ -388,6 +410,29 @@ async def run(config: dict) -> None:
     background_tasks = []
     if microstructure_stream:
         background_tasks.append(asyncio.create_task(microstructure_stream.run(microstructure_state)))
+
+    telegram_bot_config = config.get("telegram_bot", {})
+    if telegram_bot_config.get("enabled", True):
+        def telegram_bot_users() -> list[dict]:
+            if user_store:
+                return user_store.aggregate_telegram_users(default_alert_score)
+            return telegram_alert.users
+
+        def telegram_bot_ai_analyzer(owner_id: str) -> AIAnalyzer | None:
+            if user_store and dashboard:
+                return dashboard._get_ai_analyzer(owner_id)
+            return ai_analyzer
+
+        telegram_bot_responder = TelegramBotResponder(
+            enabled=True,
+            get_users=telegram_bot_users,
+            get_snapshot=dashboard_state.get_symbol_data,
+            get_ai_analyzer=telegram_bot_ai_analyzer,
+            poll_interval_seconds=float(telegram_bot_config.get("poll_interval_seconds", 2)),
+            request_timeout_seconds=int(telegram_bot_config.get("request_timeout_seconds", 20)),
+            ai_cooldown_seconds=int(telegram_bot_config.get("ai_cooldown_seconds", 20)),
+        )
+        background_tasks.append(asyncio.create_task(telegram_bot_responder.run()))
 
     try:
         async for trade in stream.listen():

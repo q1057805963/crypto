@@ -40,6 +40,11 @@ telegram:
   bot_token: ''
   chat_ids: []
   users: []
+telegram_bot:
+  enabled: true
+  poll_interval_seconds: 2
+  request_timeout_seconds: 20
+  ai_cooldown_seconds: 20
 symbol_thresholds: {}
 ai:
   enabled: true

@@ -9,7 +9,7 @@ from time import time
 from monitor.ai_analysis import AIAnalyzer
 from monitor.auth import AuthError, AuthManager
 from monitor.anomaly import AnomalyEvent, SymbolSnapshot
-from monitor.telegram import normalize_telegram_users
+from monitor.telegram import normalize_telegram_users, send_text_to_telegram_users
 from monitor.user_config import UserConfigStore
 
 
@@ -389,6 +389,10 @@ class DashboardServer:
                     self._handle_symbols_post()
                     return
 
+                if path == "/api/telegram/test":
+                    self._handle_telegram_test_post()
+                    return
+
                 if path == "/api/telegram":
                     self._handle_telegram_post()
                     return
@@ -498,6 +502,43 @@ class DashboardServer:
                                 )
                             server_ref._save_config()
                     self._send_json({"ok": True})
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+
+            def _handle_telegram_test_post(self) -> None:
+                try:
+                    payload = self._read_json()
+                    with server_ref._config_lock:
+                        if server_ref.user_config_store:
+                            user_id = self._user_id()
+                            tg = dict(server_ref._get_user_config(user_id).get("telegram", {}))
+                        else:
+                            tg = dict(server_ref.config.get("telegram", {}))
+                        if "enabled" in payload:
+                            tg["enabled"] = bool(payload["enabled"])
+                        if "users" in payload:
+                            tg["users"] = merge_telegram_users(tg.get("users", []), payload["users"])
+                        users = normalize_telegram_users(
+                            tg.get("users"),
+                            str(tg.get("bot_token", "")),
+                            tg.get("chat_ids", []),
+                        )
+                    if not tg.get("enabled", False):
+                        self._send_json({"ok": False, "error": "请先开启推送"}, status=400)
+                        return
+                    text = "Crypto Futures Monitor 测试推送：Telegram 绑定已连通。"
+                    result = send_text_to_telegram_users(users, text)
+                    if result["sent"] <= 0:
+                        self._send_json(
+                            {
+                                "ok": False,
+                                "error": "没有可用通道或发送失败",
+                                "result": result,
+                            },
+                            status=400,
+                        )
+                        return
+                    self._send_json({"ok": True, "result": result})
                 except Exception as exc:
                     self._send_json({"ok": False, "error": str(exc)}, status=400)
 
@@ -1880,6 +1921,7 @@ INDEX_HTML = """<!doctype html>
         </div>
         <div class="modal-actions">
           <button class="small-btn secondary" id="close-telegram-btn" type="button">关闭</button>
+          <button class="small-btn secondary" id="tg-test-btn" type="button">发送测试</button>
           <button class="small-btn primary" id="tg-save-btn" type="button">保存设置</button>
         </div>
       </div>
@@ -2843,6 +2885,7 @@ INDEX_HTML = """<!doctype html>
     const tgUsersEl = document.getElementById("tg-users");
     const tgAddUserBtn = document.getElementById("tg-add-user-btn");
     const tgSaveBtn = document.getElementById("tg-save-btn");
+    const tgTestBtn = document.getElementById("tg-test-btn");
     let tgUsers = [];
     let tgEnabled = false;
 
@@ -2917,6 +2960,28 @@ INDEX_HTML = """<!doctype html>
       }
     }
 
+    async function testTelegramConfig() {
+      const body = { enabled: tgEnabled, users: collectTgUsers() };
+      tgTestBtn.disabled = true;
+      tgTestBtn.textContent = "发送中";
+      try {
+        const response = await apiFetch("/api/telegram/test", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "测试失败");
+        const sent = data.result && data.result.sent ? data.result.sent : 0;
+        updatedEl.textContent = `测试推送已发送 ${sent} 条`;
+      } catch (error) {
+        updatedEl.textContent = error.message || "测试推送失败";
+      } finally {
+        tgTestBtn.disabled = false;
+        tgTestBtn.textContent = "发送测试";
+      }
+    }
+
     function setOfStars(value) {
       return value.length > 0 && value.split("").every((char) => char === "*");
     }
@@ -2934,6 +2999,7 @@ INDEX_HTML = """<!doctype html>
       renderTgUsers();
     });
     tgSaveBtn.addEventListener("click", saveTelegramConfig);
+    tgTestBtn.addEventListener("click", testTelegramConfig);
 
     const aiToggle = document.getElementById("ai-toggle");
     const aiToggleLabel = document.getElementById("ai-toggle-label");

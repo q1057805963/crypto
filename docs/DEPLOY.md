@@ -18,6 +18,9 @@ This keeps secrets out of the repository.
 export CFM_TELEGRAM_ENABLED=true
 export CFM_TELEGRAM_BOT_TOKEN="your_bot_token"
 export CFM_TELEGRAM_CHAT_IDS="your_chat_id"
+export CFM_TELEGRAM_BOT_RESPONDER_ENABLED=true
+export CFM_TELEGRAM_BOT_REQUEST_TIMEOUT_SECONDS=20
+export CFM_TELEGRAM_BOT_AI_COOLDOWN_SECONDS=20
 ```
 
 Supported variables:
@@ -26,6 +29,9 @@ Supported variables:
 CFM_TELEGRAM_ENABLED=true
 CFM_TELEGRAM_BOT_TOKEN=your_bot_token
 CFM_TELEGRAM_CHAT_IDS=your_chat_id
+CFM_TELEGRAM_BOT_RESPONDER_ENABLED=true
+CFM_TELEGRAM_BOT_REQUEST_TIMEOUT_SECONDS=20
+CFM_TELEGRAM_BOT_AI_COOLDOWN_SECONDS=20
 CFM_EXCHANGE=okx_swap
 CFM_DATA_SOURCE=rest
 CFM_REST_POLL_INTERVAL_SECONDS=5
@@ -76,6 +82,18 @@ For group messages:
 2. Send a message in the group
 3. Call `getUpdates` again
 4. Use the group's `chat.id` value, which is often negative
+
+### Telegram bot questions
+
+When `CFM_TELEGRAM_BOT_RESPONDER_ENABLED=true`, the app also polls Telegram `getUpdates` for bound bots. Bound chat IDs can ask questions such as:
+
+```text
+BTC now?
+/ask ETH downside risk?
+SOL 当前风险点是什么？
+```
+
+The bot only answers bound chat IDs, only uses that user's monitored symbols, and uses that user's AI configuration. If a Telegram webhook is already set on the same bot, clear it before using polling mode.
 
 ## 2. VPS Preparation
 
@@ -190,6 +208,9 @@ Edit it and fill in real values:
 CFM_TELEGRAM_ENABLED=true
 CFM_TELEGRAM_BOT_TOKEN=your_bot_token
 CFM_TELEGRAM_CHAT_IDS=your_chat_id
+CFM_TELEGRAM_BOT_RESPONDER_ENABLED=true
+CFM_TELEGRAM_BOT_REQUEST_TIMEOUT_SECONDS=20
+CFM_TELEGRAM_BOT_AI_COOLDOWN_SECONDS=20
 CFM_EXCHANGE=okx_swap
 CFM_DATA_SOURCE=rest
 CFM_REST_POLL_INTERVAL_SECONDS=5

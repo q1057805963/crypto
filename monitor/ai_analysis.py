@@ -132,17 +132,59 @@ class AIAnalyzer:
                 self._cache[symbol] = (time(), result)
         return result
 
+    async def answer_question(
+        self,
+        question: str,
+        snapshot_data: dict | None,
+        available_symbols: list[str] | None = None,
+    ) -> str | None:
+        if not self.enabled:
+            with self._lock:
+                self._last_error = "ai disabled"
+            return None
+        if not self.api_key:
+            with self._lock:
+                self._last_error = "missing api key"
+            return None
+
+        with self._lock:
+            self._last_error = None
+        return await asyncio.to_thread(
+            self._call_question_api,
+            question,
+            snapshot_data,
+            available_symbols or [],
+        )
+
     def _call_api(self, data: dict) -> str | None:
         try:
             prompt = self._build_prompt(data)
-            if self.provider == "anthropic":
-                return self._call_anthropic(prompt)
-            return self._call_openai(prompt)
+            return self._call_prompt(prompt)
         except Exception as exc:
             with self._lock:
                 self._last_error = str(exc)
             logging.warning("AI analysis failed: %s", exc)
             return None
+
+    def _call_question_api(
+        self,
+        question: str,
+        snapshot_data: dict | None,
+        available_symbols: list[str],
+    ) -> str | None:
+        try:
+            prompt = self._build_question_prompt(question, snapshot_data, available_symbols)
+            return self._call_prompt(prompt)
+        except Exception as exc:
+            with self._lock:
+                self._last_error = str(exc)
+            logging.warning("AI question failed: %s", exc)
+            return None
+
+    def _call_prompt(self, prompt: str) -> str | None:
+        if self.provider == "anthropic":
+            return self._call_anthropic(prompt)
+        return self._call_openai(prompt)
 
     @staticmethod
     def _provider_defaults() -> dict[str, str]:
@@ -202,6 +244,50 @@ class AIAnalyzer:
             "3. 对于杠杆交易者的具体操作建议\n"
             "如果爆仓数据状态不可用，不要把爆仓金额为0解读为没有强平压力。"
             "直接给出建议，不要重复数据。每条建议控制在一句话。"
+        )
+
+    def _build_question_prompt(
+        self,
+        question: str,
+        data: dict | None,
+        available_symbols: list[str],
+    ) -> str:
+        if not data:
+            symbols_text = ", ".join(available_symbols[:30]) or "暂无"
+            return (
+                f"用户通过 Telegram Bot 提问：{question}\n\n"
+                f"当前可查询合约：{symbols_text}\n"
+                "请用中文简洁回复，提醒用户需要带上明确合约，例如 BTC、ETH、SOL。"
+            )
+
+        liquidation_status = {
+            "recent_event": "近1分钟有强平事件",
+            "no_recent_event": "强平数据已接入，近1分钟未捕获强平订单",
+            "unavailable": "强平数据不可用",
+        }.get(str(data.get("liquidation_data_status") or "unavailable"), "未知")
+        return (
+            f"用户通过 Telegram Bot 针对 {data.get('symbol')} 提问：{question}\n\n"
+            "以下是该 USDT 永续合约的当前监控快照：\n"
+            f"- 当前价格: {data.get('price')}\n"
+            f"- 异常分: {data.get('score', 0)}/100\n"
+            f"- 风险等级: {data.get('risk_level', '低风险')}\n"
+            f"- 当前倾向: {data.get('bias', '')}\n"
+            f"- 1分钟波动: {float(data.get('price_move_pct_1m', 0)):+.3f}%\n"
+            f"- 5分钟波动: {float(data.get('price_move_pct_5m', 0)):+.3f}%\n"
+            f"- 1分钟成交额: {float(data.get('quote_volume_1m', 0)):,.0f} USDT\n"
+            f"- 量能倍数: {float(data.get('volume_multiplier', 0)):.2f}x\n"
+            f"- 主动买入占比: {float(data.get('taker_buy_ratio_1m', 0.5)):.1%}\n"
+            f"- OI 5分钟变化: {float(data.get('oi_change_pct_5m', 0)):+.3f}%\n"
+            f"- 资金费率: {float(data.get('funding_rate', 0)):.4%}\n"
+            f"- 爆仓状态: {liquidation_status}\n"
+            f"- 多头爆仓1m: {float(data.get('long_liquidation_quote_1m', 0)):,.0f} USDT\n"
+            f"- 空头爆仓1m: {float(data.get('short_liquidation_quote_1m', 0)):,.0f} USDT\n"
+            f"- 点差: {float(data.get('spread_bps', 0)):.2f} bps\n"
+            f"- 盘口深度下降: {float(data.get('depth_drop_pct_1m', 0)):.1f}%\n"
+            f"- 触发原因: {'; '.join(data.get('reasons', [])) or '暂无'}\n\n"
+            "请直接回答用户问题，控制在 4 条以内。"
+            "重点给出上涨/下跌倾向、主要依据、风险等级和接下来观察点。"
+            "不要承诺收益，不要给绝对买卖指令；如果数据不足，要明确说数据不足。"
         )
 
     def _system_prompt(self) -> str:

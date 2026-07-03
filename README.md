@@ -115,6 +115,7 @@ OKX 源支持主行情、1 分钟成交额估算、持仓量、资金费率、RE
 - 历史快照：默认保存 `signal_snapshots`，便于后续做复盘和阈值优化
 - 微结构信号：爆仓流、轻量盘口深度、点差、深度失衡
 - Telegram 推送：配置后自动发送异常提醒
+- Telegram Bot 问答：绑定后可在 Bot 里询问已监控合约，系统结合当前指标调用 AI 回复
 
 ## Telegram 推送
 
@@ -130,6 +131,8 @@ telegram:
 
 重启程序后，达到报警阈值时会推送。
 
+页面里的“发送测试”只验证 Bot Token 和 Chat ID 是否连通；真实报警推送仍然需要异常事件达到对应阈值。
+
 更推荐在 VPS 上用环境变量覆盖敏感信息，代码已经支持：
 
 ```bash
@@ -139,6 +142,18 @@ CFM_TELEGRAM_CHAT_IDS=你的_chat_id
 CFM_AUTH_ENABLED=true
 CFM_AUTH_SECRET=一段足够长的随机密钥
 ```
+
+### Telegram Bot 问答
+
+启用后，可以直接在已绑定的 Bot 聊天里问：
+
+```text
+BTC 现在能追吗？
+/ask ETH 会不会急跌？
+SOL 当前风险点是什么？
+```
+
+Bot 只响应当前账号已绑定的 Chat ID，只允许查询该账号监控列表里的合约，并使用该账号自己的 AI 配置。若 AI 未开启或 API Key 未配置，Bot 会提示先到页面配置 AI。
 
 ### 获取 Bot Token
 

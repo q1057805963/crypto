@@ -50,6 +50,48 @@ def normalize_telegram_users(
     return normalized
 
 
+def send_telegram_message(bot_token: str, chat_id: str, text: str) -> str | None:
+    payload = json.dumps(
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+    ).encode("utf-8")
+    request = Request(
+        f"https://api.telegram.org/bot{bot_token}/sendMessage",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=10):
+            return None
+    except Exception as exc:
+        return str(exc)
+
+
+def send_text_to_telegram_users(users: list[dict], text: str) -> dict:
+    sent = 0
+    errors = []
+    for user in normalize_telegram_users(users):
+        if not TelegramAlert._user_ready(user):
+            continue
+        for chat_id in user["chat_ids"]:
+            error = send_telegram_message(user["bot_token"], chat_id, text)
+            if error:
+                errors.append({"chat_id": _mask_chat_id(chat_id), "error": error})
+            else:
+                sent += 1
+    return {"sent": sent, "errors": errors}
+
+
+def _mask_chat_id(chat_id: str) -> str:
+    value = str(chat_id)
+    if len(value) <= 6:
+        return "***"
+    return f"{value[:3]}***{value[-3:]}"
+
+
 class TelegramAlert:
     def __init__(
         self,
@@ -112,23 +154,9 @@ class TelegramAlert:
         return float(event.score) >= float(threshold)
 
     def _send_to(self, bot_token: str, chat_id: str, text: str) -> None:
-        payload = json.dumps(
-            {
-                "chat_id": chat_id,
-                "text": text,
-                "disable_web_page_preview": True,
-            }
-        ).encode("utf-8")
-        request = Request(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urlopen(request, timeout=10):
-                return
-        except Exception as exc:
-            logging.warning("Telegram alert to %s failed: %s", chat_id, exc)
+        error = send_telegram_message(bot_token, chat_id, text)
+        if error:
+            logging.warning("Telegram alert to %s failed: %s", chat_id, error)
 
     @staticmethod
     def _format(event: AnomalyEvent) -> str:
