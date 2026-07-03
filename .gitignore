@@ -8,6 +8,6 @@ data/
 monitor.out
 monitor.err
 monitor.log
+run-new.log
 
 deploy/linux/crypto-futures-monitor.env
-

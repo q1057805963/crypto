@@ -6,6 +6,7 @@ from pathlib import Path
 
 import yaml
 
+from monitor.auth import AuthManager
 from monitor.ai_analysis import AIAnalyzer
 from monitor.alert import ConsoleAlert
 from monitor.anomaly import AnomalyDetector
@@ -14,7 +15,8 @@ from monitor.binance_ws import BinanceFuturesAggTradeStream
 from monitor.dashboard import DashboardServer, DashboardState
 from monitor.microstructure import BinanceFuturesMicrostructureStream, MarketMicrostructureState
 from monitor.storage import AlertStore
-from monitor.telegram import TelegramAlert
+from monitor.telegram import TelegramAlert, normalize_telegram_users
+from monitor.user_config import UserConfigStore
 
 
 def load_config(path: Path) -> dict:
@@ -24,10 +26,14 @@ def load_config(path: Path) -> dict:
 
 def save_config(path: Path, config: dict) -> None:
     public_config = {key: value for key, value in config.items() if not key.startswith("_")}
-    if config.get("_ai_api_key_from_env"):
+    if config.get("_ai_api_key_from_env") or config.get("_ai_api_key_runtime_only"):
         ai = dict(public_config.get("ai", {}))
         ai["api_key"] = ""
         public_config["ai"] = ai
+    if config.get("_auth_secret_from_env"):
+        auth = dict(public_config.get("auth", {}))
+        auth["jwt_secret"] = ""
+        public_config["auth"] = auth
     with path.open("w", encoding="utf-8") as file:
         yaml.safe_dump(public_config, file, allow_unicode=True, sort_keys=False)
 
@@ -40,7 +46,7 @@ def _env_flag(name: str, default: bool) -> bool:
 
 
 def _migrate_telegram_config(telegram: dict) -> dict:
-    """Migrate legacy chat_id (string) to chat_ids (list)."""
+    """Migrate legacy chat_id/chat_ids into per-user Telegram configs."""
     if "chat_id" in telegram and "chat_ids" not in telegram:
         old = str(telegram.pop("chat_id", ""))
         telegram["chat_ids"] = [old] if old.strip() else []
@@ -48,6 +54,11 @@ def _migrate_telegram_config(telegram: dict) -> dict:
         telegram.pop("chat_id", None)
     if "chat_ids" not in telegram:
         telegram["chat_ids"] = []
+    telegram["users"] = normalize_telegram_users(
+        telegram.get("users"),
+        str(telegram.get("bot_token", "")),
+        telegram.get("chat_ids", []),
+    )
     return telegram
 
 
@@ -56,6 +67,7 @@ def apply_env_overrides(config: dict) -> dict:
     telegram = dict(config.get("telegram", {}))
     dashboard = dict(config.get("dashboard", {}))
     ai = dict(config.get("ai", {}))
+    auth = dict(config.get("auth", {}))
 
     telegram = _migrate_telegram_config(telegram)
 
@@ -70,6 +82,12 @@ def apply_env_overrides(config: dict) -> dict:
     env_chat_ids = os.environ.get("CFM_TELEGRAM_CHAT_IDS")
     if env_chat_ids is not None:
         telegram["chat_ids"] = [cid.strip() for cid in env_chat_ids.split(",") if cid.strip()]
+    if not telegram.get("users") and (telegram.get("bot_token") or telegram.get("chat_ids")):
+        telegram["users"] = normalize_telegram_users(
+            None,
+            str(telegram.get("bot_token", "")),
+            telegram.get("chat_ids", []),
+        )
 
     dashboard["host"] = os.environ.get(
         "CFM_DASHBOARD_HOST",
@@ -82,12 +100,29 @@ def apply_env_overrides(config: dict) -> dict:
         )
     )
 
+    auth["enabled"] = _env_flag("CFM_AUTH_ENABLED", bool(auth.get("enabled", True)))
+    auth["allow_registration"] = _env_flag(
+        "CFM_AUTH_ALLOW_REGISTRATION",
+        bool(auth.get("allow_registration", False)),
+    )
+    if "CFM_AUTH_TOKEN_TTL_SECONDS" in os.environ:
+        auth["token_ttl_seconds"] = int(os.environ["CFM_AUTH_TOKEN_TTL_SECONDS"])
+    if "CFM_AUTH_USERS_PATH" in os.environ:
+        auth["users_path"] = os.environ["CFM_AUTH_USERS_PATH"]
+    if "CFM_AUTH_SECRET_PATH" in os.environ:
+        auth["secret_path"] = os.environ["CFM_AUTH_SECRET_PATH"]
+    if os.environ.get("CFM_AUTH_SECRET"):
+        auth["jwt_secret"] = os.environ["CFM_AUTH_SECRET"]
+        config["_auth_secret_from_env"] = True
+
     ai_key = os.environ.get("CFM_AI_API_KEY")
     if ai_key is None:
         ai_key = os.environ.get("ANTHROPIC_AUTH_TOKEN") or os.environ.get("ANTHROPIC_API_KEY")
     if ai_key is not None:
         ai["api_key"] = ai_key
         config["_ai_api_key_from_env"] = True
+    elif ai.get("api_key"):
+        config["_ai_api_key_runtime_only"] = True
 
     if "CFM_AI_ENABLED" in os.environ:
         ai["enabled"] = _env_flag("CFM_AI_ENABLED", bool(ai.get("enabled", False)))
@@ -128,6 +163,7 @@ def apply_env_overrides(config: dict) -> dict:
     config["telegram"] = telegram
     config["dashboard"] = dashboard
     config["ai"] = ai
+    config["auth"] = auth
     return config
 
 
@@ -139,21 +175,44 @@ async def run(config: dict) -> None:
         force=True,
     )
 
+    users_config = config.get("users", {})
+    user_store = None
+    if users_config.get("enabled", True):
+        user_store = UserConfigStore(
+            str(users_config.get("path", "data/user_configs.json")),
+            config,
+        )
+    auth_manager = AuthManager(config.get("auth", {}))
+
+    runtime_symbols = user_store.all_symbols() if user_store else config["symbols"]
+    default_alert_score = float(config.get("thresholds", {}).get("anomaly_score", 70))
+
     detector = AnomalyDetector(
-        symbols=config["symbols"],
+        symbols=runtime_symbols,
         window_seconds=int(config.get("window_seconds", 300)),
         warmup_seconds=int(config.get("warmup_seconds", 60)),
         alert_cooldown_seconds=int(config.get("alert_cooldown_seconds", 120)),
         thresholds=config.get("thresholds", {}),
-        symbol_thresholds=config.get("symbol_thresholds", {}),
+        symbol_thresholds=(
+            user_store.aggregate_symbol_thresholds()
+            if user_store
+            else config.get("symbol_thresholds", {})
+        ),
     )
     alert = ConsoleAlert()
     telegram_config = config.get("telegram", {})
-    telegram_alert = TelegramAlert(
-        enabled=bool(telegram_config.get("enabled", False)),
-        bot_token=str(telegram_config.get("bot_token", "")),
-        chat_ids=telegram_config.get("chat_ids", []),
-    )
+    if user_store:
+        telegram_alert = TelegramAlert(
+            enabled=True,
+            users=user_store.aggregate_telegram_users(default_alert_score),
+        )
+    else:
+        telegram_alert = TelegramAlert(
+            enabled=bool(telegram_config.get("enabled", False)),
+            bot_token=str(telegram_config.get("bot_token", "")),
+            chat_ids=telegram_config.get("chat_ids", []),
+            users=telegram_config.get("users", []),
+        )
     ai_analyzer = AIAnalyzer(config.get("ai", {}))
     store = None
     storage_config = config.get("storage", {})
@@ -164,23 +223,23 @@ async def run(config: dict) -> None:
         )
 
     microstructure_config = config.get("microstructure", {})
-    microstructure_state = MarketMicrostructureState(config["symbols"])
+    microstructure_state = MarketMicrostructureState(runtime_symbols)
     microstructure_stream = None
     if microstructure_config.get("enabled", True):
         microstructure_stream = BinanceFuturesMicrostructureStream(
-            config["symbols"],
+            runtime_symbols,
             depth_levels=int(microstructure_config.get("depth_levels", 10)),
             depth_interval=str(microstructure_config.get("depth_interval", "500ms")),
         )
 
     if config.get("data_source", "rest") == "websocket":
         stream = BinanceFuturesAggTradeStream(
-            config["symbols"],
+            runtime_symbols,
             microstructure_state=microstructure_state,
         )
     else:
         stream = BinanceFuturesTickerPoller(
-            config["symbols"],
+            runtime_symbols,
             poll_interval_seconds=float(config.get("rest_poll_interval_seconds", 2)),
             per_symbol_delay_ms=int(config.get("rest_per_symbol_delay_ms", 150)),
             oi_poll_interval_seconds=float(config.get("oi_poll_interval_seconds", 30)),
@@ -190,12 +249,28 @@ async def run(config: dict) -> None:
             microstructure_state=microstructure_state,
         )
     dashboard_state = DashboardState(
-        config["symbols"],
+        runtime_symbols,
         data_source=config.get("data_source", "rest"),
     )
 
     dashboard_config = config.get("dashboard", {})
     if dashboard_config.get("enabled", True):
+        def apply_user_runtime_config() -> None:
+            if not user_store:
+                return
+            symbols = user_store.all_symbols()
+            detector.set_symbols(symbols)
+            detector.symbol_thresholds = user_store.aggregate_symbol_thresholds()
+            stream.set_symbols(symbols)
+            microstructure_state.set_symbols(symbols)
+            if microstructure_stream:
+                microstructure_stream.set_symbols(symbols)
+            dashboard_state.set_symbols(symbols)
+            telegram_alert.set_config(
+                True,
+                users=user_store.aggregate_telegram_users(default_alert_score),
+            )
+
         def update_symbols(symbols: list[str]) -> None:
             config["symbols"] = symbols
             detector.set_symbols(symbols)
@@ -216,6 +291,9 @@ async def run(config: dict) -> None:
             ai_analyzer=ai_analyzer,
             config=config,
             config_path=Path(config.get("_config_path", "config.yaml")),
+            user_config_store=user_store,
+            on_user_config_change=apply_user_runtime_config,
+            auth_manager=auth_manager,
         )
         dashboard.start()
         dashboard.set_event_loop(asyncio.get_running_loop())
@@ -224,7 +302,7 @@ async def run(config: dict) -> None:
 
     logging.info(
         "Monitoring %s via %s",
-        ", ".join(config["symbols"]),
+        ", ".join(runtime_symbols),
         config.get("data_source", "rest"),
     )
 
@@ -240,11 +318,15 @@ async def run(config: dict) -> None:
                 dashboard_state.update_snapshot(snapshot)
                 if store:
                     store.record_snapshot(snapshot)
-                if ai_analyzer.enabled:
-                    score = float(snapshot.score)
-                    if score >= ai_analyzer.activation_threshold:
+                if (
+                    not user_store
+                    and ai_analyzer.enabled
+                    and bool(config.get("ai", {}).get("auto_analyze_enabled", False))
+                ):
+                    snapshot_data = dashboard_state.get_symbol_data(snapshot.symbol)
+                    if snapshot_data and ai_analyzer.should_activate(snapshot_data):
                         asyncio.ensure_future(ai_analyzer.analyze(
-                            snapshot.symbol, dashboard_state.get_symbol_data(snapshot.symbol)
+                            snapshot.symbol, snapshot_data
                         ))
             if event:
                 alert.send(event)

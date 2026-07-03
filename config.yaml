@@ -10,12 +10,12 @@ microstructure:
   depth_interval: 500ms
 symbols:
 - BNBUSDT
-- BTCUSDT
+- SOLUSDT
 - DOGEUSDT
 - ETHUSDT
-- SOLUSDT
-- XRPUSDT
+- BTCUSDT
 - HYPEUSDT
+- XRPUSDT
 window_seconds: 300
 warmup_seconds: 60
 alert_cooldown_seconds: 120
@@ -23,26 +23,60 @@ storage:
   enabled: true
   path: data/monitor.db
   snapshot_interval_seconds: 60
+users:
+  enabled: true
+  path: data/user_configs.json
+auth:
+  enabled: true
+  users_path: data/auth_users.json
+  secret_path: data/auth_secret.key
+  jwt_secret: ''
+  allow_registration: false
+  token_ttl_seconds: 604800
 telegram:
   enabled: false
   bot_token: ''
   chat_ids: []
+  users: []
 symbol_thresholds: {}
 ai:
-  enabled: false
+  enabled: true
   provider: anthropic
   api_key: ''
-  model: deepseek-v4-pro
-  base_url: https://api.deepseek.com/anthropic
-  activation_threshold: 60
+  model: deepseek-v4-flash
+  base_url: https://token.sensenova.cn
+  activation_threshold: 30
+  triggers:
+    mode: any
+    conditions:
+      score:
+        enabled: true
+        threshold: 30
+      quote_volume_1m:
+        enabled: false
+        threshold: 500000
+      volume_multiplier:
+        enabled: false
+        threshold: 3
+      price_move_pct_1m_abs:
+        enabled: false
+        threshold: 0.8
+      oi_change_pct_5m_abs:
+        enabled: false
+        threshold: 1.5
+      liquidation_total_quote_1m:
+        enabled: false
+        threshold: 250000
   cache_ttl_seconds: 300
   retry_cooldown_seconds: 120
   request_timeout_seconds: 30
   max_tokens: 500
+  auto_analyze_enabled: false
 dashboard:
   enabled: true
   host: 127.0.0.1
   port: 8765
+  theme: dark
 thresholds:
   price_move_pct_1m: 0.8
   price_move_pct_5m: 1.8

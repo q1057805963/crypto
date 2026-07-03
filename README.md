@@ -112,7 +112,8 @@ BTC, ETH, SOL
 telegram:
   enabled: true
   bot_token: '你的 Bot Token'
-  chat_id: '你的 Chat ID'
+  chat_ids:
+    - '你的 Chat ID'
 ```
 
 重启程序后，达到报警阈值时会推送。
@@ -122,7 +123,9 @@ telegram:
 ```bash
 CFM_TELEGRAM_ENABLED=true
 CFM_TELEGRAM_BOT_TOKEN=你的_bot_token
-CFM_TELEGRAM_CHAT_ID=你的_chat_id
+CFM_TELEGRAM_CHAT_IDS=你的_chat_id
+CFM_AUTH_ENABLED=true
+CFM_AUTH_SECRET=一段足够长的随机密钥
 ```
 
 ### 获取 Bot Token
@@ -190,6 +193,10 @@ dashboard:
 
 然后放行端口，或者更推荐挂到 Nginx 反向代理后面。
 
+面板默认启用登录。VPS 首次打开时会让你创建管理员账号，后续登录后才会加载个人监控、AI、Telegram 和阈值配置。每个账号的监控列表、推送、AI 和阈值设置按 JWT 用户独立保存。`CFM_AUTH_SECRET` 请保持稳定，变更后已登录浏览器需要重新登录。
+
+如果面板对公网开放，请放到 Nginx/Caddy 反向代理后并启用 HTTPS；JWT 会随每次 API 请求发送，不能裸跑在公网 HTTP 上。
+
 ### systemd 常驻运行
 
 项目里已经放了模板：
@@ -201,7 +208,7 @@ dashboard:
 
 1. 修改 `service` 文件里的 `User`、`WorkingDirectory`、`ExecStart`
 2. 复制环境变量模板为真实 env 文件
-3. 写入 Telegram token 和 chat id
+3. 写入 Telegram token、chat ids 和 `CFM_AUTH_SECRET`
 4. 安装并启动服务
 
 命令如下：

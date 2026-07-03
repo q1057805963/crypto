@@ -12,6 +12,8 @@ class MarketMicrostructureState:
         self._depth: dict[str, dict[str, float]] = {}
         self._depth_history: dict[str, deque[tuple[float, float]]] = {}
         self._liquidations: dict[str, deque[dict[str, float | str]]] = {}
+        self._last_depth_at: dict[str, float] = {}
+        self._last_liquidation_at: dict[str, float] = {}
         self.set_symbols(symbols)
 
     def set_symbols(self, symbols: list[str]) -> None:
@@ -20,12 +22,16 @@ class MarketMicrostructureState:
             self._depth.setdefault(symbol, {})
             self._depth_history.setdefault(symbol, deque())
             self._liquidations.setdefault(symbol, deque())
+            self._last_depth_at.setdefault(symbol, 0.0)
+            self._last_liquidation_at.setdefault(symbol, 0.0)
 
         for symbol in list(self._depth):
             if symbol not in wanted:
                 self._depth.pop(symbol, None)
                 self._depth_history.pop(symbol, None)
                 self._liquidations.pop(symbol, None)
+                self._last_depth_at.pop(symbol, None)
+                self._last_liquidation_at.pop(symbol, None)
 
     def record_depth(
         self,
@@ -60,6 +66,7 @@ class MarketMicrostructureState:
             "best_bid": best_bid,
             "best_ask": best_ask,
         }
+        self._last_depth_at[symbol] = event_time
 
         history = self._depth_history[symbol]
         history.append((event_time, total_depth_notional))
@@ -84,15 +91,18 @@ class MarketMicrostructureState:
                 "quote_quantity": quote_quantity,
             }
         )
+        self._last_liquidation_at[symbol] = event_time
         cutoff = event_time - 75
         while queue and float(queue[0]["event_time"]) < cutoff:
             queue.popleft()
 
-    def snapshot(self, symbol: str, now: float) -> dict[str, float]:
+    def snapshot(self, symbol: str, now: float) -> dict[str, Any]:
         symbol = symbol.upper()
         depth = dict(self._depth.get(symbol, {}))
         depth_history = self._depth_history.get(symbol, deque())
         liquidations = self._liquidations.get(symbol, deque())
+        last_depth_at = float(self._last_depth_at.get(symbol, 0.0))
+        last_liquidation_at = float(self._last_liquidation_at.get(symbol, 0.0))
 
         cutoff = now - 60
         while depth_history and depth_history[0][0] < cutoff:
@@ -123,6 +133,20 @@ class MarketMicrostructureState:
             if total_liquidation_quote_1m
             else 0.0
         )
+        depth_age_seconds = now - last_depth_at if last_depth_at else None
+        last_liquidation_age_seconds = now - last_liquidation_at if last_liquidation_at else None
+        microstructure_status = (
+            "active"
+            if depth_age_seconds is not None and depth_age_seconds <= 20
+            else "unavailable"
+        )
+        liquidation_event_count_1m = len(liquidations)
+        if microstructure_status != "active":
+            liquidation_data_status = "unavailable"
+        elif liquidation_event_count_1m:
+            liquidation_data_status = "recent_event"
+        else:
+            liquidation_data_status = "no_recent_event"
 
         return {
             "spread_bps": float(depth.get("spread_bps", 0.0)),
@@ -135,6 +159,11 @@ class MarketMicrostructureState:
             "short_liquidation_quote_1m": short_liquidation_quote_1m,
             "liquidation_total_quote_1m": total_liquidation_quote_1m,
             "liquidation_imbalance": liquidation_imbalance,
+            "liquidation_event_count_1m": liquidation_event_count_1m,
+            "liquidation_data_status": liquidation_data_status,
+            "microstructure_status": microstructure_status,
+            "depth_data_age_seconds": depth_age_seconds,
+            "last_liquidation_age_seconds": last_liquidation_age_seconds,
         }
 
 

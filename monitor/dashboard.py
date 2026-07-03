@@ -6,7 +6,11 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import time
 
+from monitor.ai_analysis import AIAnalyzer
+from monitor.auth import AuthError, AuthManager
 from monitor.anomaly import AnomalyEvent, SymbolSnapshot
+from monitor.telegram import normalize_telegram_users
+from monitor.user_config import UserConfigStore
 
 
 def normalize_symbols(symbols: list[str]) -> list[str]:
@@ -22,6 +26,52 @@ def normalize_symbols(symbols: list[str]) -> list[str]:
             normalized.append(symbol)
             seen.add(symbol)
     return normalized
+
+
+def _masked(value: str) -> bool:
+    return bool(value) and ("***" in value or set(value) == {"*"})
+
+
+def telegram_users_response(telegram: dict) -> list[dict]:
+    users = normalize_telegram_users(
+        telegram.get("users"),
+        str(telegram.get("bot_token", "")),
+        telegram.get("chat_ids", []),
+    )
+    return [
+        {
+            "name": user.get("name", ""),
+            "enabled": bool(user.get("enabled", True)),
+            "bot_token": "********" if user.get("bot_token") else "",
+            "bot_token_set": bool(user.get("bot_token")),
+            "chat_ids": user.get("chat_ids", []),
+        }
+        for user in users
+    ]
+
+
+def merge_telegram_users(existing_users: list[dict], incoming_users: list[dict]) -> list[dict]:
+    existing = normalize_telegram_users(existing_users)
+    merged = []
+    for index, raw_user in enumerate(incoming_users):
+        previous = existing[index] if index < len(existing) else {}
+        token = str(raw_user.get("bot_token", ""))
+        if not token or _masked(token):
+            token = str(previous.get("bot_token", ""))
+        chat_ids = [
+            str(chat_id).strip()
+            for chat_id in raw_user.get("chat_ids", [])
+            if str(chat_id).strip()
+        ]
+        merged.append(
+            {
+                "name": str(raw_user.get("name") or previous.get("name") or f"用户{index + 1}").strip(),
+                "enabled": bool(raw_user.get("enabled", True)),
+                "bot_token": token,
+                "chat_ids": chat_ids,
+            }
+        )
+    return merged
 
 
 class DashboardState:
@@ -52,6 +102,11 @@ class DashboardState:
                 "long_liquidation_quote_1m": 0,
                 "short_liquidation_quote_1m": 0,
                 "liquidation_total_quote_1m": 0,
+                "liquidation_event_count_1m": 0,
+                "liquidation_data_status": "unavailable",
+                "microstructure_status": "unavailable",
+                "depth_data_age_seconds": None,
+                "last_liquidation_age_seconds": None,
                 "risk_level": "低风险",
                 "bias": "观察：暂无明确方向",
                 "confidence": 0,
@@ -91,6 +146,11 @@ class DashboardState:
                         "long_liquidation_quote_1m": 0,
                         "short_liquidation_quote_1m": 0,
                         "liquidation_total_quote_1m": 0,
+                        "liquidation_event_count_1m": 0,
+                        "liquidation_data_status": "unavailable",
+                        "microstructure_status": "unavailable",
+                        "depth_data_age_seconds": None,
+                        "last_liquidation_age_seconds": None,
                         "risk_level": "低风险",
                         "bias": "观察：暂无明确方向",
                         "confidence": 0,
@@ -125,15 +185,22 @@ class DashboardState:
         with self._lock:
             return self._symbols.get(symbol.upper())
 
-    def as_payload(self) -> dict:
+    def as_payload(self, symbols_filter: list[str] | None = None) -> dict:
         with self._lock:
             symbols = list(self._symbols.values())
+            if symbols_filter is not None:
+                wanted = {symbol.upper() for symbol in symbols_filter}
+                symbols = [symbol for symbol in symbols if symbol["symbol"].upper() in wanted]
             symbols.sort(key=lambda item: (-float(item.get("score") or 0), item["symbol"]))
+            events = list(self._events)
+            if symbols_filter is not None:
+                wanted = {symbol.upper() for symbol in symbols_filter}
+                events = [event for event in events if str(event.get("symbol", "")).upper() in wanted]
             return {
                 "generated_at": time(),
                 "data_source": self._data_source,
                 "symbols": symbols,
-                "events": list(self._events),
+                "events": events,
             }
 
 
@@ -149,6 +216,9 @@ class DashboardServer:
         ai_analyzer=None,
         config: dict | None = None,
         config_path: str = "config.yaml",
+        user_config_store: UserConfigStore | None = None,
+        on_user_config_change=None,
+        auth_manager: AuthManager | None = None,
     ) -> None:
         self.state = state
         self.host = host
@@ -159,10 +229,16 @@ class DashboardServer:
         self.ai_analyzer = ai_analyzer
         self.config = config or {}
         self.config_path = config_path
+        self.user_config_store = user_config_store
+        self.on_user_config_change = on_user_config_change
+        self.auth_manager = auth_manager
+        self._ai_analyzers: dict[str, AIAnalyzer] = {}
         self._event_loop = None
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._config_lock = threading.Lock()
+        self._auth_attempt_lock = threading.Lock()
+        self._auth_attempts: dict[str, list[float]] = {}
 
     def set_event_loop(self, loop) -> None:
         self._event_loop = loop
@@ -170,13 +246,44 @@ class DashboardServer:
     def _save_config(self) -> None:
         from pathlib import Path
         public_config = {k: v for k, v in self.config.items() if not k.startswith("_")}
-        if self.config.get("_ai_api_key_from_env"):
+        if self.config.get("_ai_api_key_from_env") or self.config.get("_ai_api_key_runtime_only"):
             ai = dict(public_config.get("ai", {}))
             ai["api_key"] = ""
             public_config["ai"] = ai
+        if self.config.get("_auth_secret_from_env"):
+            auth = dict(public_config.get("auth", {}))
+            auth["jwt_secret"] = ""
+            public_config["auth"] = auth
         with open(Path(self.config_path), "w", encoding="utf-8") as f:
             import yaml
             yaml.safe_dump(public_config, f, allow_unicode=True, sort_keys=False)
+
+    def _get_user_config(self, user_id: str) -> dict:
+        if self.user_config_store:
+            existed = self.user_config_store.has(user_id)
+            user_config = self.user_config_store.get(user_id)
+            if not existed:
+                self._notify_user_config_change()
+            return user_config
+        return {
+            "symbols": self.config.get("symbols", []),
+            "telegram": self.config.get("telegram", {}),
+            "ai": self.config.get("ai", {}),
+            "symbol_thresholds": self.config.get("symbol_thresholds", {}),
+        }
+
+    def _get_ai_analyzer(self, user_id: str, ai_cfg: dict | None = None) -> AIAnalyzer | None:
+        if not self.user_config_store:
+            return self.ai_analyzer
+        if user_id not in self._ai_analyzers:
+            self._ai_analyzers[user_id] = AIAnalyzer(ai_cfg or self._get_user_config(user_id).get("ai", {}))
+        elif ai_cfg is not None:
+            self._ai_analyzers[user_id].update_config(ai_cfg)
+        return self._ai_analyzers[user_id]
+
+    def _notify_user_config_change(self) -> None:
+        if self.on_user_config_change:
+            self.on_user_config_change()
 
     def start(self) -> None:
         handler = self._make_handler()
@@ -192,38 +299,61 @@ class DashboardServer:
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
+                self._request_user = None
                 path = self.path.split("?")[0]
 
                 if path == "/" or path.startswith("/index.html"):
                     self._send_text(INDEX_HTML, "text/html; charset=utf-8")
                     return
 
+                if path == "/api/auth/status":
+                    self._send_json(
+                        server_ref.auth_manager.public_status()
+                        if server_ref.auth_manager
+                        else {"enabled": False, "has_users": False, "allow_registration": True}
+                    )
+                    return
+
+                if path == "/api/auth/me":
+                    user = self._require_user()
+                    if not user:
+                        return
+                    self._send_json({"ok": True, "user": user})
+                    return
+
+                if path.startswith("/api/"):
+                    user = self._require_user()
+                    if not user:
+                        return
+                    self._request_user = user
+
                 if path == "/api/state":
-                    self._send_json(state.as_payload())
+                    user_config = server_ref._get_user_config(self._user_id())
+                    self._send_json(state.as_payload(user_config.get("symbols", [])))
                     return
 
                 if path == "/api/telegram":
-                    tg = server_ref.config.get("telegram", {})
+                    tg = server_ref._get_user_config(self._user_id()).get("telegram", {})
                     self._send_json({
                         "enabled": tg.get("enabled", False),
-                        "bot_token_set": bool(tg.get("bot_token", "")),
-                        "chat_ids": tg.get("chat_ids", []),
+                        "users": telegram_users_response(tg),
                     })
                     return
 
                 if path == "/api/symbol_thresholds":
+                    user_config = server_ref._get_user_config(self._user_id())
                     self._send_json(
                         {
                             "default_score": server_ref.config.get("thresholds", {}).get(
                                 "anomaly_score", 70
                             ),
-                            "symbol_thresholds": server_ref.config.get("symbol_thresholds", {}),
+                            "symbol_thresholds": user_config.get("symbol_thresholds", {}),
                         }
                     )
                     return
 
                 if path == "/api/ai/config":
-                    ai_cfg = dict(server_ref.config.get("ai", {}))
+                    ai_cfg = dict(server_ref._get_user_config(self._user_id()).get("ai", {}))
                     if ai_cfg.get("api_key"):
                         ai_cfg["api_key"] = ai_cfg["api_key"][:8] + "***"
                     self._send_json(ai_cfg)
@@ -236,7 +366,22 @@ class DashboardServer:
                 self.send_error(404)
 
             def do_POST(self) -> None:
+                self._request_user = None
                 path = self.path.split("?")[0]
+
+                if path == "/api/auth/register":
+                    self._handle_auth_register()
+                    return
+
+                if path == "/api/auth/login":
+                    self._handle_auth_login()
+                    return
+
+                if path.startswith("/api/"):
+                    user = self._require_user()
+                    if not user:
+                        return
+                    self._request_user = user
 
                 if path == "/api/symbols":
                     self._handle_symbols_post()
@@ -256,13 +401,63 @@ class DashboardServer:
 
                 self.send_error(404)
 
+            def _handle_auth_register(self) -> None:
+                try:
+                    if self._auth_rate_limited("register"):
+                        raise AuthError("尝试过于频繁，请稍后再试")
+                    if not server_ref.auth_manager or not server_ref.auth_manager.enabled:
+                        raise AuthError("认证未启用")
+                    if not server_ref.auth_manager.can_register():
+                        raise AuthError("注册已关闭")
+                    payload = self._read_json()
+                    user = server_ref.auth_manager.register(
+                        str(payload.get("username", "")),
+                        str(payload.get("password", "")),
+                    )
+                    if server_ref.user_config_store:
+                        server_ref.user_config_store.get(user["user_id"])
+                        server_ref._notify_user_config_change()
+                    self._send_json({
+                        "ok": True,
+                        "user": user,
+                        "token": server_ref.auth_manager.issue_token(user),
+                    })
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+
+            def _handle_auth_login(self) -> None:
+                try:
+                    if self._auth_rate_limited("login"):
+                        raise AuthError("尝试过于频繁，请稍后再试")
+                    if not server_ref.auth_manager or not server_ref.auth_manager.enabled:
+                        raise AuthError("认证未启用")
+                    payload = self._read_json()
+                    user = server_ref.auth_manager.login(
+                        str(payload.get("username", "")),
+                        str(payload.get("password", "")),
+                    )
+                    if server_ref.user_config_store:
+                        server_ref.user_config_store.get(user["user_id"])
+                        server_ref._notify_user_config_change()
+                    self._send_json({
+                        "ok": True,
+                        "user": user,
+                        "token": server_ref.auth_manager.issue_token(user),
+                    })
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=401)
+
             def _handle_symbols_post(self) -> None:
                 try:
                     payload = self._read_json()
                     symbols = normalize_symbols(payload.get("symbols", []))
                     if not symbols:
                         raise ValueError("symbols cannot be empty")
-                    on_symbols_change(symbols)
+                    if server_ref.user_config_store:
+                        server_ref.user_config_store.update_symbols(self._user_id(), symbols)
+                        server_ref._notify_user_config_change()
+                    else:
+                        on_symbols_change(symbols)
                     self._send_json({"ok": True, "symbols": symbols})
                 except Exception as exc:
                     self._send_json({"ok": False, "error": str(exc)}, status=400)
@@ -271,23 +466,35 @@ class DashboardServer:
                 try:
                     payload = self._read_json()
                     with server_ref._config_lock:
-                        tg = dict(server_ref.config.get("telegram", {}))
+                        if server_ref.user_config_store:
+                            user_id = self._user_id()
+                            tg = dict(server_ref._get_user_config(user_id).get("telegram", {}))
+                        else:
+                            user_id = ""
+                            tg = dict(server_ref.config.get("telegram", {}))
                         if "enabled" in payload:
                             tg["enabled"] = bool(payload["enabled"])
                         if "bot_token" in payload:
                             bot_token = str(payload["bot_token"])
-                            if "***" not in bot_token and set(bot_token) != {"*"}:
+                            if not _masked(bot_token):
                                 tg["bot_token"] = bot_token
                         if "chat_ids" in payload:
                             tg["chat_ids"] = [str(cid).strip() for cid in payload["chat_ids"] if str(cid).strip()]
-                        server_ref.config["telegram"] = tg
-                        if server_ref.telegram_alert:
-                            server_ref.telegram_alert.set_config(
-                                bool(tg.get("enabled", False)),
-                                str(tg.get("bot_token", "")),
-                                tg.get("chat_ids", []),
-                            )
-                        server_ref._save_config()
+                        if "users" in payload:
+                            tg["users"] = merge_telegram_users(tg.get("users", []), payload["users"])
+                        if server_ref.user_config_store:
+                            server_ref.user_config_store.update_telegram(user_id, tg)
+                            server_ref._notify_user_config_change()
+                        else:
+                            server_ref.config["telegram"] = tg
+                            if server_ref.telegram_alert:
+                                server_ref.telegram_alert.set_config(
+                                    bool(tg.get("enabled", False)),
+                                    str(tg.get("bot_token", "")),
+                                    tg.get("chat_ids", []),
+                                    tg.get("users", []),
+                                )
+                            server_ref._save_config()
                     self._send_json({"ok": True})
                 except Exception as exc:
                     self._send_json({"ok": False, "error": str(exc)}, status=400)
@@ -300,17 +507,26 @@ class DashboardServer:
                         raise ValueError("symbol is required")
                     score = payload.get("anomaly_score")
                     with server_ref._config_lock:
-                        st = dict(server_ref.config.get("symbol_thresholds", {}))
+                        if server_ref.user_config_store:
+                            user_id = self._user_id()
+                            st = dict(server_ref._get_user_config(user_id).get("symbol_thresholds", {}))
+                        else:
+                            user_id = ""
+                            st = dict(server_ref.config.get("symbol_thresholds", {}))
                         if score is None:
                             st.pop(symbol, None)
-                            if server_ref.detector:
+                            if server_ref.detector and not server_ref.user_config_store:
                                 server_ref.detector.remove_symbol_threshold(symbol)
                         else:
                             st[symbol] = {"anomaly_score": float(score)}
-                            if server_ref.detector:
+                            if server_ref.detector and not server_ref.user_config_store:
                                 server_ref.detector.set_symbol_threshold(symbol, float(score))
-                        server_ref.config["symbol_thresholds"] = st
-                        server_ref._save_config()
+                        if server_ref.user_config_store:
+                            server_ref.user_config_store.update_symbol_thresholds(user_id, st)
+                            server_ref._notify_user_config_change()
+                        else:
+                            server_ref.config["symbol_thresholds"] = st
+                            server_ref._save_config()
                     self._send_json({"ok": True})
                 except Exception as exc:
                     self._send_json({"ok": False, "error": str(exc)}, status=400)
@@ -319,7 +535,12 @@ class DashboardServer:
                 try:
                     payload = self._read_json()
                     with server_ref._config_lock:
-                        ai_cfg = dict(server_ref.config.get("ai", {}))
+                        if server_ref.user_config_store:
+                            user_id = self._user_id()
+                            ai_cfg = dict(server_ref._get_user_config(user_id).get("ai", {}))
+                        else:
+                            user_id = ""
+                            ai_cfg = dict(server_ref.config.get("ai", {}))
                         for key in (
                             "enabled",
                             "provider",
@@ -331,15 +552,20 @@ class DashboardServer:
                             "retry_cooldown_seconds",
                             "request_timeout_seconds",
                             "max_tokens",
+                            "triggers",
                         ):
                             if key in payload:
                                 ai_cfg[key] = payload[key]
-                        server_ref.config["ai"] = ai_cfg
-                        if "api_key" in payload:
-                            server_ref.config["_ai_api_key_from_env"] = False
-                        if server_ref.ai_analyzer:
-                            server_ref.ai_analyzer.update_config(ai_cfg)
-                        server_ref._save_config()
+                        if server_ref.user_config_store:
+                            server_ref.user_config_store.update_ai(user_id, ai_cfg)
+                            server_ref._get_ai_analyzer(user_id, ai_cfg)
+                        else:
+                            server_ref.config["ai"] = ai_cfg
+                            if "api_key" in payload:
+                                server_ref.config["_ai_api_key_runtime_only"] = True
+                            if server_ref.ai_analyzer:
+                                server_ref.ai_analyzer.update_config(ai_cfg)
+                            server_ref._save_config()
                     self._send_json({"ok": True})
                 except Exception as exc:
                     self._send_json({"ok": False, "error": str(exc)}, status=400)
@@ -353,14 +579,16 @@ class DashboardServer:
                 if not symbol:
                     self._send_json({"analysis": None, "reason": "symbol required"})
                     return
-                if not server_ref.ai_analyzer or not server_ref.ai_analyzer.enabled:
+                user_id = self._user_id()
+                analyzer = server_ref._get_ai_analyzer(user_id)
+                if not analyzer or not analyzer.enabled:
                     self._send_json({"analysis": None, "reason": "ai disabled"})
                     return
                 snapshot_data = state.get_symbol_data(symbol)
                 if not snapshot_data:
                     self._send_json({"analysis": None, "reason": "no data"})
                     return
-                cached = server_ref.ai_analyzer.get_cached(symbol)
+                cached = analyzer.get_cached(symbol)
                 if cached and not force_refresh:
                     self._send_json({"analysis": cached, "cached": True})
                     return
@@ -368,11 +596,23 @@ class DashboardServer:
                 if loop:
                     import asyncio
                     future = asyncio.run_coroutine_threadsafe(
-                        server_ref.ai_analyzer.analyze(symbol, snapshot_data, force=force_refresh), loop
+                        analyzer.analyze(symbol, snapshot_data, force=force_refresh), loop
                     )
                     try:
                         result = future.result(timeout=35)
-                        self._send_json({"analysis": result, "cached": False})
+                        self._send_json(
+                            {
+                                "analysis": result,
+                                "cached": False,
+                                "reason": None
+                                if result
+                                else (
+                                    analyzer.get_last_error()
+                                    if analyzer
+                                    else "analysis failed"
+                                ),
+                            }
+                        )
                     except Exception:
                         self._send_json({"analysis": None, "reason": "analysis timeout"})
                 else:
@@ -382,6 +622,49 @@ class DashboardServer:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(length).decode("utf-8")
                 return json.loads(body)
+
+            def _require_user(self) -> dict | None:
+                if not server_ref.auth_manager or not server_ref.auth_manager.enabled:
+                    return {
+                        "user_id": self.headers.get("X-CFM-User", "default_user"),
+                        "username": "local",
+                        "role": "local",
+                    }
+                auth_header = self.headers.get("Authorization", "")
+                prefix = "Bearer "
+                if not auth_header.startswith(prefix):
+                    self._send_json({"ok": False, "error": "未登录"}, status=401)
+                    return None
+                token = auth_header[len(prefix):].strip()
+                try:
+                    return server_ref.auth_manager.verify_token(token)
+                except AuthError as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=401)
+                    return None
+
+            def _user_id(self) -> str:
+                user = getattr(self, "_request_user", None)
+                if user and user.get("user_id"):
+                    return str(user["user_id"])
+                return self.headers.get("X-CFM-User", "default_user")
+
+            def _auth_rate_limited(self, action: str) -> bool:
+                window_seconds = 300
+                max_attempts = 20 if action == "login" else 8
+                now = time()
+                client = self.client_address[0] if self.client_address else "unknown"
+                key = f"{action}:{client}"
+                with server_ref._auth_attempt_lock:
+                    attempts = [
+                        ts
+                        for ts in server_ref._auth_attempts.get(key, [])
+                        if now - ts < window_seconds
+                    ]
+                    limited = len(attempts) >= max_attempts
+                    if not limited:
+                        attempts.append(now)
+                    server_ref._auth_attempts[key] = attempts
+                    return limited
 
             def _send_json(self, data: dict, status: int = 200) -> None:
                 body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -426,6 +709,9 @@ INDEX_HTML = """<!doctype html>
       --red: #ff5a66;
       --amber: #f2b84b;
       --blue: #64a8ff;
+      --blue-soft: rgba(100, 168, 255, .14);
+      --green-soft: rgba(43, 213, 118, .12);
+      --red-soft: rgba(255, 90, 102, .12);
     }
 
     * { box-sizing: border-box; }
@@ -466,11 +752,31 @@ INDEX_HTML = """<!doctype html>
       white-space: nowrap;
     }
 
+    .scope-btn {
+      height: 28px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 0 10px;
+      font-size: 12px;
+      cursor: pointer;
+      max-width: 210px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .scope-btn:hover {
+      border-color: var(--blue);
+      color: var(--blue);
+    }
+
     .toolbar {
       display: grid;
-      grid-template-columns: minmax(200px, 1fr) auto auto auto;
+      grid-template-columns: minmax(220px, 1fr) auto auto auto auto auto;
       gap: 10px;
-      width: min(720px, 100%);
+      width: min(900px, 100%);
     }
 
     .symbol-input {
@@ -502,6 +808,167 @@ INDEX_HTML = """<!doctype html>
 
     .save-btn:hover {
       border-color: var(--blue);
+    }
+
+    .save-btn.primary {
+      background: #1267d6;
+      border-color: #1267d6;
+      color: #ffffff;
+      font-weight: 650;
+    }
+
+    .save-btn.ai {
+      background: rgba(43, 213, 118, .12);
+      border-color: rgba(43, 213, 118, .32);
+      color: var(--green);
+    }
+
+    .save-btn.ghost {
+      background: transparent;
+    }
+
+    .save-btn.danger {
+      background: var(--red-soft);
+      border-color: rgba(255, 90, 102, .32);
+      color: var(--red);
+    }
+
+    body.light {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --panel-2: #edf1f5;
+      --text: #18202a;
+      --muted: #647184;
+      --line: #d8e0ea;
+      --green: #098b4d;
+      --red: #d92d3a;
+      --amber: #b7791f;
+      --blue: #1267d6;
+      --blue-soft: rgba(18, 103, 214, .12);
+      --green-soft: rgba(9, 139, 77, .12);
+      --red-soft: rgba(217, 45, 58, .1);
+    }
+
+    body.light header,
+    body.light .modal-card,
+    body.light .auth-card {
+      background: #ffffff;
+    }
+
+    body.light .symbol-input,
+    body.light .setting-group input,
+    body.light .setting-group select,
+    body.light .modal-close,
+    body.light .auth-form input {
+      background: #ffffff;
+      color: var(--text);
+    }
+
+    body.light .save-btn,
+    body.light .small-btn {
+      background: #edf4ff;
+      color: var(--text);
+      border-color: #bfd4f2;
+    }
+
+    body.light .small-btn.secondary {
+      background: #eef1f5;
+    }
+
+    body.light .scope-btn {
+      background: #edf4ff;
+    }
+
+    body.light .metric,
+    body.light .score,
+    body.light .risk,
+    body.light .tag,
+    body.light .chip {
+      background: #f5f7fa;
+    }
+
+    body.light th {
+      background: #edf1f5;
+    }
+
+    body.light tbody tr:hover {
+      background: rgba(18, 103, 214, .06);
+    }
+
+    body.light tbody tr.selected {
+      background: rgba(18, 103, 214, .12);
+    }
+
+    body.light .ai-inline {
+      background: rgba(18, 103, 214, .06);
+      border-color: rgba(18, 103, 214, .18);
+    }
+
+    .auth-screen {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(8, 12, 18, .82);
+      backdrop-filter: blur(8px);
+      z-index: 200;
+    }
+
+    .auth-screen.open {
+      display: flex;
+    }
+
+    .auth-card {
+      width: min(420px, calc(100vw - 32px));
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #15181c;
+      box-shadow: 0 18px 70px rgba(0, 0, 0, .52);
+      padding: 22px;
+    }
+
+    .auth-title {
+      margin: 0 0 8px;
+      font-size: 20px;
+      font-weight: 750;
+    }
+
+    .auth-hint {
+      margin-bottom: 18px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .auth-form {
+      display: grid;
+      gap: 12px;
+    }
+
+    .auth-form input {
+      width: 100%;
+      height: 38px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #101215;
+      color: var(--text);
+      padding: 0 11px;
+      outline: none;
+      font-size: 13px;
+    }
+
+    .auth-form input:focus {
+      border-color: var(--blue);
+    }
+
+    .auth-error {
+      min-height: 18px;
+      color: var(--red);
+      font-size: 12px;
+      line-height: 1.4;
     }
 
     .modal-backdrop {
@@ -602,6 +1069,73 @@ INDEX_HTML = """<!doctype html>
       line-height: 1.45;
     }
 
+    .profile-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .profile-item {
+      min-width: 0;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: rgba(255, 255, 255, .02);
+    }
+
+    .profile-label {
+      margin-bottom: 5px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .profile-value {
+      min-width: 0;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 650;
+      overflow-wrap: anywhere;
+    }
+
+    .condition-grid,
+    .telegram-users {
+      display: grid;
+      gap: 8px;
+    }
+
+    .condition-row,
+    .telegram-user {
+      display: grid;
+      grid-template-columns: auto minmax(90px, 1fr) minmax(78px, 110px);
+      align-items: center;
+      gap: 8px;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: rgba(255, 255, 255, .02);
+      font-size: 12px;
+    }
+
+    .condition-row input[type="checkbox"] {
+      width: 16px;
+      min-width: 16px;
+      height: 16px;
+    }
+
+    .condition-row input[type="number"] {
+      min-width: 0;
+      width: 100%;
+    }
+
+    .telegram-user {
+      grid-template-columns: minmax(72px, .8fr) minmax(120px, 1.1fr) minmax(120px, 1fr) auto;
+    }
+
+    .telegram-user input {
+      min-width: 0;
+      width: 100%;
+    }
+
     .chip-list {
       display: flex;
       flex-wrap: wrap;
@@ -644,6 +1178,17 @@ INDEX_HTML = """<!doctype html>
     .small-btn:hover { border-color: var(--blue); }
     .small-btn.secondary {
       background: #1d2128;
+    }
+    .small-btn.primary {
+      background: #1267d6;
+      border-color: #1267d6;
+      color: #ffffff;
+      font-weight: 650;
+    }
+    .small-btn.danger {
+      background: var(--red-soft);
+      border-color: rgba(255, 90, 102, .35);
+      color: var(--red);
     }
     .toggle-wrap {
       display: flex;
@@ -690,7 +1235,7 @@ INDEX_HTML = """<!doctype html>
       height: 24px;
       border: 1px solid #344252;
       border-radius: 999px;
-      background: #1d2937;
+      background: var(--blue-soft);
       color: var(--blue);
       padding: 0 9px;
       font-size: 11px;
@@ -737,6 +1282,21 @@ INDEX_HTML = """<!doctype html>
       border-radius: 6px;
     }
 
+    .ai-status {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .ai-status strong {
+      color: var(--blue);
+      font-weight: 650;
+    }
+
     .ai-inline-title {
       color: var(--blue);
       font-size: 12px;
@@ -762,7 +1322,7 @@ INDEX_HTML = """<!doctype html>
 
     main {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 380px;
+      grid-template-columns: minmax(0, 1fr) 400px;
       grid-template-rows: minmax(0, 1fr);
       gap: 18px;
       flex: 1;
@@ -955,7 +1515,7 @@ INDEX_HTML = """<!doctype html>
       padding: 10px;
       border: 1px solid var(--line);
       border-radius: 6px;
-      background: #171a1f;
+      background: rgba(255, 255, 255, .025);
     }
 
     .metric-label {
@@ -1002,26 +1562,100 @@ INDEX_HTML = """<!doctype html>
     }
 
     .event {
-      padding: 14px 16px;
+      display: grid;
+      gap: 9px;
+      padding: 13px 14px;
       border-bottom: 1px solid var(--line);
     }
 
     .event-head {
       display: flex;
-      align-items: center;
+      align-items: flex-start;
       justify-content: space-between;
       gap: 12px;
-      margin-bottom: 8px;
     }
 
     .event-title {
       font-size: 14px;
       font-weight: 700;
+      line-height: 1.35;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .event-main {
+      min-width: 0;
+    }
+
+    .event-score-text {
+      color: var(--blue);
+      font-weight: 750;
+    }
+
+    .event-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+      min-width: 74px;
+      height: 34px;
+      padding: 0 10px;
+      border-radius: 6px;
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-size: 12px;
+      font-weight: 750;
+      white-space: nowrap;
+    }
+
+    .event-badge.up {
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .event-badge.down {
+      background: var(--red-soft);
+      color: var(--red);
+    }
+
+    .event-badge.mixed {
+      background: rgba(242, 184, 75, .12);
+      color: var(--amber);
     }
 
     .event-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px 8px;
+      margin-top: 3px;
       color: var(--muted);
       font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .event-row {
+      display: grid;
+      grid-template-columns: 38px minmax(0, 1fr);
+      gap: 7px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .event-label {
+      color: var(--muted);
+      font-weight: 650;
+    }
+
+    .event-text {
+      min-width: 0;
+      color: var(--text);
+      overflow-wrap: anywhere;
+    }
+
+    .event-text.muted {
+      color: var(--muted);
     }
 
     .reason {
@@ -1055,6 +1689,7 @@ INDEX_HTML = """<!doctype html>
       main { padding: 10px; }
       section { border-radius: 6px; }
       table { min-width: 1080px; }
+      .profile-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -1063,12 +1698,28 @@ INDEX_HTML = """<!doctype html>
     <h1>合约异动监控</h1>
     <div class="toolbar">
       <input id="symbol-input" class="symbol-input" autocomplete="off" spellcheck="false" placeholder="BTCUSDT, ETHUSDT, SOLUSDT">
-      <button id="save-symbols" class="save-btn">保存监控</button>
+      <button id="save-symbols" class="save-btn primary">保存监控</button>
       <button id="btn-telegram" class="save-btn" title="推送设置">推送</button>
-      <button id="btn-ai" class="save-btn" title="AI 设置">AI</button>
+      <button id="btn-ai" class="save-btn ai" title="AI 设置">AI</button>
+      <button id="btn-theme" class="save-btn ghost" title="切换主题">白天</button>
+      <button id="btn-logout" class="save-btn danger" title="退出登录">退出</button>
     </div>
-    <div class="status"><span class="dot"></span><span id="updated">等待数据</span></div>
+    <div class="status"><span class="dot"></span><span id="updated">等待数据</span><button id="user-scope" class="scope-btn" type="button">个人配置</button></div>
   </header>
+
+  <div class="auth-screen" id="auth-screen">
+    <div class="auth-card">
+      <h2 class="auth-title" id="auth-title">登录</h2>
+      <div class="auth-hint" id="auth-hint">登录后加载你的监控列表、AI、Telegram 和阈值配置。</div>
+      <div class="auth-form">
+        <input id="auth-username" autocomplete="username" placeholder="用户名">
+        <input id="auth-password" autocomplete="current-password" type="password" placeholder="密码">
+        <div class="auth-error" id="auth-error"></div>
+        <button class="small-btn primary" id="auth-submit" type="button">登录</button>
+        <button class="small-btn secondary" id="auth-switch" type="button">创建账号</button>
+      </div>
+    </div>
+  </div>
 
   <div class="modal-backdrop" id="telegram-modal">
     <div class="modal-card">
@@ -1085,21 +1736,14 @@ INDEX_HTML = """<!doctype html>
           </div>
         </div>
         <div class="setting-group">
-          <label>Bot Token</label>
-          <input id="tg-token" type="password" placeholder="输入 Bot Token">
-          <div class="setting-help">支持一个机器人绑定多个接收人，适合多人共用同一套报警通道。</div>
-        </div>
-        <div class="setting-group">
-          <label>接收人 Chat IDs</label>
-          <div class="chip-list" id="tg-chips"></div>
-          <div class="setting-row">
-            <input id="tg-new-chat-id" placeholder="输入 Chat ID">
-            <button class="small-btn" id="tg-add-btn" type="button">添加</button>
-          </div>
+          <label>用户推送通道</label>
+          <div class="telegram-users" id="tg-users"></div>
+          <button class="small-btn secondary" id="tg-add-user-btn" type="button">添加通道</button>
+          <div class="setting-help">每个用户可以使用自己的 Bot Token 和 Chat ID；Chat ID 多个时用逗号分隔。</div>
         </div>
         <div class="modal-actions">
           <button class="small-btn secondary" id="close-telegram-btn" type="button">关闭</button>
-          <button class="small-btn" id="tg-save-btn" type="button">保存设置</button>
+          <button class="small-btn primary" id="tg-save-btn" type="button">保存设置</button>
         </div>
       </div>
     </div>
@@ -1140,6 +1784,7 @@ INDEX_HTML = """<!doctype html>
         <div class="setting-group">
           <label>API Key</label>
           <input id="ai-key" type="password" placeholder="输入 API Key">
+          <div class="setting-help">页面输入的 Key 仅用于当前运行进程；长期部署建议写入环境变量。</div>
         </div>
         <div class="setting-group">
           <label>模型</label>
@@ -1148,6 +1793,21 @@ INDEX_HTML = """<!doctype html>
         <div class="setting-group">
           <label>触发阈值</label>
           <input id="ai-threshold" type="number" value="60" min="0" max="100" style="width:90px">
+        </div>
+        <div class="setting-group">
+          <label>触发条件</label>
+          <select id="ai-trigger-mode" style="width:140px">
+            <option value="any">任一条件满足</option>
+            <option value="all">全部条件满足</option>
+          </select>
+          <div class="condition-grid">
+            <label class="condition-row"><input id="ai-trigger-score" type="checkbox"><span>异常分 >=</span><input id="ai-trigger-score-value" type="number" min="0" max="100" value="60"></label>
+            <label class="condition-row"><input id="ai-trigger-volume" type="checkbox"><span>1分钟成交额 >=</span><input id="ai-trigger-volume-value" type="number" min="0" value="500000"></label>
+            <label class="condition-row"><input id="ai-trigger-multiplier" type="checkbox"><span>量能倍数 >=</span><input id="ai-trigger-multiplier-value" type="number" min="0" step="0.1" value="3"></label>
+            <label class="condition-row"><input id="ai-trigger-price" type="checkbox"><span>1分钟波动绝对值 >=</span><input id="ai-trigger-price-value" type="number" min="0" step="0.1" value="0.8"></label>
+            <label class="condition-row"><input id="ai-trigger-oi" type="checkbox"><span>OI 5分钟绝对值 >=</span><input id="ai-trigger-oi-value" type="number" min="0" step="0.1" value="1.5"></label>
+            <label class="condition-row"><input id="ai-trigger-liquidation" type="checkbox"><span>1分钟爆仓额 >=</span><input id="ai-trigger-liquidation-value" type="number" min="0" value="250000"></label>
+          </div>
         </div>
         <div class="setting-group">
           <label>失败冷却秒数</label>
@@ -1159,7 +1819,7 @@ INDEX_HTML = """<!doctype html>
         </div>
         <div class="modal-actions">
           <button class="small-btn secondary" id="close-ai-btn" type="button">关闭</button>
-          <button class="small-btn" id="ai-save-btn" type="button">保存设置</button>
+          <button class="small-btn primary" id="ai-save-btn" type="button">保存设置</button>
         </div>
       </div>
     </div>
@@ -1182,9 +1842,56 @@ INDEX_HTML = """<!doctype html>
           <div class="setting-help" id="threshold-hint">留空或恢复默认时，将回退到全局阈值。</div>
         </div>
         <div class="modal-actions">
-          <button class="small-btn secondary" id="threshold-reset-btn" type="button">恢复默认</button>
+          <button class="small-btn danger" id="threshold-reset-btn" type="button">恢复默认</button>
           <button class="small-btn secondary" id="close-threshold-btn" type="button">关闭</button>
-          <button class="small-btn" id="threshold-save-btn" type="button">保存</button>
+          <button class="small-btn primary" id="threshold-save-btn" type="button">保存</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="profile-modal">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div class="modal-title">个人配置</div>
+        <button id="close-profile-modal" class="modal-close" type="button">x</button>
+      </div>
+      <div class="modal-body">
+        <div class="profile-grid">
+          <div class="profile-item">
+            <div class="profile-label">账号</div>
+            <div class="profile-value" id="profile-name">--</div>
+          </div>
+          <div class="profile-item">
+            <div class="profile-label">角色</div>
+            <div class="profile-value" id="profile-role">--</div>
+          </div>
+          <div class="profile-item">
+            <div class="profile-label">用户 ID</div>
+            <div class="profile-value" id="profile-user-id">--</div>
+          </div>
+          <div class="profile-item">
+            <div class="profile-label">认证</div>
+            <div class="profile-value" id="profile-auth">--</div>
+          </div>
+          <div class="profile-item">
+            <div class="profile-label">监控数量</div>
+            <div class="profile-value" id="profile-symbol-count">0 个合约</div>
+          </div>
+          <div class="profile-item">
+            <div class="profile-label">主题</div>
+            <div class="profile-value" id="profile-theme">夜间</div>
+          </div>
+        </div>
+        <div class="setting-group">
+          <label>当前监控</label>
+          <div class="chip-list" id="profile-symbols"></div>
+        </div>
+        <div class="modal-actions">
+          <button class="small-btn secondary" id="profile-open-telegram" type="button">推送设置</button>
+          <button class="small-btn secondary" id="profile-open-ai" type="button">AI 设置</button>
+          <button class="small-btn danger" id="profile-logout" type="button">退出登录</button>
+          <button class="small-btn primary" id="close-profile-btn" type="button">关闭</button>
         </div>
       </div>
     </div>
@@ -1193,7 +1900,7 @@ INDEX_HTML = """<!doctype html>
   <main>
     <section class="market">
       <div class="section-title">
-        <span>USDT 永续合约</span>
+        <span>我的 USDT 永续合约</span>
         <span id="count">0 个合约</span>
       </div>
       <div class="table-wrap">
@@ -1243,14 +1950,33 @@ INDEX_HTML = """<!doctype html>
     const alertCountEl = document.getElementById("alert-count");
     const symbolInputEl = document.getElementById("symbol-input");
     const saveSymbolsEl = document.getElementById("save-symbols");
+    const btnTheme = document.getElementById("btn-theme");
+    const btnLogout = document.getElementById("btn-logout");
+    const userScopeEl = document.getElementById("user-scope");
     const detailEl = document.getElementById("detail");
     const sourceLabelEl = document.getElementById("source-label");
     const telegramModal = document.getElementById("telegram-modal");
     const aiModal = document.getElementById("ai-modal");
     const thresholdModal = document.getElementById("threshold-modal");
+    const profileModal = document.getElementById("profile-modal");
     const thresholdSymbolEl = document.getElementById("threshold-symbol");
     const thresholdInputEl = document.getElementById("threshold-input");
     const thresholdHintEl = document.getElementById("threshold-hint");
+    const profileNameEl = document.getElementById("profile-name");
+    const profileRoleEl = document.getElementById("profile-role");
+    const profileUserIdEl = document.getElementById("profile-user-id");
+    const profileAuthEl = document.getElementById("profile-auth");
+    const profileSymbolCountEl = document.getElementById("profile-symbol-count");
+    const profileThemeEl = document.getElementById("profile-theme");
+    const profileSymbolsEl = document.getElementById("profile-symbols");
+    const authScreen = document.getElementById("auth-screen");
+    const authTitle = document.getElementById("auth-title");
+    const authHint = document.getElementById("auth-hint");
+    const authUsername = document.getElementById("auth-username");
+    const authPassword = document.getElementById("auth-password");
+    const authError = document.getElementById("auth-error");
+    const authSubmit = document.getElementById("auth-submit");
+    const authSwitch = document.getElementById("auth-switch");
 
     let selectedSymbol = null;
     let inputTouched = false;
@@ -1259,6 +1985,13 @@ INDEX_HTML = """<!doctype html>
     let thresholdEditingSymbol = null;
     let aiResults = {};
     let aiRequestedAt = {};
+    let aiMeta = {};
+    let authStatus = { enabled: false, has_users: false, allow_registration: true };
+    let authMode = "login";
+    let currentUser = null;
+    let authToken = localStorage.getItem("cfm_auth_token") || "";
+    let refreshTimer = null;
+    let lastSymbols = [];
 
     const directionText = {
       up: "向上异动",
@@ -1266,6 +1999,259 @@ INDEX_HTML = """<!doctype html>
       mixed: "混合异常",
       waiting: "等待数据"
     };
+
+    function createUserId() {
+      if (window.crypto && window.crypto.randomUUID) {
+        return `u_${window.crypto.randomUUID().replace(/-/g, "")}`;
+      }
+      return `u_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 14)}`;
+    }
+
+    function getUserId() {
+      const key = "cfm_user_id";
+      let value = localStorage.getItem(key);
+      if (!value) {
+        value = createUserId();
+        localStorage.setItem(key, value);
+      }
+      return value;
+    }
+
+    const userId = getUserId();
+    userScopeEl.textContent = `个人配置 ${userId.slice(-6)}`;
+
+    function storageKey(name) {
+      const scope = currentUser && currentUser.user_id ? currentUser.user_id : userId;
+      return `${name}_${scope}`;
+    }
+
+    function requestHeaders(extra = {}) {
+      const headers = Object.assign({ "X-CFM-User": userId }, extra);
+      if (authToken) headers.Authorization = `Bearer ${authToken}`;
+      return headers;
+    }
+
+    async function apiFetch(url, options = {}) {
+      const response = await fetch(url, Object.assign({}, options, {
+        headers: requestHeaders(options.headers || {})
+      }));
+      if (response.status === 401 && authStatus.enabled) {
+        localStorage.removeItem("cfm_auth_token");
+        authToken = "";
+        currentUser = null;
+        stopRefreshTimer();
+        resetViewState();
+        showAuth("login");
+      }
+      return response;
+    }
+
+    function stopRefreshTimer() {
+      if (refreshTimer) {
+        clearInterval(refreshTimer);
+        refreshTimer = null;
+      }
+    }
+
+    function resetViewState() {
+      selectedSymbol = null;
+      inputTouched = false;
+      symbolThresholds = {};
+      globalThreshold = 70;
+      thresholdEditingSymbol = null;
+      lastSymbols = [];
+      aiResults = {};
+      aiRequestedAt = {};
+      aiMeta = {};
+      symbolInputEl.value = "";
+      symbolsEl.innerHTML = "";
+      eventsEl.innerHTML = `<div class="empty">暂无报警</div>`;
+      detailEl.innerHTML = `<div class="empty">等待行情数据</div>`;
+      countEl.textContent = "0 个合约";
+      alertCountEl.textContent = "0";
+    }
+
+    function applyTheme(theme) {
+      const light = theme === "light";
+      document.body.classList.toggle("light", light);
+      btnTheme.textContent = light ? "夜间" : "白天";
+      localStorage.setItem(storageKey("cfm_theme"), light ? "light" : "dark");
+    }
+
+    applyTheme(localStorage.getItem(storageKey("cfm_theme")) || "dark");
+    btnTheme.addEventListener("click", () => {
+      applyTheme(document.body.classList.contains("light") ? "dark" : "light");
+    });
+
+    function updateAuthUser(user) {
+      currentUser = user;
+      if (user && user.username) {
+        userScopeEl.textContent = `${user.username} · 个人配置`;
+        userScopeEl.title = "打开个人配置";
+      } else {
+        userScopeEl.textContent = `个人配置 ${userId.slice(-6)}`;
+        userScopeEl.title = "打开个人配置";
+      }
+    }
+
+    function renderProfileModal() {
+      const theme = document.body.classList.contains("light") ? "白天" : "夜间";
+      profileNameEl.textContent = currentUser && currentUser.username ? currentUser.username : "本地用户";
+      profileRoleEl.textContent = currentUser && currentUser.role ? currentUser.role : (authStatus.enabled ? "未登录" : "local");
+      profileUserIdEl.textContent = currentUser && currentUser.user_id ? currentUser.user_id : userId;
+      profileAuthEl.textContent = authStatus.enabled ? "JWT 已启用" : "本地模式";
+      profileSymbolCountEl.textContent = `${lastSymbols.length} 个合约`;
+      profileThemeEl.textContent = theme;
+      profileSymbolsEl.innerHTML = lastSymbols.length
+        ? lastSymbols.map((symbol) => `<span class="chip">${esc(symbol.symbol || symbol)}</span>`).join("")
+        : `<span class="muted">暂无监控对象</span>`;
+    }
+
+    function openProfileModal() {
+      renderProfileModal();
+      openModal(profileModal);
+    }
+
+    function showAuth(mode = "login") {
+      if (!authStatus.enabled) return;
+      authMode = mode;
+      const registerMode = authMode === "register";
+      authTitle.textContent = registerMode ? "创建管理员账号" : "登录";
+      authHint.textContent = registerMode
+        ? "首次部署请创建管理员账号。后续用户注册默认关闭，可在配置中开启。"
+        : "登录后加载你的监控列表、AI、Telegram 和阈值配置。";
+      authSubmit.textContent = registerMode ? "创建并登录" : "登录";
+      authSwitch.textContent = registerMode ? "返回登录" : "创建账号";
+      authSwitch.style.display = authStatus.allow_registration ? "block" : "none";
+      authError.textContent = "";
+      authPassword.value = "";
+      authScreen.classList.add("open");
+      setTimeout(() => authUsername.focus(), 0);
+    }
+
+    function hideAuth() {
+      authScreen.classList.remove("open");
+      authError.textContent = "";
+    }
+
+    async function loadAuthStatus() {
+      const response = await fetch("/api/auth/status", { cache: "no-store" });
+      authStatus = await response.json();
+      if (!authStatus.has_users && authStatus.enabled) {
+        authStatus.allow_registration = true;
+      }
+    }
+
+    async function verifyStoredToken() {
+      if (!authToken) return false;
+      const response = await apiFetch("/api/auth/me", { cache: "no-store" });
+      if (!response.ok) return false;
+      const data = await response.json();
+      if (!data.ok || !data.user) return false;
+      updateAuthUser(data.user);
+      return true;
+    }
+
+    async function submitAuth() {
+      const username = authUsername.value.trim();
+      const password = authPassword.value;
+      authSubmit.disabled = true;
+      authSubmit.textContent = authMode === "register" ? "创建中" : "登录中";
+      authError.textContent = "";
+      try {
+        const endpoint = authMode === "register" ? "/api/auth/register" : "/api/auth/login";
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username, password })
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "认证失败");
+        authToken = data.token;
+        localStorage.setItem("cfm_auth_token", authToken);
+        updateAuthUser(data.user);
+        hideAuth();
+        startApp();
+      } catch (error) {
+        authError.textContent = error.message || "认证失败";
+      } finally {
+        authSubmit.disabled = false;
+        authSubmit.textContent = authMode === "register" ? "创建并登录" : "登录";
+      }
+    }
+
+    function logout() {
+      localStorage.removeItem("cfm_auth_token");
+      authToken = "";
+      updateAuthUser(null);
+      stopRefreshTimer();
+      resetViewState();
+      showAuth("login");
+    }
+
+    function startApp() {
+      stopRefreshTimer();
+      resetViewState();
+      authScreen.classList.remove("open");
+      applyTheme(localStorage.getItem(storageKey("cfm_theme")) || "dark");
+      loadStoredAIResults();
+      loadSymbolThresholds().then(refresh);
+      refreshTimer = setInterval(refresh, 1000);
+    }
+
+    async function bootstrap() {
+      try {
+        await loadAuthStatus();
+        if (!authStatus.enabled) {
+          btnLogout.style.display = "none";
+          startApp();
+          return;
+        }
+        btnLogout.style.display = "inline-block";
+        const ok = await verifyStoredToken();
+        if (ok) {
+          startApp();
+          return;
+        }
+        showAuth(authStatus.has_users ? "login" : "register");
+      } catch (error) {
+        updatedEl.textContent = "认证服务不可用";
+        showAuth("login");
+      }
+    }
+
+    authSubmit.addEventListener("click", submitAuth);
+    authSwitch.addEventListener("click", () => {
+      showAuth(authMode === "register" ? "login" : "register");
+    });
+    [authUsername, authPassword].forEach((input) => {
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") submitAuth();
+      });
+    });
+    btnLogout.addEventListener("click", logout);
+    userScopeEl.addEventListener("click", openProfileModal);
+
+    function loadStoredAIResults() {
+      try {
+        const raw = JSON.parse(localStorage.getItem(storageKey("cfm_ai_results")) || "{}");
+        const now = Date.now();
+        Object.entries(raw).forEach(([symbol, value]) => {
+          if (value && value.text && now - Number(value.ts || 0) < 30 * 60 * 1000) {
+            aiResults[symbol] = value.text;
+          }
+        });
+      } catch (error) {}
+    }
+
+    function saveAIResult(symbol, text) {
+      aiResults[symbol] = text;
+      try {
+        const raw = JSON.parse(localStorage.getItem(storageKey("cfm_ai_results")) || "{}");
+        raw[symbol] = { text, ts: Date.now() };
+        localStorage.setItem(storageKey("cfm_ai_results"), JSON.stringify(raw));
+      } catch (error) {}
+    }
 
     function esc(value) {
       return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -1303,6 +2289,44 @@ INDEX_HTML = """<!doctype html>
       return `<span class="${cls}">${number.toFixed(2)}</span>`;
     }
 
+    function liquidationStatusText(symbol) {
+      const status = symbol.liquidation_data_status || "unavailable";
+      if (status === "recent_event") return "有强平";
+      if (status === "no_recent_event") return "0 / 无强平";
+      return "未接入";
+    }
+
+    function liquidationStatusClass(symbol) {
+      const status = symbol.liquidation_data_status || "unavailable";
+      if (status === "recent_event") return "down";
+      if (status === "no_recent_event") return "muted";
+      return "mixed";
+    }
+
+    function liquidationTotalHtml(symbol) {
+      if ((symbol.liquidation_data_status || "unavailable") === "unavailable") {
+        return `<span class="mixed">未接入</span>`;
+      }
+      if ((symbol.liquidation_data_status || "") === "no_recent_event") {
+        return `<span class="muted">0 / 无强平</span>`;
+      }
+      return `<span class="down">${fmtNumber(symbol.liquidation_total_quote_1m, 0)}</span>`;
+    }
+
+    function liquidationSideHtml(symbol, key) {
+      if ((symbol.liquidation_data_status || "unavailable") === "unavailable") {
+        return `<span class="mixed">未接入</span>`;
+      }
+      return fmtNumber(symbol[key], 0);
+    }
+
+    function microstructureStatusHtml(symbol) {
+      if ((symbol.microstructure_status || "unavailable") === "active") {
+        return `<span class="up">流活跃</span>`;
+      }
+      return `<span class="mixed">未接入</span>`;
+    }
+
     function riskClass(level) {
       if (level && level.includes("高")) return "risk-high";
       if (level && level.includes("中")) return "risk-mid";
@@ -1332,7 +2356,7 @@ INDEX_HTML = """<!doctype html>
       if (Math.abs(Number(symbol.price_move_pct_1m || 0)) >= 0.8) return "急动";
       if (Number(symbol.volume_multiplier || 0) >= 3) return "放量";
       if (Math.abs(Number(symbol.oi_change_pct_5m || 0)) >= 0.3) return "OI";
-      if (Number(symbol.liquidation_total_quote_1m || 0) >= 250000) return "爆仓";
+      if ((symbol.liquidation_data_status || "") === "recent_event" && Number(symbol.liquidation_total_quote_1m || 0) >= 250000) return "爆仓";
       if (Number(symbol.spread_bps || 0) >= 4 || Number(symbol.depth_drop_pct_1m || 0) >= 18) return "盘口";
       if (Math.abs(Number(symbol.funding_rate || 0)) >= 0.0005) return "费率";
       if (Number(symbol.score || 0) > 0) return "监测";
@@ -1361,14 +2385,36 @@ INDEX_HTML = """<!doctype html>
       return `全局 ${fmtNumber(globalThreshold, 1)} 分`;
     }
 
+    function aiStatusLine(symbol) {
+      const meta = aiMeta[symbol];
+      if (!meta) return "";
+      const timeText = meta.ts ? new Date(meta.ts).toLocaleTimeString() : "";
+      return `<div class="ai-status"><strong>${esc(meta.status)}</strong><span>${esc(timeText)}</span></div>`;
+    }
+
     function renderAIBlock(symbol) {
       const text = aiResults[symbol];
-      if (!text) return `<div class="muted">等待 AI 根据当前合约指标生成观察建议。</div>`;
-      return text.split("\\n")
+      if (!text) {
+        return `${aiStatusLine(symbol)}<div class="muted">等待 AI 根据当前合约指标生成观察建议。</div>`;
+      }
+      return aiStatusLine(symbol) + text.split("\\n")
         .map((line) => line.trim())
         .filter(Boolean)
         .map((line) => `<div>${esc(line)}</div>`)
         .join("");
+    }
+
+    function eventLevel(event) {
+      const score = Number(event.score || 0);
+      if (score >= 70) return "风险预警";
+      if (score >= 45) return "关注信号";
+      return "观察信号";
+    }
+
+    function eventDirectionClass(event) {
+      if (event.direction === "up") return "up";
+      if (event.direction === "down") return "down";
+      return "mixed";
     }
 
     function openModal(modal) {
@@ -1380,6 +2426,7 @@ INDEX_HTML = """<!doctype html>
     }
 
     function renderSymbols(symbols) {
+      lastSymbols = symbols || [];
       countEl.textContent = `${symbols.length} 个合约`;
       if (!selectedSymbol && symbols.length) selectedSymbol = symbols[0].symbol;
       if (selectedSymbol && !symbols.some((symbol) => symbol.symbol === selectedSymbol)) {
@@ -1407,7 +2454,7 @@ INDEX_HTML = """<!doctype html>
           <td>${fmtNumber(symbol.quote_volume_1m, 0)}</td>
           <td class="${rowClass(symbol)}">${fmtNumber(symbol.volume_multiplier, 2)}x</td>
           <td>${fmtPct(symbol.oi_change_pct_5m)}</td>
-          <td>${fmtNumber(symbol.liquidation_total_quote_1m, 0)}</td>
+          <td>${liquidationTotalHtml(symbol)}</td>
           <td>${fmtBps(symbol.spread_bps)}</td>
         </tr>
       `).join("");
@@ -1459,8 +2506,11 @@ INDEX_HTML = """<!doctype html>
           <div class="metric"><div class="metric-label">量能倍数</div><div class="metric-value ${rowClass(symbol)}">${fmtNumber(symbol.volume_multiplier, 2)}x</div></div>
           <div class="metric"><div class="metric-label">OI 5分钟</div><div class="metric-value">${fmtPct(symbol.oi_change_pct_5m)}</div></div>
           <div class="metric"><div class="metric-label">资金费率</div><div class="metric-value">${fmtFunding(symbol.funding_rate)}</div></div>
-          <div class="metric"><div class="metric-label">多头爆仓 1m</div><div class="metric-value">${fmtNumber(symbol.long_liquidation_quote_1m, 0)}</div></div>
-          <div class="metric"><div class="metric-label">空头爆仓 1m</div><div class="metric-value">${fmtNumber(symbol.short_liquidation_quote_1m, 0)}</div></div>
+          <div class="metric"><div class="metric-label">爆仓状态</div><div class="metric-value ${liquidationStatusClass(symbol)}">${liquidationStatusText(symbol)}</div></div>
+          <div class="metric"><div class="metric-label">强平事件 1m</div><div class="metric-value">${fmtNumber(symbol.liquidation_event_count_1m, 0)}</div></div>
+          <div class="metric"><div class="metric-label">多头爆仓 1m</div><div class="metric-value">${liquidationSideHtml(symbol, "long_liquidation_quote_1m")}</div></div>
+          <div class="metric"><div class="metric-label">空头爆仓 1m</div><div class="metric-value">${liquidationSideHtml(symbol, "short_liquidation_quote_1m")}</div></div>
+          <div class="metric"><div class="metric-label">微观结构</div><div class="metric-value">${microstructureStatusHtml(symbol)}</div></div>
           <div class="metric"><div class="metric-label">盘口点差</div><div class="metric-value">${fmtBps(symbol.spread_bps)} bps</div></div>
           <div class="metric"><div class="metric-label">盘口深度下降</div><div class="metric-value">${fmtNumber(symbol.depth_drop_pct_1m, 1)}%</div></div>
           <div class="metric"><div class="metric-label">买盘深度</div><div class="metric-value">${fmtNumber(symbol.bid_depth_notional, 0)}</div></div>
@@ -1490,24 +2540,36 @@ INDEX_HTML = """<!doctype html>
         eventsEl.innerHTML = `<div class="empty">暂无报警</div>`;
         return;
       }
-      eventsEl.innerHTML = events.map((event) => `
-        <div class="event">
-          <div class="event-head">
-            <div>
-              <div class="event-title ${esc(event.direction)}">${esc(event.symbol)} 异常分 ${fmtNumber(event.score, 1)}/100</div>
-              <div class="event-meta">${esc(event.created_at || "")} · ${esc(event.risk_level || "")} · ${esc(event.bias || "")}</div>
+      eventsEl.innerHTML = events.map((event) => {
+        const reasons = (event.reasons || []).join("; ") || "暂无明确触发项";
+        const suggestions = (event.suggestions || []).join("; ") || "继续观察盘口与量价变化";
+        const directionClass = eventDirectionClass(event);
+        const directionLabel = directionText[event.direction] || event.direction || "异常";
+        return `
+          <div class="event">
+            <div class="event-head">
+              <div class="event-main">
+                <div class="event-title ${directionClass}">${esc(event.symbol)} <span class="event-score-text">${fmtNumber(event.score, 1)}/100</span></div>
+                <div class="event-meta">
+                  <span>${esc(event.created_at || "")}</span>
+                  <span>${esc(eventLevel(event))}</span>
+                  <span>${esc(event.risk_level || "")}</span>
+                  <span>${esc(event.bias || "")}</span>
+                </div>
+              </div>
+              <span class="event-badge ${directionClass}">${esc(directionLabel)}</span>
             </div>
-            <span class="score">${esc(directionText[event.direction] || event.direction || "异常")}</span>
+            <div class="event-row"><span class="event-label">触发</span><span class="event-text">${esc(reasons)}</span></div>
+            <div class="event-row"><span class="event-label">观察</span><span class="event-text muted">${esc(suggestions)}</span></div>
           </div>
-          <div class="reason">${esc((event.reasons || []).join("; "))}</div>
-          <div class="reason">观察：${esc((event.suggestions || []).join("; "))}</div>
-        </div>
-      `).join("");
+        `;
+      }).join("");
     }
 
     async function refresh() {
       try {
-        const response = await fetch("/api/state", { cache: "no-store" });
+        const response = await apiFetch("/api/state", { cache: "no-store" });
+        if (!response.ok) return;
         const data = await response.json();
         sourceLabelEl.textContent = data.data_source === "websocket" ? "WebSocket" : "REST";
         renderSymbols(data.symbols || []);
@@ -1528,7 +2590,7 @@ INDEX_HTML = """<!doctype html>
       saveSymbolsEl.disabled = true;
       saveSymbolsEl.textContent = "保存中";
       try {
-        const response = await fetch("/api/symbols", {
+        const response = await apiFetch("/api/symbols", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ symbols })
@@ -1556,12 +2618,10 @@ INDEX_HTML = """<!doctype html>
     const btnAI = document.getElementById("btn-ai");
     const tgToggle = document.getElementById("tg-toggle");
     const tgToggleLabel = document.getElementById("tg-toggle-label");
-    const tgToken = document.getElementById("tg-token");
-    const tgChips = document.getElementById("tg-chips");
-    const tgNewId = document.getElementById("tg-new-chat-id");
-    const tgAddBtn = document.getElementById("tg-add-btn");
+    const tgUsersEl = document.getElementById("tg-users");
+    const tgAddUserBtn = document.getElementById("tg-add-user-btn");
     const tgSaveBtn = document.getElementById("tg-save-btn");
-    let tgChatIds = [];
+    let tgUsers = [];
     let tgEnabled = false;
 
     function setToggle(toggle, label, enabled) {
@@ -1569,48 +2629,59 @@ INDEX_HTML = """<!doctype html>
       label.textContent = enabled ? "开启" : "关闭";
     }
 
-    function renderTgChips() {
-      tgChips.innerHTML = tgChatIds.map((id) =>
-        `<span class="chip">${esc(id)} <span class="chip-x" data-id="${esc(id)}">&times;</span></span>`
-      ).join("");
-      tgChips.querySelectorAll(".chip-x").forEach((el) => {
-        el.addEventListener("click", () => {
-          tgChatIds = tgChatIds.filter((chatId) => chatId !== el.dataset.id);
-          renderTgChips();
+    function renderTgUsers() {
+      tgUsersEl.innerHTML = tgUsers.map((user, index) => `
+        <div class="telegram-user" data-index="${index}">
+          <input class="tg-user-name" placeholder="用户名" value="${esc(user.name || "")}">
+          <input class="tg-user-token" type="password" placeholder="Bot Token" value="${user.bot_token_set ? "********" : esc(user.bot_token || "")}">
+          <input class="tg-user-chat" placeholder="Chat ID，多个用逗号" value="${esc((user.chat_ids || []).join(", "))}">
+          <button class="small-btn secondary tg-user-remove" type="button">删除</button>
+        </div>
+      `).join("");
+      tgUsersEl.querySelectorAll(".tg-user-remove").forEach((button) => {
+        button.addEventListener("click", () => {
+          const row = button.closest(".telegram-user");
+          tgUsers.splice(Number(row.dataset.index), 1);
+          renderTgUsers();
         });
       });
     }
 
     async function loadTelegramConfig() {
       try {
-        const response = await fetch("/api/telegram", { cache: "no-store" });
+        const response = await apiFetch("/api/telegram", { cache: "no-store" });
         const data = await response.json();
         tgEnabled = Boolean(data.enabled);
-        tgChatIds = data.chat_ids || [];
-        tgToken.value = data.bot_token_set ? "********" : "";
+        tgUsers = data.users || [];
+        if (!tgUsers.length) {
+          tgUsers = [{ name: "默认用户", enabled: true, bot_token: "", chat_ids: [] }];
+        }
         setToggle(tgToggle, tgToggleLabel, tgEnabled);
-        renderTgChips();
+        renderTgUsers();
       } catch (error) {
         updatedEl.textContent = "推送配置读取失败";
       }
     }
 
-    function addTelegramChatId() {
-      const value = tgNewId.value.trim();
-      if (value && !tgChatIds.includes(value)) {
-        tgChatIds.push(value);
-        tgNewId.value = "";
-        renderTgChips();
-      }
+    function collectTgUsers() {
+      return Array.from(tgUsersEl.querySelectorAll(".telegram-user")).map((row, index) => {
+        const chatIds = row.querySelector(".tg-user-chat").value
+          .split(/[\\s,，;；]+/)
+          .map((item) => item.trim())
+          .filter(Boolean);
+        return {
+          name: row.querySelector(".tg-user-name").value.trim() || `用户${index + 1}`,
+          enabled: true,
+          bot_token: row.querySelector(".tg-user-token").value.trim(),
+          chat_ids: chatIds
+        };
+      });
     }
 
     async function saveTelegramConfig() {
-      const body = { enabled: tgEnabled, chat_ids: tgChatIds };
-      if (tgToken.value && !tgToken.value.includes("***") && setOfStars(tgToken.value) === false) {
-        body.bot_token = tgToken.value;
-      }
+      const body = { enabled: tgEnabled, users: collectTgUsers() };
       try {
-        const response = await fetch("/api/telegram", {
+        const response = await apiFetch("/api/telegram", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body)
@@ -1636,9 +2707,9 @@ INDEX_HTML = """<!doctype html>
       tgEnabled = !tgEnabled;
       setToggle(tgToggle, tgToggleLabel, tgEnabled);
     });
-    tgAddBtn.addEventListener("click", addTelegramChatId);
-    tgNewId.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") addTelegramChatId();
+    tgAddUserBtn.addEventListener("click", () => {
+      tgUsers.push({ name: `用户${tgUsers.length + 1}`, enabled: true, bot_token: "", chat_ids: [] });
+      renderTgUsers();
     });
     tgSaveBtn.addEventListener("click", saveTelegramConfig);
 
@@ -1651,12 +2722,21 @@ INDEX_HTML = """<!doctype html>
     const aiThreshold = document.getElementById("ai-threshold");
     const aiRetryCooldown = document.getElementById("ai-retry-cooldown");
     const aiTimeout = document.getElementById("ai-timeout");
+    const aiTriggerMode = document.getElementById("ai-trigger-mode");
+    const aiTriggerFields = {
+      score: [document.getElementById("ai-trigger-score"), document.getElementById("ai-trigger-score-value")],
+      quote_volume_1m: [document.getElementById("ai-trigger-volume"), document.getElementById("ai-trigger-volume-value")],
+      volume_multiplier: [document.getElementById("ai-trigger-multiplier"), document.getElementById("ai-trigger-multiplier-value")],
+      price_move_pct_1m_abs: [document.getElementById("ai-trigger-price"), document.getElementById("ai-trigger-price-value")],
+      oi_change_pct_5m_abs: [document.getElementById("ai-trigger-oi"), document.getElementById("ai-trigger-oi-value")],
+      liquidation_total_quote_1m: [document.getElementById("ai-trigger-liquidation"), document.getElementById("ai-trigger-liquidation-value")]
+    };
     const aiSaveBtn = document.getElementById("ai-save-btn");
     let aiEnabled = false;
 
     async function loadAIConfig() {
       try {
-        const response = await fetch("/api/ai/config", { cache: "no-store" });
+        const response = await apiFetch("/api/ai/config", { cache: "no-store" });
         const data = await response.json();
         aiEnabled = Boolean(data.enabled);
         setToggle(aiToggle, aiToggleLabel, aiEnabled);
@@ -1667,9 +2747,28 @@ INDEX_HTML = """<!doctype html>
         aiThreshold.value = data.activation_threshold || 60;
         aiRetryCooldown.value = data.retry_cooldown_seconds || 120;
         aiTimeout.value = data.request_timeout_seconds || 30;
+        const triggers = data.triggers || {};
+        const conditions = triggers.conditions || {};
+        aiTriggerMode.value = triggers.mode || "any";
+        Object.entries(aiTriggerFields).forEach(([key, fields]) => {
+          const cfg = conditions[key] || {};
+          fields[0].checked = Boolean(cfg.enabled ?? (key === "score"));
+          fields[1].value = cfg.threshold ?? fields[1].value;
+        });
       } catch (error) {
         updatedEl.textContent = "AI 配置读取失败";
       }
+    }
+
+    function collectAITriggers() {
+      const conditions = {};
+      Object.entries(aiTriggerFields).forEach(([key, fields]) => {
+        conditions[key] = {
+          enabled: fields[0].checked,
+          threshold: Number(fields[1].value) || 0
+        };
+      });
+      return { mode: aiTriggerMode.value || "any", conditions };
     }
 
     async function saveAIConfig() {
@@ -1680,13 +2779,14 @@ INDEX_HTML = """<!doctype html>
         model: aiModel.value.trim() || "gpt-4o-mini",
         activation_threshold: Number(aiThreshold.value) || 60,
         retry_cooldown_seconds: Number(aiRetryCooldown.value) || 120,
-        request_timeout_seconds: Math.max(5, Math.min(30, Number(aiTimeout.value) || 30))
+        request_timeout_seconds: Math.max(5, Math.min(30, Number(aiTimeout.value) || 30)),
+        triggers: collectAITriggers()
       };
       if (aiKey.value && !aiKey.value.includes("***") && setOfStars(aiKey.value) === false) {
         body.api_key = aiKey.value;
       }
       try {
-        const response = await fetch("/api/ai/config", {
+        const response = await apiFetch("/api/ai/config", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body)
@@ -1713,7 +2813,7 @@ INDEX_HTML = """<!doctype html>
 
     async function loadSymbolThresholds() {
       try {
-        const response = await fetch("/api/symbol_thresholds", { cache: "no-store" });
+        const response = await apiFetch("/api/symbol_thresholds", { cache: "no-store" });
         const data = await response.json();
         globalThreshold = Number(data.default_score || 70);
         symbolThresholds = data.symbol_thresholds || {};
@@ -1735,7 +2835,7 @@ INDEX_HTML = """<!doctype html>
 
     async function saveSymbolThreshold(symbol, score) {
       try {
-        const response = await fetch("/api/symbol_thresholds", {
+        const response = await apiFetch("/api/symbol_thresholds", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ symbol, anomaly_score: score })
@@ -1772,12 +2872,30 @@ INDEX_HTML = """<!doctype html>
       aiRequestedAt[symbol] = Date.now();
       try {
         const url = `/api/ai/analysis?symbol=${encodeURIComponent(symbol)}${force ? "&force=1" : ""}`;
-        const response = await fetch(url, { cache: "no-store" });
+        const response = await apiFetch(url, { cache: "no-store" });
         const data = await response.json();
         if (data.analysis) {
-          aiResults[symbol] = data.analysis;
+          saveAIResult(symbol, data.analysis);
+          aiMeta[symbol] = {
+            status: data.cached ? "使用缓存" : "已更新",
+            ts: Date.now()
+          };
         } else {
-          aiResults[symbol] = data.reason || "暂无分析";
+          const reason = data.reason || "暂无分析";
+          if (reason === "ai trigger not met") {
+            aiMeta[symbol] = { status: "触发条件未满足", ts: Date.now() };
+            if (aiBlock && selectedSymbol === symbol) {
+              aiBlock.innerHTML = renderAIBlock(symbol);
+            }
+            updatedEl.textContent = "AI 触发条件未满足";
+            return;
+          }
+          if (reason === "retry cooldown") {
+            aiMeta[symbol] = { status: "冷却中", ts: Date.now() };
+          } else {
+            aiMeta[symbol] = { status: reason, ts: Date.now() };
+            aiResults[symbol] = reason;
+          }
         }
         if (aiBlock && selectedSymbol === symbol) {
           aiBlock.innerHTML = renderAIBlock(symbol);
@@ -1791,7 +2909,6 @@ INDEX_HTML = """<!doctype html>
 
     function maybeLoadAIAnalysis(symbol) {
       if (!symbol || aiResults[symbol.symbol]) return;
-      if (Number(symbol.score || 0) < 60) return;
       const lastRequested = aiRequestedAt[symbol.symbol] || 0;
       if (Date.now() - lastRequested < 60000) return;
       fetchAIAnalysis(symbol.symbol, false);
@@ -1803,7 +2920,24 @@ INDEX_HTML = """<!doctype html>
       }
     });
 
+    document.getElementById("profile-open-telegram").addEventListener("click", async () => {
+      closeModal(profileModal);
+      await loadTelegramConfig();
+      openModal(telegramModal);
+    });
+    document.getElementById("profile-open-ai").addEventListener("click", async () => {
+      closeModal(profileModal);
+      await loadAIConfig();
+      openModal(aiModal);
+    });
+    document.getElementById("profile-logout").addEventListener("click", () => {
+      closeModal(profileModal);
+      logout();
+    });
+
     [
+      ["close-profile-modal", profileModal],
+      ["close-profile-btn", profileModal],
       ["close-telegram-modal", telegramModal],
       ["close-telegram-btn", telegramModal],
       ["close-ai-modal", aiModal],
@@ -1813,21 +2947,21 @@ INDEX_HTML = """<!doctype html>
     ].forEach(([id, modal]) => {
       document.getElementById(id).addEventListener("click", () => closeModal(modal));
     });
-    [telegramModal, aiModal, thresholdModal].forEach((modal) => {
+    [profileModal, telegramModal, aiModal, thresholdModal].forEach((modal) => {
       modal.addEventListener("click", (event) => {
         if (event.target === modal) closeModal(modal);
       });
     });
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
+        closeModal(profileModal);
         closeModal(telegramModal);
         closeModal(aiModal);
         closeModal(thresholdModal);
       }
     });
 
-    loadSymbolThresholds().then(refresh);
-    setInterval(refresh, 1000);
+    bootstrap();
   </script>
 </body>
 </html>

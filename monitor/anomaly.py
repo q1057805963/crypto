@@ -56,6 +56,11 @@ class SymbolSnapshot:
     long_liquidation_quote_1m: float
     short_liquidation_quote_1m: float
     liquidation_total_quote_1m: float
+    liquidation_event_count_1m: int
+    liquidation_data_status: str
+    microstructure_status: str
+    depth_data_age_seconds: float | None
+    last_liquidation_age_seconds: float | None
     risk_level: str
     bias: str
     confidence: float
@@ -186,6 +191,11 @@ class AnomalyDetector:
             long_liquidation_quote_1m=round(metrics["long_liquidation_quote_1m"], 2),
             short_liquidation_quote_1m=round(metrics["short_liquidation_quote_1m"], 2),
             liquidation_total_quote_1m=round(metrics["liquidation_total_quote_1m"], 2),
+            liquidation_event_count_1m=metrics["liquidation_event_count_1m"],
+            liquidation_data_status=metrics["liquidation_data_status"],
+            microstructure_status=metrics["microstructure_status"],
+            depth_data_age_seconds=metrics["depth_data_age_seconds"],
+            last_liquidation_age_seconds=metrics["last_liquidation_age_seconds"],
             risk_level=metrics["risk_level"],
             bias=metrics["bias"],
             confidence=round(metrics["confidence"], 1),
@@ -257,6 +267,11 @@ class AnomalyDetector:
         long_liquidation_quote_1m = float(trades_1m[-1].get("long_liquidation_quote_1m") or 0)
         short_liquidation_quote_1m = float(trades_1m[-1].get("short_liquidation_quote_1m") or 0)
         liquidation_total_quote_1m = float(trades_1m[-1].get("liquidation_total_quote_1m") or 0)
+        liquidation_event_count_1m = int(trades_1m[-1].get("liquidation_event_count_1m") or 0)
+        liquidation_data_status = str(trades_1m[-1].get("liquidation_data_status") or "unavailable")
+        microstructure_status = str(trades_1m[-1].get("microstructure_status") or "unavailable")
+        depth_data_age_seconds = trades_1m[-1].get("depth_data_age_seconds")
+        last_liquidation_age_seconds = trades_1m[-1].get("last_liquidation_age_seconds")
 
         quote_volume_1m = sum(trade["quote_quantity"] for trade in trades_1m)
         quote_volume_window = sum(trade["quote_quantity"] for trade in window.trades)
@@ -341,6 +356,11 @@ class AnomalyDetector:
             "long_liquidation_quote_1m": long_liquidation_quote_1m,
             "short_liquidation_quote_1m": short_liquidation_quote_1m,
             "liquidation_total_quote_1m": liquidation_total_quote_1m,
+            "liquidation_event_count_1m": liquidation_event_count_1m,
+            "liquidation_data_status": liquidation_data_status,
+            "microstructure_status": microstructure_status,
+            "depth_data_age_seconds": depth_data_age_seconds,
+            "last_liquidation_age_seconds": last_liquidation_age_seconds,
             "risk_level": risk_level,
             "bias": bias,
             "confidence": confidence,

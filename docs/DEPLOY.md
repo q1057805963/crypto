@@ -17,7 +17,7 @@ This keeps secrets out of the repository.
 ```bash
 export CFM_TELEGRAM_ENABLED=true
 export CFM_TELEGRAM_BOT_TOKEN="your_bot_token"
-export CFM_TELEGRAM_CHAT_ID="your_chat_id"
+export CFM_TELEGRAM_CHAT_IDS="your_chat_id"
 ```
 
 Supported variables:
@@ -25,9 +25,13 @@ Supported variables:
 ```bash
 CFM_TELEGRAM_ENABLED=true
 CFM_TELEGRAM_BOT_TOKEN=your_bot_token
-CFM_TELEGRAM_CHAT_ID=your_chat_id
+CFM_TELEGRAM_CHAT_IDS=your_chat_id
 CFM_DASHBOARD_HOST=0.0.0.0
 CFM_DASHBOARD_PORT=8765
+CFM_AUTH_ENABLED=true
+CFM_AUTH_SECRET=replace_with_a_long_random_secret
+CFM_AUTH_ALLOW_REGISTRATION=false
+CFM_AUTH_TOKEN_TTL_SECONDS=604800
 ```
 
 ### Alternative: config.yaml
@@ -36,7 +40,8 @@ CFM_DASHBOARD_PORT=8765
 telegram:
   enabled: true
   bot_token: "your bot token"
-  chat_id: "your chat id"
+  chat_ids:
+    - "your chat id"
 ```
 
 ### How to get the bot token
@@ -123,9 +128,35 @@ dashboard:
   port: 8765
 ```
 
-If you expose the port publicly, place it behind a firewall or reverse proxy. The safer default is to keep `127.0.0.1` and use Nginx or an SSH tunnel.
+If you expose the port publicly, place it behind a firewall or reverse proxy. The safer default is to keep `127.0.0.1` and use Nginx/Caddy or an SSH tunnel.
 
-## 4. Manual Start
+JWT tokens are sent by the browser on every API request. On a real VPS, use HTTPS at the reverse proxy layer before opening this to the public internet.
+
+## 4. Login and JWT
+
+JWT login is enabled by default.
+
+- First visit: create the first admin account in the browser.
+- Later visits: log in with that account.
+- Registration is closed after the first user unless `CFM_AUTH_ALLOW_REGISTRATION=true`.
+- User passwords and JWT signing keys are stored under `data/`, which is ignored by Git.
+- Each user's symbols, Telegram, AI and push threshold settings are stored separately by JWT user id.
+
+For VPS deployment, set a stable secret:
+
+```bash
+openssl rand -base64 48
+```
+
+Put the generated value into:
+
+```bash
+CFM_AUTH_SECRET=your_generated_secret
+```
+
+Keep this value stable across restarts. If it changes, existing browser tokens will be invalidated and users need to log in again.
+
+## 5. Manual Start
 
 From the project root:
 
@@ -135,7 +166,7 @@ source .venv/bin/activate
 python main.py --config config.yaml
 ```
 
-## 5. systemd Service
+## 6. systemd Service
 
 Templates already exist in:
 
@@ -153,9 +184,12 @@ Edit it and fill in real values:
 ```bash
 CFM_TELEGRAM_ENABLED=true
 CFM_TELEGRAM_BOT_TOKEN=your_bot_token
-CFM_TELEGRAM_CHAT_ID=your_chat_id
+CFM_TELEGRAM_CHAT_IDS=your_chat_id
 CFM_DASHBOARD_HOST=0.0.0.0
 CFM_DASHBOARD_PORT=8765
+CFM_AUTH_ENABLED=true
+CFM_AUTH_SECRET=replace_with_a_long_random_secret
+CFM_AUTH_ALLOW_REGISTRATION=false
 ```
 
 Adjust the service file if needed:
@@ -187,7 +221,7 @@ Restart after changing config:
 sudo systemctl restart crypto-futures-monitor
 ```
 
-## 6. Suggested Production Defaults
+## 7. Suggested Production Defaults
 
 For a stable first deployment:
 
@@ -201,7 +235,7 @@ funding_poll_interval_seconds: 60
 
 After the VPS is stable, you can evaluate moving from REST mode to WebSocket mode.
 
-## 7. What Not to Commit
+## 8. What Not to Commit
 
 Do not commit:
 
