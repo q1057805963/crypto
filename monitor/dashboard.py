@@ -1261,6 +1261,89 @@ INDEX_HTML = """<!doctype html>
       gap: 8px;
     }
 
+    .collapse-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .collapse-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      width: 100%;
+      min-width: 0;
+      border: 0;
+      background: none;
+      color: var(--text);
+      padding: 0;
+      cursor: pointer;
+      text-align: left;
+      font: inherit;
+    }
+
+    .collapse-main {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .collapse-title {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .collapse-meta {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .collapse-side {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .collapse-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 22px;
+      height: 22px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: var(--panel-2);
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 750;
+      line-height: 1;
+    }
+
+    .collapse-head:hover .collapse-title,
+    .collapse-head:hover .collapse-icon {
+      color: var(--blue);
+      border-color: var(--blue);
+    }
+
+    .collapsible.collapsed .collapsible-body,
+    .event-list.collapsed-list {
+      display: none;
+    }
+
+    .section-title.collapsible-title {
+      padding: 12px 16px;
+    }
+
+    .section-collapse {
+      min-height: 28px;
+    }
+
     .inline-link {
       border: none;
       background: none;
@@ -1933,9 +2016,16 @@ INDEX_HTML = """<!doctype html>
       </div>
       <div class="side-scroll" id="side-scroll">
         <div class="detail" id="detail"></div>
-        <div class="section-title">
-          <span>最近报警</span>
-          <span id="alert-count">0</span>
+        <div class="section-title collapsible-title">
+          <button class="collapse-head section-collapse" id="events-collapse-btn" data-collapse="events" type="button" aria-expanded="true">
+            <span class="collapse-main">
+              <span class="collapse-title">最近报警</span>
+            </span>
+            <span class="collapse-side">
+              <span id="alert-count">0</span>
+              <span class="collapse-icon">-</span>
+            </span>
+          </button>
         </div>
         <div class="event-list" id="events"></div>
       </div>
@@ -1945,6 +2035,7 @@ INDEX_HTML = """<!doctype html>
   <script>
     const symbolsEl = document.getElementById("symbols");
     const eventsEl = document.getElementById("events");
+    const eventsCollapseBtn = document.getElementById("events-collapse-btn");
     const updatedEl = document.getElementById("updated");
     const countEl = document.getElementById("count");
     const alertCountEl = document.getElementById("alert-count");
@@ -2425,6 +2516,55 @@ INDEX_HTML = """<!doctype html>
       modal.classList.remove("open");
     }
 
+    function readCollapseState() {
+      try {
+        return JSON.parse(localStorage.getItem(storageKey("cfm_collapsed_sections")) || "{}");
+      } catch (error) {
+        return {};
+      }
+    }
+
+    function isCollapsed(section) {
+      return Boolean(readCollapseState()[section]);
+    }
+
+    function setCollapsed(section, collapsed) {
+      const state = readCollapseState();
+      state[section] = Boolean(collapsed);
+      localStorage.setItem(storageKey("cfm_collapsed_sections"), JSON.stringify(state));
+    }
+
+    function updateCollapseButton(button, collapsed) {
+      if (!button) return;
+      button.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      const icon = button.querySelector(".collapse-icon");
+      if (icon) icon.textContent = collapsed ? "+" : "-";
+    }
+
+    function collapseClass(section) {
+      return isCollapsed(section) ? " collapsed" : "";
+    }
+
+    function collapseHead(section, title, meta = "") {
+      const collapsed = isCollapsed(section);
+      const metaHtml = meta ? `<span class="collapse-meta">${esc(meta)}</span>` : "";
+      return `
+        <button class="collapse-head" data-collapse="${esc(section)}" type="button" aria-expanded="${collapsed ? "false" : "true"}">
+          <span class="collapse-main">
+            <span class="collapse-title">${esc(title)}</span>
+            ${metaHtml}
+          </span>
+          <span class="collapse-icon">${collapsed ? "+" : "-"}</span>
+        </button>
+      `;
+    }
+
+    function applyEventsCollapseState() {
+      const collapsed = isCollapsed("events");
+      eventsEl.classList.toggle("collapsed-list", collapsed);
+      updateCollapseButton(eventsCollapseBtn, collapsed);
+    }
+
     function renderSymbols(symbols) {
       lastSymbols = symbols || [];
       countEl.textContent = `${symbols.length} 个合约`;
@@ -2499,43 +2639,47 @@ INDEX_HTML = """<!doctype html>
           </div>
           <span class="score">${fmtNumber(symbol.score, 1)}</span>
         </div>
-        <div class="metric-grid">
-          <div class="metric"><div class="metric-label">风险</div><div class="metric-value ${riskClass(symbol.risk_level)}">${esc(symbol.risk_level || "低风险")}</div></div>
-          <div class="metric"><div class="metric-label">置信度</div><div class="metric-value">${fmtNumber(symbol.confidence, 1)}%</div></div>
-          <div class="metric"><div class="metric-label">1分钟成交额</div><div class="metric-value">${fmtNumber(symbol.quote_volume_1m, 0)}</div></div>
-          <div class="metric"><div class="metric-label">量能倍数</div><div class="metric-value ${rowClass(symbol)}">${fmtNumber(symbol.volume_multiplier, 2)}x</div></div>
-          <div class="metric"><div class="metric-label">OI 5分钟</div><div class="metric-value">${fmtPct(symbol.oi_change_pct_5m)}</div></div>
-          <div class="metric"><div class="metric-label">资金费率</div><div class="metric-value">${fmtFunding(symbol.funding_rate)}</div></div>
-          <div class="metric"><div class="metric-label">爆仓状态</div><div class="metric-value ${liquidationStatusClass(symbol)}">${liquidationStatusText(symbol)}</div></div>
-          <div class="metric"><div class="metric-label">强平事件 1m</div><div class="metric-value">${fmtNumber(symbol.liquidation_event_count_1m, 0)}</div></div>
-          <div class="metric"><div class="metric-label">多头爆仓 1m</div><div class="metric-value">${liquidationSideHtml(symbol, "long_liquidation_quote_1m")}</div></div>
-          <div class="metric"><div class="metric-label">空头爆仓 1m</div><div class="metric-value">${liquidationSideHtml(symbol, "short_liquidation_quote_1m")}</div></div>
-          <div class="metric"><div class="metric-label">微观结构</div><div class="metric-value">${microstructureStatusHtml(symbol)}</div></div>
-          <div class="metric"><div class="metric-label">盘口点差</div><div class="metric-value">${fmtBps(symbol.spread_bps)} bps</div></div>
-          <div class="metric"><div class="metric-label">盘口深度下降</div><div class="metric-value">${fmtNumber(symbol.depth_drop_pct_1m, 1)}%</div></div>
-          <div class="metric"><div class="metric-label">买盘深度</div><div class="metric-value">${fmtNumber(symbol.bid_depth_notional, 0)}</div></div>
-          <div class="metric"><div class="metric-label">卖盘深度</div><div class="metric-value">${fmtNumber(symbol.ask_depth_notional, 0)}</div></div>
-          <div class="metric"><div class="metric-label">盘口失衡</div><div class="metric-value">${fmtNumber(Number(symbol.depth_imbalance || 0) * 100, 1)}%</div></div>
-          <div class="metric"><div class="metric-label">主动买入</div><div class="metric-value">${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%</div></div>
-        </div>
-        <div class="detail-block">
-          <div class="detail-title">触发原因</div>
-          <div class="detail-list">${reasons.map((item) => `<div>${esc(item)}</div>`).join("")}</div>
-        </div>
-        <div class="detail-block">
-          <div class="detail-title-row">
-            <div class="detail-title">观察建议</div>
-            <div class="detail-tools">
-              <button class="inline-link" id="ai-refresh-btn" type="button">刷新</button>
+        <div class="detail-block collapsible${collapseClass("detail_metrics")}">
+          <div class="collapse-bar">${collapseHead("detail_metrics", "核心指标", "17项")}</div>
+          <div class="collapsible-body">
+            <div class="metric-grid">
+              <div class="metric"><div class="metric-label">风险</div><div class="metric-value ${riskClass(symbol.risk_level)}">${esc(symbol.risk_level || "低风险")}</div></div>
+              <div class="metric"><div class="metric-label">置信度</div><div class="metric-value">${fmtNumber(symbol.confidence, 1)}%</div></div>
+              <div class="metric"><div class="metric-label">1分钟成交额</div><div class="metric-value">${fmtNumber(symbol.quote_volume_1m, 0)}</div></div>
+              <div class="metric"><div class="metric-label">量能倍数</div><div class="metric-value ${rowClass(symbol)}">${fmtNumber(symbol.volume_multiplier, 2)}x</div></div>
+              <div class="metric"><div class="metric-label">OI 5分钟</div><div class="metric-value">${fmtPct(symbol.oi_change_pct_5m)}</div></div>
+              <div class="metric"><div class="metric-label">资金费率</div><div class="metric-value">${fmtFunding(symbol.funding_rate)}</div></div>
+              <div class="metric"><div class="metric-label">爆仓状态</div><div class="metric-value ${liquidationStatusClass(symbol)}">${liquidationStatusText(symbol)}</div></div>
+              <div class="metric"><div class="metric-label">强平事件 1m</div><div class="metric-value">${fmtNumber(symbol.liquidation_event_count_1m, 0)}</div></div>
+              <div class="metric"><div class="metric-label">多头爆仓 1m</div><div class="metric-value">${liquidationSideHtml(symbol, "long_liquidation_quote_1m")}</div></div>
+              <div class="metric"><div class="metric-label">空头爆仓 1m</div><div class="metric-value">${liquidationSideHtml(symbol, "short_liquidation_quote_1m")}</div></div>
+              <div class="metric"><div class="metric-label">微观结构</div><div class="metric-value">${microstructureStatusHtml(symbol)}</div></div>
+              <div class="metric"><div class="metric-label">盘口点差</div><div class="metric-value">${fmtBps(symbol.spread_bps)} bps</div></div>
+              <div class="metric"><div class="metric-label">盘口深度下降</div><div class="metric-value">${fmtNumber(symbol.depth_drop_pct_1m, 1)}%</div></div>
+              <div class="metric"><div class="metric-label">买盘深度</div><div class="metric-value">${fmtNumber(symbol.bid_depth_notional, 0)}</div></div>
+              <div class="metric"><div class="metric-label">卖盘深度</div><div class="metric-value">${fmtNumber(symbol.ask_depth_notional, 0)}</div></div>
+              <div class="metric"><div class="metric-label">盘口失衡</div><div class="metric-value">${fmtNumber(Number(symbol.depth_imbalance || 0) * 100, 1)}%</div></div>
+              <div class="metric"><div class="metric-label">主动买入</div><div class="metric-value">${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%</div></div>
             </div>
           </div>
-          <div class="detail-list ai-inline" id="ai-block">${renderAIBlock(symbol.symbol)}</div>
+        </div>
+        <div class="detail-block collapsible${collapseClass("detail_reasons")}">
+          <div class="collapse-bar">${collapseHead("detail_reasons", "触发原因", `${reasons.length}项`)}</div>
+          <div class="detail-list collapsible-body">${reasons.map((item) => `<div>${esc(item)}</div>`).join("")}</div>
+        </div>
+        <div class="detail-block collapsible${collapseClass("detail_ai")}">
+          <div class="collapse-bar">
+            ${collapseHead("detail_ai", "观察建议", aiResults[symbol.symbol] ? "AI已生成" : "等待AI")}
+            <button class="inline-link" id="ai-refresh-btn" type="button">刷新</button>
+          </div>
+          <div class="detail-list ai-inline collapsible-body" id="ai-block">${renderAIBlock(symbol.symbol)}</div>
         </div>
       `;
     }
 
     function renderEvents(events) {
       alertCountEl.textContent = String(events.length);
+      applyEventsCollapseState();
       if (!events.length) {
         eventsEl.innerHTML = `<div class="empty">暂无报警</div>`;
         return;
@@ -2918,6 +3062,19 @@ INDEX_HTML = """<!doctype html>
       if (event.target.id === "ai-refresh-btn" && selectedSymbol) {
         fetchAIAnalysis(selectedSymbol, true);
       }
+    });
+
+    document.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-collapse]");
+      if (!button) return;
+      const section = button.dataset.collapse;
+      if (!section) return;
+      const collapsed = !isCollapsed(section);
+      setCollapsed(section, collapsed);
+      updateCollapseButton(button, collapsed);
+      const block = button.closest(".collapsible");
+      if (block) block.classList.toggle("collapsed", collapsed);
+      if (section === "events") applyEventsCollapseState();
     });
 
     document.getElementById("profile-open-telegram").addEventListener("click", async () => {
