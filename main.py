@@ -139,6 +139,10 @@ def apply_env_overrides(config: dict) -> dict:
         microstructure["rest_depth_poll_interval_seconds"] = float(
             os.environ["CFM_REST_DEPTH_POLL_INTERVAL_SECONDS"]
         )
+    if "CFM_REST_LIQUIDATION_POLL_INTERVAL_SECONDS" in os.environ:
+        microstructure["rest_liquidation_poll_interval_seconds"] = float(
+            os.environ["CFM_REST_LIQUIDATION_POLL_INTERVAL_SECONDS"]
+        )
 
     ai_key = os.environ.get("CFM_AI_API_KEY")
     if ai_key is None:
@@ -266,7 +270,12 @@ async def run(config: dict) -> None:
     microstructure_config = config.get("microstructure", {})
     microstructure_state = MarketMicrostructureState(
         runtime_symbols,
-        liquidations_enabled=not _is_okx_exchange(exchange),
+        liquidations_enabled=(
+            bool(microstructure_config.get("enabled", True))
+            if _is_okx_exchange(exchange)
+            else True
+        ),
+        liquidation_feed_mode="poll" if _is_okx_exchange(exchange) else "stream",
     )
     microstructure_stream = None
     if microstructure_config.get("enabled", True) and not _is_okx_exchange(exchange):
@@ -290,6 +299,9 @@ async def run(config: dict) -> None:
                     "rest_depth_poll_interval_seconds",
                     config.get("rest_poll_interval_seconds", 5),
                 )
+            ),
+            liquidation_poll_interval_seconds=float(
+                microstructure_config.get("rest_liquidation_poll_interval_seconds", 15)
             ),
             microstructure_state=(
                 microstructure_state

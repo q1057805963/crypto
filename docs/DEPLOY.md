@@ -28,6 +28,9 @@ CFM_TELEGRAM_BOT_TOKEN=your_bot_token
 CFM_TELEGRAM_CHAT_IDS=your_chat_id
 CFM_EXCHANGE=okx_swap
 CFM_DATA_SOURCE=rest
+CFM_REST_POLL_INTERVAL_SECONDS=5
+CFM_REST_DEPTH_POLL_INTERVAL_SECONDS=5
+CFM_REST_LIQUIDATION_POLL_INTERVAL_SECONDS=15
 CFM_DASHBOARD_HOST=0.0.0.0
 CFM_DASHBOARD_PORT=8765
 CFM_AUTH_ENABLED=true
@@ -191,6 +194,7 @@ CFM_EXCHANGE=okx_swap
 CFM_DATA_SOURCE=rest
 CFM_REST_POLL_INTERVAL_SECONDS=5
 CFM_REST_DEPTH_POLL_INTERVAL_SECONDS=5
+CFM_REST_LIQUIDATION_POLL_INTERVAL_SECONDS=15
 CFM_DASHBOARD_HOST=0.0.0.0
 CFM_DASHBOARD_PORT=8765
 CFM_AUTH_ENABLED=true
@@ -240,6 +244,7 @@ oi_poll_interval_seconds: 30
 funding_poll_interval_seconds: 60
 microstructure:
   rest_depth_poll_interval_seconds: 5
+  rest_liquidation_poll_interval_seconds: 15
 ```
 
 After the VPS is stable, you can evaluate moving from REST mode to WebSocket mode.
@@ -253,7 +258,7 @@ CFM_EXCHANGE=okx_swap
 CFM_DATA_SOURCE=rest
 ```
 
-The OKX source supports ticker price, estimated 1-minute quote volume, open interest, funding rate and REST order-book depth. Binance-only forced liquidation streams are marked unavailable under OKX, so the dashboard will not treat missing liquidation data as zero liquidation.
+The OKX source supports ticker price, estimated 1-minute quote volume, open interest, funding rate, REST order-book depth and public liquidation-order polling. OKX liquidation data is lower frequency than Binance's force-order stream. The dashboard deduplicates returned orders and treats "no recent event" as a 1-minute window result, not proof that the whole market has zero liquidations.
 
 ## 9. What Not to Commit
 

@@ -8,13 +8,20 @@ import websockets
 
 
 class MarketMicrostructureState:
-    def __init__(self, symbols: list[str], liquidations_enabled: bool = True) -> None:
+    def __init__(
+        self,
+        symbols: list[str],
+        liquidations_enabled: bool = True,
+        liquidation_feed_mode: str = "stream",
+    ) -> None:
         self._depth: dict[str, dict[str, float]] = {}
         self._depth_history: dict[str, deque[tuple[float, float]]] = {}
         self._liquidations: dict[str, deque[dict[str, float | str]]] = {}
         self._last_depth_at: dict[str, float] = {}
         self._last_liquidation_at: dict[str, float] = {}
+        self._last_liquidation_feed_at: dict[str, float] = {}
         self.liquidations_enabled = liquidations_enabled
+        self.liquidation_feed_mode = liquidation_feed_mode
         self.set_symbols(symbols)
 
     def set_symbols(self, symbols: list[str]) -> None:
@@ -25,6 +32,7 @@ class MarketMicrostructureState:
             self._liquidations.setdefault(symbol, deque())
             self._last_depth_at.setdefault(symbol, 0.0)
             self._last_liquidation_at.setdefault(symbol, 0.0)
+            self._last_liquidation_feed_at.setdefault(symbol, 0.0)
 
         for symbol in list(self._depth):
             if symbol not in wanted:
@@ -33,6 +41,7 @@ class MarketMicrostructureState:
                 self._liquidations.pop(symbol, None)
                 self._last_depth_at.pop(symbol, None)
                 self._last_liquidation_at.pop(symbol, None)
+                self._last_liquidation_feed_at.pop(symbol, None)
 
     def record_depth(
         self,
@@ -93,9 +102,16 @@ class MarketMicrostructureState:
             }
         )
         self._last_liquidation_at[symbol] = event_time
+        self._last_liquidation_feed_at[symbol] = max(
+            self._last_liquidation_feed_at.get(symbol, 0.0),
+            event_time,
+        )
         cutoff = event_time - 75
         while queue and float(queue[0]["event_time"]) < cutoff:
             queue.popleft()
+
+    def mark_liquidation_feed(self, symbol: str, event_time: float) -> None:
+        self._last_liquidation_feed_at[symbol.upper()] = event_time
 
     def snapshot(self, symbol: str, now: float) -> dict[str, Any]:
         symbol = symbol.upper()
@@ -104,6 +120,7 @@ class MarketMicrostructureState:
         liquidations = self._liquidations.get(symbol, deque())
         last_depth_at = float(self._last_depth_at.get(symbol, 0.0))
         last_liquidation_at = float(self._last_liquidation_at.get(symbol, 0.0))
+        last_liquidation_feed_at = float(self._last_liquidation_feed_at.get(symbol, 0.0))
 
         cutoff = now - 60
         while depth_history and depth_history[0][0] < cutoff:
@@ -142,7 +159,18 @@ class MarketMicrostructureState:
             else "unavailable"
         )
         liquidation_event_count_1m = len(liquidations)
-        if not self.liquidations_enabled or microstructure_status != "active":
+        liquidation_feed_age_seconds = (
+            now - last_liquidation_feed_at if last_liquidation_feed_at else None
+        )
+        if self.liquidation_feed_mode == "poll":
+            liquidation_feed_active = (
+                liquidation_feed_age_seconds is not None
+                and liquidation_feed_age_seconds <= 45
+            )
+        else:
+            liquidation_feed_active = microstructure_status == "active"
+
+        if not self.liquidations_enabled or not liquidation_feed_active:
             liquidation_data_status = "unavailable"
         elif liquidation_event_count_1m:
             liquidation_data_status = "recent_event"

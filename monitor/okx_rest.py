@@ -17,6 +17,7 @@ class OkxSwapTickerPoller:
         oi_poll_interval_seconds: float,
         funding_poll_interval_seconds: float,
         depth_poll_interval_seconds: float,
+        liquidation_poll_interval_seconds: float,
         microstructure_state=None,
     ) -> None:
         self._lock = threading.Lock()
@@ -27,14 +28,17 @@ class OkxSwapTickerPoller:
         self.oi_poll_interval_seconds = oi_poll_interval_seconds
         self.funding_poll_interval_seconds = funding_poll_interval_seconds
         self.depth_poll_interval_seconds = depth_poll_interval_seconds
+        self.liquidation_poll_interval_seconds = liquidation_poll_interval_seconds
         self.base_url = "https://www.okx.com"
         self._last: dict[str, dict] = {}
         self._open_interest: dict[str, float] = {}
         self._funding_rate: dict[str, float] = {}
         self._instrument_specs: dict[str, dict] = {}
+        self._seen_liquidations: dict[str, dict[str, float]] = {}
         self._last_oi_poll_at: dict[str, float] = {}
         self._last_funding_poll_at: dict[str, float] = {}
         self._last_depth_poll_at: dict[str, float] = {}
+        self._last_liquidation_poll_at: dict[str, float] = {}
         self.set_symbols(symbols)
 
     def set_symbols(self, symbols: list[str]) -> None:
@@ -75,6 +79,18 @@ class OkxSwapTickerPoller:
                 self._last_depth_poll_at[symbol] = now
             except Exception as exc:
                 logging.warning("OKX depth poll failed for %s: %s", symbol, exc)
+
+        if (
+            self.microstructure_state
+            and now - self._last_liquidation_poll_at.get(symbol, 0) >= self.liquidation_poll_interval_seconds
+        ):
+            try:
+                liquidations = await asyncio.to_thread(self._fetch_liquidations, symbol, now)
+                self.microstructure_state.mark_liquidation_feed(symbol, now)
+                self._record_liquidations(symbol, liquidations, now)
+                self._last_liquidation_poll_at[symbol] = now
+            except Exception as exc:
+                logging.warning("OKX liquidation poll failed for %s: %s", symbol, exc)
 
         if now - self._last_oi_poll_at.get(symbol, 0) >= self.oi_poll_interval_seconds:
             try:
@@ -141,6 +157,74 @@ class OkxSwapTickerPoller:
         bids = self._convert_depth_levels(symbol, book.get("bids") or [])
         asks = self._convert_depth_levels(symbol, book.get("asks") or [])
         return event_time, bids, asks
+
+    def _fetch_liquidations(self, symbol: str, now: float) -> list[dict]:
+        payload = self._get_json(
+            "/api/v5/public/liquidation-orders",
+            {
+                "instType": "SWAP",
+                "instFamily": self._inst_family(symbol),
+                "state": "filled",
+            },
+        )
+        inst_id = self._inst_id(symbol)
+        cutoff = now - 90
+        liquidations = []
+        for group in payload.get("data") or []:
+            group_inst_id = str(group.get("instId") or "")
+            if group_inst_id and group_inst_id != inst_id:
+                continue
+            for item in group.get("details") or []:
+                event_time = float(item.get("ts") or item.get("time") or 0) / 1000
+                if event_time < cutoff:
+                    continue
+                price = float(item.get("bkPx") or 0)
+                contracts = float(item.get("sz") or 0)
+                if price <= 0 or contracts <= 0:
+                    continue
+                side = str(item.get("side") or "sell").upper()
+                base_quantity = self._contracts_to_base_quantity(symbol, price, contracts)
+                liquidation_id = "|".join(
+                    [
+                        str(item.get("ts") or item.get("time") or ""),
+                        str(item.get("bkPx") or ""),
+                        str(item.get("sz") or ""),
+                        str(item.get("side") or ""),
+                        str(item.get("posSide") or ""),
+                    ]
+                )
+                liquidations.append(
+                    {
+                        "id": liquidation_id,
+                        "event_time": event_time,
+                        "side": side,
+                        "price": price,
+                        "quantity": base_quantity,
+                    }
+                )
+        return liquidations
+
+    def _record_liquidations(self, symbol: str, liquidations: list[dict], now: float) -> None:
+        if not self.microstructure_state:
+            return
+
+        seen = self._seen_liquidations.setdefault(symbol, {})
+        for key, event_time in list(seen.items()):
+            if event_time < now - 180:
+                seen.pop(key, None)
+
+        for item in sorted(liquidations, key=lambda value: value["event_time"]):
+            liquidation_id = str(item["id"])
+            if liquidation_id in seen:
+                continue
+            seen[liquidation_id] = float(item["event_time"])
+            self.microstructure_state.record_liquidation(
+                symbol=symbol,
+                event_time=float(item["event_time"]),
+                side=str(item["side"]),
+                price=float(item["price"]),
+                quantity=float(item["quantity"]),
+            )
 
     def _convert_depth_levels(self, symbol: str, levels: list[list[str]]) -> list[list[float]]:
         converted = []
@@ -235,6 +319,14 @@ class OkxSwapTickerPoller:
             return symbol
         base = symbol[:-4] if symbol.endswith("USDT") else symbol
         return f"{base}-USDT-SWAP"
+
+    @staticmethod
+    def _inst_family(symbol: str) -> str:
+        inst_id = OkxSwapTickerPoller._inst_id(symbol)
+        parts = inst_id.split("-")
+        if len(parts) >= 2:
+            return f"{parts[0]}-{parts[1]}"
+        return inst_id
 
     def _get_json(self, path: str, params: dict[str, str]) -> dict:
         query = urlencode(params)

@@ -1266,8 +1266,13 @@ INDEX_HTML = """<!doctype html>
     .collapse-bar {
       display: flex;
       align-items: center;
+      justify-content: space-between;
       gap: 8px;
       margin-bottom: 8px;
+    }
+
+    .collapse-bar .collapse-head {
+      flex: 1 1 auto;
     }
 
     .collapse-head {
@@ -1387,16 +1392,23 @@ INDEX_HTML = """<!doctype html>
     }
 
     .inline-link {
-      border: none;
-      background: none;
+      flex: 0 0 auto;
+      min-width: 46px;
+      height: 24px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: var(--panel-2);
       color: var(--blue);
       cursor: pointer;
       font-size: 12px;
-      padding: 0;
+      line-height: 22px;
+      padding: 0 10px;
+      white-space: nowrap;
     }
 
     .inline-link:hover {
-      text-decoration: underline;
+      border-color: var(--blue);
+      background: rgba(100, 168, 255, .12);
     }
 
     .ai-inline {
@@ -2425,7 +2437,7 @@ INDEX_HTML = """<!doctype html>
     function liquidationStatusText(symbol) {
       const status = symbol.liquidation_data_status || "unavailable";
       if (status === "recent_event") return "有强平";
-      if (status === "no_recent_event") return "0 / 无强平";
+      if (status === "no_recent_event") return "近1m无";
       return "未接入";
     }
 
@@ -2441,7 +2453,7 @@ INDEX_HTML = """<!doctype html>
         return `<span class="mixed">未接入</span>`;
       }
       if ((symbol.liquidation_data_status || "") === "no_recent_event") {
-        return `<span class="muted">0 / 无强平</span>`;
+        return `<span class="muted">近1m无</span>`;
       }
       return `<span class="down">${fmtNumber(symbol.liquidation_total_quote_1m, 0)}</span>`;
     }

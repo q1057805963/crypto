@@ -9,6 +9,7 @@ microstructure:
   depth_levels: 10
   depth_interval: 500ms
   rest_depth_poll_interval_seconds: 5
+  rest_liquidation_poll_interval_seconds: 15
 symbols:
 - BNBUSDT
 - SOLUSDT
