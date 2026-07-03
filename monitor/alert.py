@@ -33,5 +33,7 @@ class ConsoleAlert:
         print(f"盘口深度下降: {event.depth_drop_pct_1m:.2f}%")
         print("原因: " + "; ".join(event.reasons))
         print("观察: " + "; ".join(event.suggestions))
+        if event.ai_summary:
+            print("AI: " + "; ".join(event.ai_summary))
         print("=" * 72)
         print("")

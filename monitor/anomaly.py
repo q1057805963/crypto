@@ -30,6 +30,8 @@ class AnomalyEvent:
     confidence: float
     reasons: tuple[str, ...]
     suggestions: tuple[str, ...]
+    ai_analysis: str = ""
+    ai_summary: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,17 @@ class SymbolSnapshot:
     bid_depth_notional: float
     ask_depth_notional: float
     depth_drop_pct_1m: float
+    support_price: float
+    resistance_price: float
+    support_distance_pct: float
+    resistance_distance_pct: float
+    window_vwap: float
+    vwap_deviation_pct: float
+    range_position_pct: float
+    bid_wall_price: float
+    bid_wall_notional: float
+    ask_wall_price: float
+    ask_wall_notional: float
     long_liquidation_quote_1m: float
     short_liquidation_quote_1m: float
     liquidation_total_quote_1m: float
@@ -61,6 +74,9 @@ class SymbolSnapshot:
     microstructure_status: str
     depth_data_age_seconds: float | None
     last_liquidation_age_seconds: float | None
+    price_series_5m: tuple[float, ...]
+    volume_series_5m: tuple[float, ...]
+    oi_series_5m: tuple[float, ...]
     risk_level: str
     bias: str
     confidence: float
@@ -129,6 +145,18 @@ class AnomalyDetector:
                 del self.windows[symbol]
                 self.last_alert_at.pop(symbol, None)
 
+    def reset_windows(self, symbols: list[str] | None = None) -> None:
+        target_symbols = (
+            {symbol.upper() for symbol in symbols}
+            if symbols is not None
+            else set(self.windows)
+        )
+        for symbol in target_symbols:
+            if symbol in self.windows:
+                self.windows[symbol] = SymbolWindow(self.window_seconds)
+            self.last_alert_at.pop(symbol, None)
+        self.started_at = time()
+
     def set_symbol_threshold(self, symbol: str, score: float) -> None:
         self.symbol_thresholds[symbol.upper()] = {"anomaly_score": score}
 
@@ -188,6 +216,17 @@ class AnomalyDetector:
             bid_depth_notional=round(metrics["bid_depth_notional"], 2),
             ask_depth_notional=round(metrics["ask_depth_notional"], 2),
             depth_drop_pct_1m=round(metrics["depth_drop_pct_1m"], 3),
+            support_price=round(metrics["support_price"], 8),
+            resistance_price=round(metrics["resistance_price"], 8),
+            support_distance_pct=round(metrics["support_distance_pct"], 3),
+            resistance_distance_pct=round(metrics["resistance_distance_pct"], 3),
+            window_vwap=round(metrics["window_vwap"], 8),
+            vwap_deviation_pct=round(metrics["vwap_deviation_pct"], 3),
+            range_position_pct=round(metrics["range_position_pct"], 2),
+            bid_wall_price=round(metrics["bid_wall_price"], 8),
+            bid_wall_notional=round(metrics["bid_wall_notional"], 2),
+            ask_wall_price=round(metrics["ask_wall_price"], 8),
+            ask_wall_notional=round(metrics["ask_wall_notional"], 2),
             long_liquidation_quote_1m=round(metrics["long_liquidation_quote_1m"], 2),
             short_liquidation_quote_1m=round(metrics["short_liquidation_quote_1m"], 2),
             liquidation_total_quote_1m=round(metrics["liquidation_total_quote_1m"], 2),
@@ -196,6 +235,9 @@ class AnomalyDetector:
             microstructure_status=metrics["microstructure_status"],
             depth_data_age_seconds=metrics["depth_data_age_seconds"],
             last_liquidation_age_seconds=metrics["last_liquidation_age_seconds"],
+            price_series_5m=tuple(round(value, 8) for value in metrics["price_series_5m"]),
+            volume_series_5m=tuple(round(value, 2) for value in metrics["volume_series_5m"]),
+            oi_series_5m=tuple(round(value, 4) for value in metrics["oi_series_5m"]),
             risk_level=metrics["risk_level"],
             bias=metrics["bias"],
             confidence=round(metrics["confidence"], 1),
@@ -264,6 +306,10 @@ class AnomalyDetector:
         bid_depth_notional = float(trades_1m[-1].get("bid_depth_notional") or 0)
         ask_depth_notional = float(trades_1m[-1].get("ask_depth_notional") or 0)
         depth_drop_pct_1m = float(trades_1m[-1].get("depth_drop_pct_1m") or 0)
+        bid_wall_price = float(trades_1m[-1].get("bid_wall_price") or 0)
+        bid_wall_notional = float(trades_1m[-1].get("bid_wall_notional") or 0)
+        ask_wall_price = float(trades_1m[-1].get("ask_wall_price") or 0)
+        ask_wall_notional = float(trades_1m[-1].get("ask_wall_notional") or 0)
         long_liquidation_quote_1m = float(trades_1m[-1].get("long_liquidation_quote_1m") or 0)
         short_liquidation_quote_1m = float(trades_1m[-1].get("short_liquidation_quote_1m") or 0)
         liquidation_total_quote_1m = float(trades_1m[-1].get("liquidation_total_quote_1m") or 0)
@@ -275,15 +321,24 @@ class AnomalyDetector:
 
         quote_volume_1m = sum(trade["quote_quantity"] for trade in trades_1m)
         quote_volume_window = sum(trade["quote_quantity"] for trade in window.trades)
+        base_volume_window = sum(float(trade.get("quantity") or 0) for trade in window.trades)
         window_minutes = max(self.window_seconds / 60, 1)
         baseline_per_minute = max(quote_volume_window / window_minutes, 1)
         volume_multiplier = quote_volume_1m / baseline_per_minute
+        window_vwap = (quote_volume_window / base_volume_window) if base_volume_window > 0 else latest_price
+        vwap_deviation_pct = self._pct_change(window_vwap, latest_price)
+        support_price = min(float(trade.get("price") or latest_price) for trade in window.trades)
+        resistance_price = max(float(trade.get("price") or latest_price) for trade in window.trades)
+        support_distance_pct = self._distance_below_pct(latest_price, support_price)
+        resistance_distance_pct = self._distance_above_pct(latest_price, resistance_price)
+        range_position_pct = self._range_position_pct(latest_price, support_price, resistance_price)
 
         buy_volume_1m = sum(
             trade["quote_quantity"] for trade in trades_1m if trade["side"] == "buy"
         )
         sell_volume_1m = max(quote_volume_1m - buy_volume_1m, 0)
         taker_buy_ratio = buy_volume_1m / quote_volume_1m if quote_volume_1m else 0.5
+        price_series_5m, volume_series_5m, oi_series_5m = self._series(window, now)
 
         score, reasons = self._score(
             price_move_pct_1m=price_move_pct_1m,
@@ -353,6 +408,17 @@ class AnomalyDetector:
             "bid_depth_notional": bid_depth_notional,
             "ask_depth_notional": ask_depth_notional,
             "depth_drop_pct_1m": depth_drop_pct_1m,
+            "support_price": support_price,
+            "resistance_price": resistance_price,
+            "support_distance_pct": support_distance_pct,
+            "resistance_distance_pct": resistance_distance_pct,
+            "window_vwap": window_vwap,
+            "vwap_deviation_pct": vwap_deviation_pct,
+            "range_position_pct": range_position_pct,
+            "bid_wall_price": bid_wall_price,
+            "bid_wall_notional": bid_wall_notional,
+            "ask_wall_price": ask_wall_price,
+            "ask_wall_notional": ask_wall_notional,
             "long_liquidation_quote_1m": long_liquidation_quote_1m,
             "short_liquidation_quote_1m": short_liquidation_quote_1m,
             "liquidation_total_quote_1m": liquidation_total_quote_1m,
@@ -361,12 +427,66 @@ class AnomalyDetector:
             "microstructure_status": microstructure_status,
             "depth_data_age_seconds": depth_data_age_seconds,
             "last_liquidation_age_seconds": last_liquidation_age_seconds,
+            "price_series_5m": price_series_5m,
+            "volume_series_5m": volume_series_5m,
+            "oi_series_5m": oi_series_5m,
             "risk_level": risk_level,
             "bias": bias,
             "confidence": confidence,
             "reasons": reasons,
             "suggestions": suggestions,
         }
+
+    def _series(
+        self,
+        window: SymbolWindow,
+        now: float,
+        seconds: int = 300,
+        buckets: int = 15,
+    ) -> tuple[list[float], list[float], list[float]]:
+        trades = window.since(now, seconds)
+        if not trades:
+            return [], [], []
+
+        start = now - seconds
+        bucket_width = max(seconds / buckets, 1)
+        latest_price = float(trades[-1].get("price") or 0)
+        latest_oi = float(trades[-1].get("open_interest") or 0)
+        price_series: list[float | None] = [None] * buckets
+        volume_series = [0.0] * buckets
+        oi_series: list[float | None] = [None] * buckets
+
+        for trade in trades:
+            trade_time = float(trade.get("event_time") or now)
+            raw_index = int((trade_time - start) / bucket_width)
+            index = max(0, min(buckets - 1, raw_index))
+            price_series[index] = float(trade.get("price") or latest_price)
+            volume_series[index] += float(trade.get("quote_quantity") or 0)
+            open_interest = trade.get("open_interest")
+            if open_interest not in (None, ""):
+                oi_series[index] = float(open_interest)
+
+        price_seed = next((value for value in price_series if value is not None), latest_price)
+        price_carry = price_seed
+        for index, value in enumerate(price_series):
+            if value is None:
+                price_series[index] = price_carry
+            else:
+                price_carry = value
+
+        oi_seed = next((value for value in oi_series if value is not None), latest_oi)
+        oi_carry = oi_seed
+        for index, value in enumerate(oi_series):
+            if value is None:
+                oi_series[index] = oi_carry
+            else:
+                oi_carry = value
+
+        return (
+            [float(value or 0) for value in price_series],
+            volume_series,
+            [float(value or 0) for value in oi_series],
+        )
 
     def _score(
         self,
@@ -464,6 +584,24 @@ class AnomalyDetector:
         if old_price is None or old_price <= 0:
             return 0.0
         return (new_price - old_price) / old_price * 100
+
+    @staticmethod
+    def _distance_below_pct(price: float, lower: float | None) -> float:
+        if lower is None or lower <= 0 or price <= 0 or lower >= price:
+            return 0.0
+        return (price - lower) / price * 100
+
+    @staticmethod
+    def _distance_above_pct(price: float, upper: float | None) -> float:
+        if upper is None or upper <= 0 or price <= 0 or upper <= price:
+            return 0.0
+        return (upper - price) / price * 100
+
+    @staticmethod
+    def _range_position_pct(price: float, low: float, high: float) -> float:
+        if price <= 0 or high <= low:
+            return 50.0
+        return max(0.0, min((price - low) / (high - low) * 100, 100.0))
 
     @staticmethod
     def _direction(price_move_pct_1m: float, buy_volume_1m: float, sell_volume_1m: float) -> str:

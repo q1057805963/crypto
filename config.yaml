@@ -1,5 +1,14 @@
 exchange: binance_usdm
-data_source: rest
+data_source: websocket
+failover:
+  enabled: true
+  stale_after_seconds: 20
+  switch_cooldown_seconds: 45
+  candidates:
+  - exchange: binance_usdm
+    data_source: websocket
+  - exchange: okx_swap
+    data_source: rest
 rest_poll_interval_seconds: 5
 rest_per_symbol_delay_ms: 150
 oi_poll_interval_seconds: 30

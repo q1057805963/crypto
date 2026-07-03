@@ -2,14 +2,17 @@ import argparse
 import asyncio
 import logging
 import os
+import time
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import yaml
 
 from monitor.auth import AuthManager
-from monitor.ai_analysis import AIAnalyzer
+from monitor.ai_analysis import AIAnalyzer, summarize_analysis
 from monitor.alert import ConsoleAlert
-from monitor.anomaly import AnomalyDetector
+from monitor.anomaly import AnomalyDetector, AnomalyEvent
 from monitor.binance_rest import BinanceFuturesTickerPoller
 from monitor.binance_ws import BinanceFuturesAggTradeStream
 from monitor.dashboard import DashboardServer, DashboardState
@@ -226,6 +229,271 @@ def _is_okx_exchange(exchange: str) -> bool:
     return exchange in {"okx", "okx_swap", "okx_usdt_swap"}
 
 
+def _normalized_data_source(exchange: str, data_source: str) -> str:
+    source = str(data_source or "").strip().lower()
+    if _is_okx_exchange(exchange):
+        if source not in {"", "auto", "rest"}:
+            logging.warning(
+                "OKX exchange currently uses REST polling; ignoring data_source=%s",
+                data_source,
+            )
+        return "rest"
+    if source in {"", "auto"}:
+        return "websocket"
+    if source not in {"rest", "websocket"}:
+        logging.warning("Unsupported data_source=%s, fallback to websocket", data_source)
+        return "websocket"
+    return source
+
+
+@dataclass(frozen=True)
+class SourceSpec:
+    exchange: str
+    data_source: str
+
+
+@dataclass
+class SourceContext:
+    exchange: str
+    data_source: str
+    stream: object
+    microstructure_state: MarketMicrostructureState
+    microstructure_stream: BinanceFuturesMicrostructureStream | None
+
+
+def _source_label(exchange: str, data_source: str) -> str:
+    venue = "OKX" if _is_okx_exchange(exchange) else "Binance"
+    transport = "REST" if data_source == "rest" else "WebSocket"
+    return f"{venue} {transport}"
+
+
+def _build_source_specs(config: dict, exchange: str, data_source: str) -> list[SourceSpec]:
+    failover = config.get("failover", {})
+    enabled = bool(failover.get("enabled", False))
+    raw_candidates = list(failover.get("candidates") or [])
+    if enabled and not raw_candidates:
+        raw_candidates = [
+            {"exchange": exchange, "data_source": data_source},
+            {"exchange": "okx_swap", "data_source": "rest"},
+        ]
+    elif not enabled:
+        raw_candidates = [{"exchange": exchange, "data_source": data_source}]
+
+    specs: list[SourceSpec] = []
+    seen: set[tuple[str, str]] = set()
+    for raw in raw_candidates:
+        item_exchange = str(raw.get("exchange") or exchange).strip().lower()
+        item_source = _normalized_data_source(
+            item_exchange,
+            str(raw.get("data_source") or data_source),
+        )
+        key = (item_exchange, item_source)
+        if key in seen:
+            continue
+        seen.add(key)
+        specs.append(SourceSpec(exchange=item_exchange, data_source=item_source))
+
+    primary = SourceSpec(
+        exchange=exchange,
+        data_source=_normalized_data_source(exchange, data_source),
+    )
+    if primary not in specs:
+        specs.insert(0, primary)
+    return specs
+
+
+def _build_source_context(config: dict, symbols: list[str], spec: SourceSpec) -> SourceContext:
+    microstructure_config = config.get("microstructure", {})
+    microstructure_state = MarketMicrostructureState(
+        symbols,
+        liquidations_enabled=(
+            bool(microstructure_config.get("enabled", True))
+            if _is_okx_exchange(spec.exchange)
+            else True
+        ),
+        liquidation_feed_mode="poll" if _is_okx_exchange(spec.exchange) else "stream",
+    )
+    microstructure_stream = None
+    if microstructure_config.get("enabled", True) and not _is_okx_exchange(spec.exchange):
+        microstructure_stream = BinanceFuturesMicrostructureStream(
+            symbols,
+            depth_levels=int(microstructure_config.get("depth_levels", 10)),
+            depth_interval=str(microstructure_config.get("depth_interval", "500ms")),
+        )
+
+    if _is_okx_exchange(spec.exchange):
+        stream = OkxSwapTickerPoller(
+            symbols,
+            poll_interval_seconds=float(config.get("rest_poll_interval_seconds", 2)),
+            per_symbol_delay_ms=int(config.get("rest_per_symbol_delay_ms", 150)),
+            oi_poll_interval_seconds=float(config.get("oi_poll_interval_seconds", 30)),
+            funding_poll_interval_seconds=float(
+                config.get("funding_poll_interval_seconds", 60)
+            ),
+            depth_poll_interval_seconds=float(
+                microstructure_config.get(
+                    "rest_depth_poll_interval_seconds",
+                    config.get("rest_poll_interval_seconds", 5),
+                )
+            ),
+            liquidation_poll_interval_seconds=float(
+                microstructure_config.get("rest_liquidation_poll_interval_seconds", 15)
+            ),
+            microstructure_state=(
+                microstructure_state
+                if microstructure_config.get("enabled", True)
+                else None
+            ),
+        )
+    elif spec.data_source == "websocket":
+        stream = BinanceFuturesAggTradeStream(
+            symbols,
+            microstructure_state=microstructure_state,
+        )
+    else:
+        stream = BinanceFuturesTickerPoller(
+            symbols,
+            poll_interval_seconds=float(config.get("rest_poll_interval_seconds", 2)),
+            per_symbol_delay_ms=int(config.get("rest_per_symbol_delay_ms", 150)),
+            oi_poll_interval_seconds=float(config.get("oi_poll_interval_seconds", 30)),
+            funding_poll_interval_seconds=float(
+                config.get("funding_poll_interval_seconds", 60)
+            ),
+            microstructure_state=microstructure_state,
+        )
+
+    return SourceContext(
+        exchange=spec.exchange,
+        data_source=spec.data_source,
+        stream=stream,
+        microstructure_state=microstructure_state,
+        microstructure_stream=microstructure_stream,
+    )
+
+
+class SourceFailoverManager:
+    def __init__(
+        self,
+        *,
+        config: dict,
+        specs: list[SourceSpec],
+        symbols: list[str],
+        stale_after_seconds: float,
+        switch_cooldown_seconds: float,
+        on_switch=None,
+    ) -> None:
+        self.config = config
+        self.specs = specs
+        self.symbols = list(symbols)
+        self.stale_after_seconds = max(float(stale_after_seconds), 5.0)
+        self.switch_cooldown_seconds = max(float(switch_cooldown_seconds), 0.0)
+        self.on_switch = on_switch
+        self._active_index = 0
+        self._active_context: SourceContext | None = None
+        self._reader_task: asyncio.Task | None = None
+        self._micro_task: asyncio.Task | None = None
+        self._queue: asyncio.Queue[tuple[int, dict]] = asyncio.Queue()
+        self._nonce = 0
+        self._last_trade_at = 0.0
+        self._last_switch_at = 0.0
+
+    @property
+    def active_exchange(self) -> str:
+        return self._active_context.exchange if self._active_context else self.specs[self._active_index].exchange
+
+    @property
+    def active_data_source(self) -> str:
+        return self._active_context.data_source if self._active_context else self.specs[self._active_index].data_source
+
+    def set_symbols(self, symbols: list[str]) -> None:
+        self.symbols = list(symbols)
+        if not self._active_context:
+            return
+        self._active_context.stream.set_symbols(self.symbols)
+        self._active_context.microstructure_state.set_symbols(self.symbols)
+        if self._active_context.microstructure_stream:
+            self._active_context.microstructure_stream.set_symbols(self.symbols)
+
+    async def _stop_active(self) -> None:
+        tasks = [task for task in (self._reader_task, self._micro_task) if task]
+        self._reader_task = None
+        self._micro_task = None
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _activate(self, index: int, note: str = "") -> None:
+        await self._stop_active()
+        self._active_index = index
+        self._active_context = _build_source_context(self.config, self.symbols, self.specs[index])
+        self._nonce += 1
+        current_nonce = self._nonce
+        self._last_trade_at = time.monotonic()
+
+        async def _pump() -> None:
+            async for trade in self._active_context.stream.listen():
+                await self._queue.put((current_nonce, trade))
+
+        self._reader_task = asyncio.create_task(_pump())
+        if self._active_context.microstructure_stream:
+            self._micro_task = asyncio.create_task(
+                self._active_context.microstructure_stream.run(
+                    self._active_context.microstructure_state
+                )
+            )
+        if self.on_switch:
+            self.on_switch(
+                self._active_context.exchange,
+                self._active_context.data_source,
+                note,
+            )
+        logging.info(
+            "Active source: %s",
+            _source_label(
+                self._active_context.exchange,
+                self._active_context.data_source,
+            ),
+        )
+
+    async def _switch_to_next(self, reason: str) -> None:
+        if len(self.specs) <= 1:
+            return
+        now = time.monotonic()
+        if now - self._last_switch_at < self.switch_cooldown_seconds:
+            return
+        next_index = (self._active_index + 1) % len(self.specs)
+        current_label = _source_label(self.active_exchange, self.active_data_source)
+        next_spec = self.specs[next_index]
+        next_label = _source_label(next_spec.exchange, next_spec.data_source)
+        note = f"{current_label} 异常，已切换到 {next_label}"
+        logging.warning("Source failover: %s -> %s (%s)", current_label, next_label, reason)
+        self._last_switch_at = now
+        await self._activate(next_index, note)
+
+    async def listen(self):
+        await self._activate(self._active_index, "")
+        timeout_seconds = min(max(self.stale_after_seconds / 3, 1.0), 5.0)
+        while True:
+            try:
+                nonce, trade = await asyncio.wait_for(
+                    self._queue.get(),
+                    timeout=timeout_seconds,
+                )
+                if nonce != self._nonce:
+                    continue
+                self._last_trade_at = time.monotonic()
+                yield trade
+            except asyncio.TimeoutError:
+                if time.monotonic() - self._last_trade_at >= self.stale_after_seconds:
+                    await self._switch_to_next(
+                        f"no trades for {int(time.monotonic() - self._last_trade_at)}s"
+                    )
+
+    async def close(self) -> None:
+        await self._stop_active()
+
+
 async def run(config: dict) -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -264,6 +532,7 @@ async def run(config: dict) -> None:
         telegram_alert = TelegramAlert(
             enabled=True,
             users=user_store.aggregate_telegram_users(default_alert_score),
+            cooldown_seconds=float(config.get("alert_cooldown_seconds", 120)),
         )
     else:
         telegram_alert = TelegramAlert(
@@ -271,8 +540,100 @@ async def run(config: dict) -> None:
             bot_token=str(telegram_config.get("bot_token", "")),
             chat_ids=telegram_config.get("chat_ids", []),
             users=telegram_config.get("users", []),
+            cooldown_seconds=float(config.get("alert_cooldown_seconds", 120)),
         )
     ai_analyzer = AIAnalyzer(config.get("ai", {}))
+    analysis_tasks: dict[str, asyncio.Task] = {}
+    notification_tasks: dict[str, asyncio.Task] = {}
+    runtime_tasks: set[asyncio.Task] = set()
+
+    def track_task(task: asyncio.Task) -> asyncio.Task:
+        runtime_tasks.add(task)
+        task.add_done_callback(lambda done: runtime_tasks.discard(done))
+        return task
+
+    def clone_payload(payload: dict | None) -> dict | None:
+        return deepcopy(payload) if payload else None
+
+    def enrich_snapshot_with_ai(snapshot_data: dict, analysis: str | None) -> dict:
+        payload = clone_payload(snapshot_data) or {}
+        payload["ai_analysis"] = analysis or ""
+        payload["ai_summary"] = summarize_analysis(analysis) if analysis else []
+        return payload
+
+    def enrich_event_with_ai(event: AnomalyEvent, analysis: str | None) -> AnomalyEvent:
+        if not analysis:
+            return event
+        return replace(
+            event,
+            ai_analysis=analysis,
+            ai_summary=tuple(summarize_analysis(analysis)),
+        )
+
+    async def ensure_ai_analysis(symbol: str, snapshot_data: dict, force: bool = False) -> str | None:
+        if not ai_analyzer.enabled or not ai_analyzer.api_key or not snapshot_data:
+            return None
+        cached = ai_analyzer.get_cached(symbol)
+        if cached:
+            return cached
+        symbol = symbol.upper()
+        existing = analysis_tasks.get(symbol)
+        if existing and not existing.done():
+            return await existing
+        task = track_task(
+            asyncio.create_task(ai_analyzer.analyze(symbol, snapshot_data, force=force))
+        )
+        analysis_tasks[symbol] = task
+
+        def cleanup(done: asyncio.Task, tracked_symbol: str = symbol, tracked_task: asyncio.Task = task) -> None:
+            if analysis_tasks.get(tracked_symbol) is tracked_task:
+                analysis_tasks.pop(tracked_symbol, None)
+
+        task.add_done_callback(cleanup)
+        return await task
+
+    async def get_alert_ai_analysis(symbol: str, snapshot_data: dict) -> str | None:
+        timeout_seconds = max(3.0, min(float(ai_analyzer.request_timeout), 12.0))
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(ensure_ai_analysis(symbol, snapshot_data, force=True)),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            logging.warning("AI analysis timeout for %s during alert enrichment", symbol)
+            return ai_analyzer.get_cached(symbol)
+
+    async def dispatch_event(event: AnomalyEvent, snapshot_data: dict | None) -> None:
+        enriched_event = event
+        if snapshot_data:
+            analysis = await get_alert_ai_analysis(event.symbol, snapshot_data)
+            enriched_event = enrich_event_with_ai(event, analysis)
+        alert.send(enriched_event)
+        if store:
+            store.record_event(enriched_event)
+        dashboard_state.add_event(enriched_event)
+
+    def queue_snapshot_notification(snapshot_data: dict) -> None:
+        symbol = str(snapshot_data.get("symbol", "")).upper()
+        if not symbol:
+            return
+        existing = notification_tasks.get(symbol)
+        if existing and not existing.done():
+            return
+
+        async def runner() -> None:
+            analysis = await get_alert_ai_analysis(symbol, snapshot_data)
+            telegram_alert.send_snapshot(enrich_snapshot_with_ai(snapshot_data, analysis))
+
+        task = track_task(asyncio.create_task(runner()))
+        notification_tasks[symbol] = task
+
+        def cleanup(done: asyncio.Task, tracked_symbol: str = symbol, tracked_task: asyncio.Task = task) -> None:
+            if notification_tasks.get(tracked_symbol) is tracked_task:
+                notification_tasks.pop(tracked_symbol, None)
+
+        task.add_done_callback(cleanup)
+
     store = None
     storage_config = config.get("storage", {})
     if storage_config.get("enabled", True):
@@ -282,74 +643,33 @@ async def run(config: dict) -> None:
         )
 
     exchange = _normalized_exchange(config)
-    configured_data_source = str(config.get("data_source", "rest")).lower()
-    data_source = configured_data_source
-    if _is_okx_exchange(exchange) and configured_data_source != "rest":
-        logging.warning("OKX exchange currently uses REST polling; ignoring data_source=%s", configured_data_source)
-        data_source = "rest"
-
-    microstructure_config = config.get("microstructure", {})
-    microstructure_state = MarketMicrostructureState(
-        runtime_symbols,
-        liquidations_enabled=(
-            bool(microstructure_config.get("enabled", True))
-            if _is_okx_exchange(exchange)
-            else True
-        ),
-        liquidation_feed_mode="poll" if _is_okx_exchange(exchange) else "stream",
-    )
-    microstructure_stream = None
-    if microstructure_config.get("enabled", True) and not _is_okx_exchange(exchange):
-        microstructure_stream = BinanceFuturesMicrostructureStream(
-            runtime_symbols,
-            depth_levels=int(microstructure_config.get("depth_levels", 10)),
-            depth_interval=str(microstructure_config.get("depth_interval", "500ms")),
-        )
-
-    if _is_okx_exchange(exchange):
-        stream = OkxSwapTickerPoller(
-            runtime_symbols,
-            poll_interval_seconds=float(config.get("rest_poll_interval_seconds", 2)),
-            per_symbol_delay_ms=int(config.get("rest_per_symbol_delay_ms", 150)),
-            oi_poll_interval_seconds=float(config.get("oi_poll_interval_seconds", 30)),
-            funding_poll_interval_seconds=float(
-                config.get("funding_poll_interval_seconds", 60)
-            ),
-            depth_poll_interval_seconds=float(
-                microstructure_config.get(
-                    "rest_depth_poll_interval_seconds",
-                    config.get("rest_poll_interval_seconds", 5),
-                )
-            ),
-            liquidation_poll_interval_seconds=float(
-                microstructure_config.get("rest_liquidation_poll_interval_seconds", 15)
-            ),
-            microstructure_state=(
-                microstructure_state
-                if microstructure_config.get("enabled", True)
-                else None
-            ),
-        )
-    elif data_source == "websocket":
-        stream = BinanceFuturesAggTradeStream(
-            runtime_symbols,
-            microstructure_state=microstructure_state,
-        )
-    else:
-        stream = BinanceFuturesTickerPoller(
-            runtime_symbols,
-            poll_interval_seconds=float(config.get("rest_poll_interval_seconds", 2)),
-            per_symbol_delay_ms=int(config.get("rest_per_symbol_delay_ms", 150)),
-            oi_poll_interval_seconds=float(config.get("oi_poll_interval_seconds", 30)),
-            funding_poll_interval_seconds=float(
-                config.get("funding_poll_interval_seconds", 60)
-            ),
-            microstructure_state=microstructure_state,
-        )
+    configured_data_source = str(config.get("data_source", "auto")).lower()
+    data_source = _normalized_data_source(exchange, configured_data_source)
+    source_specs = _build_source_specs(config, exchange, data_source)
     dashboard_state = DashboardState(
         runtime_symbols,
-        data_source=data_source,
-        exchange=exchange,
+        data_source=source_specs[0].data_source,
+        exchange=source_specs[0].exchange,
+    )
+
+    failover_config = config.get("failover", {})
+    def handle_source_switch(active_exchange: str, active_data_source: str, note: str) -> None:
+        detector.reset_windows(source_manager.symbols)
+        dashboard_state.set_source(
+            exchange=active_exchange,
+            data_source=active_data_source,
+            note=note,
+        )
+
+    source_manager = SourceFailoverManager(
+        config=config,
+        specs=source_specs,
+        symbols=runtime_symbols,
+        stale_after_seconds=float(failover_config.get("stale_after_seconds", 20)),
+        switch_cooldown_seconds=float(
+            failover_config.get("switch_cooldown_seconds", 45)
+        ),
+        on_switch=handle_source_switch,
     )
 
     dashboard = None
@@ -361,10 +681,8 @@ async def run(config: dict) -> None:
             symbols = user_store.all_symbols()
             detector.set_symbols(symbols)
             detector.symbol_thresholds = user_store.aggregate_symbol_thresholds()
-            stream.set_symbols(symbols)
-            microstructure_state.set_symbols(symbols)
-            if microstructure_stream:
-                microstructure_stream.set_symbols(symbols)
+            detector.reset_windows(symbols)
+            source_manager.set_symbols(symbols)
             dashboard_state.set_symbols(symbols)
             telegram_alert.set_config(
                 True,
@@ -374,10 +692,8 @@ async def run(config: dict) -> None:
         def update_symbols(symbols: list[str]) -> None:
             config["symbols"] = symbols
             detector.set_symbols(symbols)
-            stream.set_symbols(symbols)
-            microstructure_state.set_symbols(symbols)
-            if microstructure_stream:
-                microstructure_stream.set_symbols(symbols)
+            detector.reset_windows(symbols)
+            source_manager.set_symbols(symbols)
             dashboard_state.set_symbols(symbols)
             save_config(Path(config.get("_config_path", "config.yaml")), config)
 
@@ -403,14 +719,11 @@ async def run(config: dict) -> None:
     logging.info(
         "Monitoring %s on %s via %s",
         ", ".join(runtime_symbols),
-        exchange,
-        data_source,
+        source_specs[0].exchange,
+        source_specs[0].data_source,
     )
 
     background_tasks = []
-    if microstructure_stream:
-        background_tasks.append(asyncio.create_task(microstructure_stream.run(microstructure_state)))
-
     telegram_bot_config = config.get("telegram_bot", {})
     if telegram_bot_config.get("enabled", True):
         def telegram_bot_users() -> list[dict]:
@@ -435,11 +748,20 @@ async def run(config: dict) -> None:
         background_tasks.append(asyncio.create_task(telegram_bot_responder.run()))
 
     try:
-        async for trade in stream.listen():
+        async for trade in source_manager.listen():
             event = detector.update(trade)
             snapshot = detector.snapshot(trade["symbol"])
+            snapshot_payload = None
             if snapshot:
                 dashboard_state.update_snapshot(snapshot)
+                snapshot_data = dashboard_state.get_symbol_data(snapshot.symbol)
+                if snapshot_data:
+                    snapshot_payload = clone_payload(snapshot_data)
+                    if snapshot_payload and telegram_alert.has_ready_targets(snapshot_payload):
+                        if ai_analyzer.enabled and ai_analyzer.api_key:
+                            queue_snapshot_notification(snapshot_payload)
+                        else:
+                            telegram_alert.send_snapshot(snapshot_payload)
                 if store:
                     store.record_snapshot(snapshot)
                 if (
@@ -447,22 +769,26 @@ async def run(config: dict) -> None:
                     and ai_analyzer.enabled
                     and bool(config.get("ai", {}).get("auto_analyze_enabled", False))
                 ):
-                    snapshot_data = dashboard_state.get_symbol_data(snapshot.symbol)
-                    if snapshot_data and ai_analyzer.should_activate(snapshot_data):
-                        asyncio.ensure_future(ai_analyzer.analyze(
-                            snapshot.symbol, snapshot_data
-                        ))
+                    if snapshot_payload and ai_analyzer.should_activate(snapshot_payload):
+                        track_task(
+                            asyncio.create_task(ai_analyzer.analyze(snapshot.symbol, snapshot_payload))
+                        )
             if event:
-                alert.send(event)
-                telegram_alert.send(event)
-                if store:
-                    store.record_event(event)
-                dashboard_state.add_event(event)
+                if snapshot_payload and ai_analyzer.enabled and ai_analyzer.api_key:
+                    track_task(asyncio.create_task(dispatch_event(event, snapshot_payload)))
+                else:
+                    alert.send(event)
+                    if store:
+                        store.record_event(event)
+                    dashboard_state.add_event(event)
     finally:
-        for task in background_tasks:
+        await source_manager.close()
+        active_tasks = [task for task in background_tasks if not task.done()]
+        active_tasks.extend(task for task in runtime_tasks if not task.done())
+        for task in active_tasks:
             task.cancel()
-        if background_tasks:
-            await asyncio.gather(*background_tasks, return_exceptions=True)
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
 
 
 def parse_args() -> argparse.Namespace:

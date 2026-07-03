@@ -66,6 +66,22 @@ class MarketMicrostructureState:
             if total_depth_notional
             else 0.0
         )
+        strongest_bid = max(
+            (
+                {"price": price, "notional": price * quantity}
+                for price, quantity in bid_levels
+            ),
+            key=lambda item: item["notional"],
+            default={"price": 0.0, "notional": 0.0},
+        )
+        strongest_ask = max(
+            (
+                {"price": price, "notional": price * quantity}
+                for price, quantity in ask_levels
+            ),
+            key=lambda item: item["notional"],
+            default={"price": 0.0, "notional": 0.0},
+        )
 
         self._depth[symbol] = {
             "spread_bps": spread_bps,
@@ -75,6 +91,10 @@ class MarketMicrostructureState:
             "depth_imbalance": depth_imbalance,
             "best_bid": best_bid,
             "best_ask": best_ask,
+            "strongest_bid_wall_price": float(strongest_bid["price"]),
+            "strongest_bid_wall_notional": float(strongest_bid["notional"]),
+            "strongest_ask_wall_price": float(strongest_ask["price"]),
+            "strongest_ask_wall_notional": float(strongest_ask["notional"]),
         }
         self._last_depth_at[symbol] = event_time
 
@@ -184,6 +204,10 @@ class MarketMicrostructureState:
             "depth_total_notional": current_depth,
             "depth_imbalance": float(depth.get("depth_imbalance", 0.0)),
             "depth_drop_pct_1m": depth_drop_pct_1m,
+            "bid_wall_price": float(depth.get("strongest_bid_wall_price", 0.0)),
+            "bid_wall_notional": float(depth.get("strongest_bid_wall_notional", 0.0)),
+            "ask_wall_price": float(depth.get("strongest_ask_wall_price", 0.0)),
+            "ask_wall_notional": float(depth.get("strongest_ask_wall_notional", 0.0)),
             "long_liquidation_quote_1m": long_liquidation_quote_1m,
             "short_liquidation_quote_1m": short_liquidation_quote_1m,
             "liquidation_total_quote_1m": total_liquidation_quote_1m,

@@ -51,6 +51,7 @@ class AlertStore:
         payload = asdict(event)
         payload["reasons"] = list(payload["reasons"])
         payload["suggestions"] = list(payload["suggestions"])
+        payload["ai_summary"] = list(payload.get("ai_summary", ()))
         with sqlite3.connect(self.path) as conn:
             conn.execute(
                 """

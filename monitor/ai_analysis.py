@@ -1,9 +1,45 @@
 import asyncio
 import json
 import logging
+import re
 import threading
 from time import time
 from urllib.request import Request, urlopen
+
+from monitor.rules import evaluate_trigger_rules, normalize_trigger_rules
+
+
+def summarize_analysis(text: str, max_items: int = 3, max_chars: int = 110) -> list[str]:
+    items: list[str] = []
+    seen: set[str] = set()
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("```"):
+            continue
+        line = re.sub(r"^\s{0,3}(?:[-*+]|(?:\d+)[.)])\s*", "", line)
+        line = re.sub(r"^#+\s*", "", line)
+        line = re.sub(r"\s+", " ", line).strip(" -:：")
+        if not line:
+            continue
+        lowered = line.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        if len(line) > max_chars:
+            line = f"{line[:max_chars - 1].rstrip()}..."
+        items.append(line)
+        if len(items) >= max_items:
+            break
+
+    if items:
+        return items
+
+    compact = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not compact:
+        return []
+    if len(compact) > max_chars:
+        compact = f"{compact[:max_chars - 1].rstrip()}..."
+    return [compact]
 
 
 class AIAnalyzer:
@@ -28,27 +64,11 @@ class AIAnalyzer:
         self.request_timeout = int(config.get("request_timeout_seconds", 30))
 
     def _normalize_triggers(self, config: dict) -> dict:
-        triggers = dict(config.get("triggers") or {})
-        conditions = dict(triggers.get("conditions") or {})
-        defaults = {
-            "score": {"enabled": True, "threshold": float(config.get("activation_threshold", 60))},
-            "quote_volume_1m": {"enabled": False, "threshold": 500000},
-            "volume_multiplier": {"enabled": False, "threshold": 3},
-            "price_move_pct_1m_abs": {"enabled": False, "threshold": 0.8},
-            "oi_change_pct_5m_abs": {"enabled": False, "threshold": 1.5},
-            "liquidation_total_quote_1m": {"enabled": False, "threshold": 250000},
-        }
-        normalized = {}
-        for key, default in defaults.items():
-            value = dict(conditions.get(key) or {})
-            normalized[key] = {
-                "enabled": bool(value.get("enabled", default["enabled"])),
-                "threshold": float(value.get("threshold", default["threshold"])),
-            }
-        return {
-            "mode": "all" if triggers.get("mode") == "all" else "any",
-            "conditions": normalized,
-        }
+        return normalize_trigger_rules(
+            config.get("triggers"),
+            default_score=float(config.get("activation_threshold", 60)),
+            score_enabled=True,
+        )
 
     def update_config(self, config: dict) -> None:
         self._apply(config)
@@ -69,33 +89,7 @@ class AIAnalyzer:
             return self._last_error
 
     def should_activate(self, snapshot_data: dict) -> bool:
-        checks = []
-        conditions = self.triggers.get("conditions", {})
-        for key, cfg in conditions.items():
-            if not cfg.get("enabled"):
-                continue
-            threshold = float(cfg.get("threshold", 0))
-            if key == "score":
-                value = float(snapshot_data.get("score", 0) or 0)
-            elif key == "quote_volume_1m":
-                value = float(snapshot_data.get("quote_volume_1m", 0) or 0)
-            elif key == "volume_multiplier":
-                value = float(snapshot_data.get("volume_multiplier", 0) or 0)
-            elif key == "price_move_pct_1m_abs":
-                value = abs(float(snapshot_data.get("price_move_pct_1m", 0) or 0))
-            elif key == "oi_change_pct_5m_abs":
-                value = abs(float(snapshot_data.get("oi_change_pct_5m", 0) or 0))
-            elif key == "liquidation_total_quote_1m":
-                value = float(snapshot_data.get("liquidation_total_quote_1m", 0) or 0)
-            else:
-                continue
-            checks.append(value >= threshold)
-
-        if not checks:
-            return False
-        if self.triggers.get("mode") == "all":
-            return all(checks)
-        return any(checks)
+        return evaluate_trigger_rules(self.triggers, snapshot_data)
 
     async def analyze(self, symbol: str, snapshot_data: dict, force: bool = False) -> str | None:
         if not self.enabled:
@@ -237,11 +231,18 @@ class AIAnalyzer:
             f"- 空头爆仓1m: {float(data.get('short_liquidation_quote_1m', 0)):,.0f}\n"
             f"- 盘口点差: {float(data.get('spread_bps', 0)):.2f} bps\n"
             f"- 深度下降: {float(data.get('depth_drop_pct_1m', 0)):.1f}%\n"
+            f"- 区间支撑: {data.get('support_price')}\n"
+            f"- 区间压力: {data.get('resistance_price')}\n"
+            f"- 区间VWAP: {data.get('window_vwap')}\n"
+            f"- 偏离VWAP: {float(data.get('vwap_deviation_pct', 0)):+.3f}%\n"
+            f"- 买盘墙: {data.get('bid_wall_price')} / {float(data.get('bid_wall_notional', 0)):,.0f}\n"
+            f"- 卖盘墙: {data.get('ask_wall_price')} / {float(data.get('ask_wall_notional', 0)):,.0f}\n"
             f"- 触发原因: {'; '.join(data.get('reasons', []))}\n\n"
             "请给出简洁、专业、可操作的建议（3-5条），重点关注：\n"
             "1. 当前行情的核心驱动力\n"
             "2. 短期可能的走势和风险\n"
-            "3. 对于杠杆交易者的具体操作建议\n"
+            "3. 结合支撑/压力、VWAP、盘口墙给出具体观察位\n"
+            "4. 对于杠杆交易者的具体操作建议\n"
             "如果爆仓数据状态不可用，不要把爆仓金额为0解读为没有强平压力。"
             "直接给出建议，不要重复数据。每条建议控制在一句话。"
         )
@@ -284,9 +285,12 @@ class AIAnalyzer:
             f"- 空头爆仓1m: {float(data.get('short_liquidation_quote_1m', 0)):,.0f} USDT\n"
             f"- 点差: {float(data.get('spread_bps', 0)):.2f} bps\n"
             f"- 盘口深度下降: {float(data.get('depth_drop_pct_1m', 0)):.1f}%\n"
+            f"- 区间支撑 / 压力: {data.get('support_price')} / {data.get('resistance_price')}\n"
+            f"- 区间VWAP: {data.get('window_vwap')}\n"
+            f"- 买盘墙 / 卖盘墙: {data.get('bid_wall_price')} / {data.get('ask_wall_price')}\n"
             f"- 触发原因: {'; '.join(data.get('reasons', [])) or '暂无'}\n\n"
             "请直接回答用户问题，控制在 4 条以内。"
-            "重点给出上涨/下跌倾向、主要依据、风险等级和接下来观察点。"
+            "重点给出上涨/下跌倾向、主要依据、风险等级和接下来观察点，尽量指出支撑/压力或关键价位。"
             "不要承诺收益，不要给绝对买卖指令；如果数据不足，要明确说数据不足。"
         )
 

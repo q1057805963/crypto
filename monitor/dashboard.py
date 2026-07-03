@@ -9,6 +9,7 @@ from time import time
 from monitor.ai_analysis import AIAnalyzer
 from monitor.auth import AuthError, AuthManager
 from monitor.anomaly import AnomalyEvent, SymbolSnapshot
+from monitor.rules import enabled_trigger_count
 from monitor.telegram import normalize_telegram_users, send_text_to_telegram_users
 from monitor.user_config import UserConfigStore
 
@@ -79,6 +80,7 @@ class DashboardState:
         self._lock = threading.Lock()
         self._data_source = data_source
         self._exchange = exchange
+        self._source_note = ""
         self._symbols = {
             symbol: {
                 "symbol": symbol,
@@ -100,6 +102,17 @@ class DashboardState:
                 "bid_depth_notional": 0,
                 "ask_depth_notional": 0,
                 "depth_drop_pct_1m": 0,
+                "support_price": 0,
+                "resistance_price": 0,
+                "support_distance_pct": 0,
+                "resistance_distance_pct": 0,
+                "window_vwap": 0,
+                "vwap_deviation_pct": 0,
+                "range_position_pct": 50,
+                "bid_wall_price": 0,
+                "bid_wall_notional": 0,
+                "ask_wall_price": 0,
+                "ask_wall_notional": 0,
                 "long_liquidation_quote_1m": 0,
                 "short_liquidation_quote_1m": 0,
                 "liquidation_total_quote_1m": 0,
@@ -108,6 +121,9 @@ class DashboardState:
                 "microstructure_status": "unavailable",
                 "depth_data_age_seconds": None,
                 "last_liquidation_age_seconds": None,
+                "price_series_5m": [],
+                "volume_series_5m": [],
+                "oi_series_5m": [],
                 "risk_level": "低风险",
                 "bias": "观察：暂无明确方向",
                 "confidence": 0,
@@ -144,6 +160,17 @@ class DashboardState:
                         "bid_depth_notional": 0,
                         "ask_depth_notional": 0,
                         "depth_drop_pct_1m": 0,
+                        "support_price": 0,
+                        "resistance_price": 0,
+                        "support_distance_pct": 0,
+                        "resistance_distance_pct": 0,
+                        "window_vwap": 0,
+                        "vwap_deviation_pct": 0,
+                        "range_position_pct": 50,
+                        "bid_wall_price": 0,
+                        "bid_wall_notional": 0,
+                        "ask_wall_price": 0,
+                        "ask_wall_notional": 0,
                         "long_liquidation_quote_1m": 0,
                         "short_liquidation_quote_1m": 0,
                         "liquidation_total_quote_1m": 0,
@@ -152,6 +179,9 @@ class DashboardState:
                         "microstructure_status": "unavailable",
                         "depth_data_age_seconds": None,
                         "last_liquidation_age_seconds": None,
+                        "price_series_5m": [],
+                        "volume_series_5m": [],
+                        "oi_series_5m": [],
                         "risk_level": "低风险",
                         "bias": "观察：暂无明确方向",
                         "confidence": 0,
@@ -178,6 +208,7 @@ class DashboardState:
             data = asdict(event)
             data["reasons"] = list(data["reasons"])
             data["suggestions"] = list(data["suggestions"])
+            data["ai_summary"] = list(data.get("ai_summary", ()))
             data["created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._events.insert(0, data)
             self._events = self._events[:50]
@@ -185,6 +216,16 @@ class DashboardState:
     def get_symbol_data(self, symbol: str) -> dict | None:
         with self._lock:
             return self._symbols.get(symbol.upper())
+
+    def set_source(self, *, exchange: str, data_source: str, note: str = "") -> None:
+        with self._lock:
+            self._exchange = exchange
+            self._data_source = data_source
+            self._source_note = note
+
+    def clear_source_note(self) -> None:
+        with self._lock:
+            self._source_note = ""
 
     def as_payload(self, symbols_filter: list[str] | None = None) -> dict:
         with self._lock:
@@ -201,6 +242,7 @@ class DashboardState:
                 "generated_at": time(),
                 "data_source": self._data_source,
                 "exchange": self._exchange,
+                "source_note": self._source_note,
                 "symbols": symbols,
                 "events": events,
             }
@@ -548,7 +590,10 @@ class DashboardServer:
                     symbol = str(payload.get("symbol", "")).upper()
                     if not symbol:
                         raise ValueError("symbol is required")
+                    has_score = "anomaly_score" in payload
                     score = payload.get("anomaly_score")
+                    has_push_rules = "push_rules" in payload
+                    push_rules = payload.get("push_rules")
                     with server_ref._config_lock:
                         if server_ref.user_config_store:
                             user_id = self._user_id()
@@ -556,14 +601,25 @@ class DashboardServer:
                         else:
                             user_id = ""
                             st = dict(server_ref.config.get("symbol_thresholds", {}))
-                        if score is None:
-                            st.pop(symbol, None)
-                            if server_ref.detector and not server_ref.user_config_store:
-                                server_ref.detector.remove_symbol_threshold(symbol)
+                        current = dict(st.get(symbol, {})) if isinstance(st.get(symbol), dict) else {}
+                        if has_score:
+                            if score is None:
+                                current.pop("anomaly_score", None)
+                                if server_ref.detector and not server_ref.user_config_store:
+                                    server_ref.detector.remove_symbol_threshold(symbol)
+                            else:
+                                current["anomaly_score"] = float(score)
+                                if server_ref.detector and not server_ref.user_config_store:
+                                    server_ref.detector.set_symbol_threshold(symbol, float(score))
+                        if has_push_rules:
+                            if enabled_trigger_count(push_rules) > 0:
+                                current["push_rules"] = push_rules
+                            else:
+                                current.pop("push_rules", None)
+                        if current:
+                            st[symbol] = current
                         else:
-                            st[symbol] = {"anomaly_score": float(score)}
-                            if server_ref.detector and not server_ref.user_config_store:
-                                server_ref.detector.set_symbol_threshold(symbol, float(score))
+                            st.pop(symbol, None)
                         if server_ref.user_config_store:
                             server_ref.user_config_store.update_symbol_thresholds(user_id, st)
                             server_ref._notify_user_config_change()
@@ -931,6 +987,45 @@ INDEX_HTML = """<!doctype html>
       background: #f5f7fa;
     }
 
+    body.light .summary-chip,
+    body.light .detail-callout,
+    body.light .metric,
+    body.light .event,
+    body.light .detail {
+      background: #f8fafc;
+      border-color: #dbe4ef;
+    }
+
+    body.light .detail-callout.primary,
+    body.light .ai-inline {
+      background: #eef5ff;
+      border-color: #cadef7;
+    }
+
+    body.light .chart-card,
+    body.light .mini-meter,
+    body.light .insight-card,
+    body.light .ai-card,
+    body.light .range-rail-card,
+    body.light .depth-card,
+    body.light .detail-tab {
+      background: #f8fafc;
+      border-color: #dbe4ef;
+    }
+
+    body.light .detail-tab.active {
+      background: #eaf2ff;
+      border-color: #cadef7;
+    }
+
+    body.light .section-title {
+      background: #fbfcfe;
+    }
+
+    body.light .events {
+      box-shadow: 0 24px 70px rgba(31, 55, 91, .14);
+    }
+
     body.light th {
       background: #edf1f5;
     }
@@ -1276,10 +1371,10 @@ INDEX_HTML = """<!doctype html>
 
     .row-action-btn {
       height: 24px;
-      border: 1px solid #344252;
+      border: 1px solid var(--line);
       border-radius: 999px;
-      background: var(--blue-soft);
-      color: var(--blue);
+      background: transparent;
+      color: var(--muted);
       padding: 0 9px;
       font-size: 11px;
       cursor: pointer;
@@ -1288,6 +1383,14 @@ INDEX_HTML = """<!doctype html>
 
     .row-action-btn:hover {
       border-color: var(--blue);
+      color: var(--blue);
+      background: var(--blue-soft);
+    }
+
+    .row-action-btn.active {
+      border-color: rgba(18, 103, 214, .35);
+      color: var(--blue);
+      background: var(--blue-soft);
     }
 
     .detail-title-row {
@@ -1386,9 +1489,14 @@ INDEX_HTML = """<!doctype html>
 
     .metric-summary {
       display: none;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 6px;
       margin-top: 2px;
+    }
+
+    .metric-summary.always-visible {
+      display: grid;
+      margin: 0 0 12px;
     }
 
     .collapsible.collapsed .metric-summary {
@@ -1401,12 +1509,16 @@ INDEX_HTML = """<!doctype html>
       align-items: center;
       justify-content: space-between;
       gap: 8px;
-      height: 30px;
+      height: 34px;
       padding: 0 9px;
       border: 1px solid var(--line);
-      border-radius: 6px;
+      border-radius: 8px;
       background: rgba(255, 255, 255, .02);
       font-size: 12px;
+    }
+
+    .summary-chip.empty .summary-value {
+      color: var(--muted);
     }
 
     .summary-label {
@@ -1458,6 +1570,10 @@ INDEX_HTML = """<!doctype html>
       background: rgba(100, 168, 255, .06);
       border: 1px solid rgba(100, 168, 255, .15);
       border-radius: 6px;
+      max-height: 220px;
+      overflow: auto;
+      overscroll-behavior: contain;
+      scrollbar-gutter: stable;
     }
 
     .ai-status {
@@ -1499,8 +1615,9 @@ INDEX_HTML = """<!doctype html>
     }
 
     main {
+      position: relative;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 400px;
+      grid-template-columns: minmax(0, 1fr);
       grid-template-rows: minmax(0, 1fr);
       gap: 18px;
       flex: 1;
@@ -1624,10 +1741,92 @@ INDEX_HTML = """<!doctype html>
     .bias-watch { color: var(--muted); }
     .bias-crowded { color: var(--amber); }
 
+    .detail-drawer-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(6, 10, 14, .54);
+      backdrop-filter: blur(2px);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .2s ease;
+      z-index: 14;
+    }
+
+    main.drawer-open .detail-drawer-backdrop {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
     .events {
+      position: absolute;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: min(860px, calc(100vw - 48px));
       display: flex;
       flex-direction: column;
-      height: 100%;
+      height: auto;
+      z-index: 16;
+      box-shadow: 0 18px 60px rgba(0, 0, 0, .36);
+      transform: translateX(calc(100% + 22px));
+      opacity: 0;
+      pointer-events: none;
+      transition: transform .24s ease, opacity .24s ease;
+    }
+
+    .events.open {
+      transform: translateX(0);
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .drawer-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .drawer-meta {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .drawer-close {
+      width: 30px;
+      height: 30px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel-2);
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 1;
+    }
+
+    .drawer-close:hover {
+      border-color: var(--blue);
+      color: var(--blue);
+    }
+
+    .drawer-empty {
+      display: grid;
+      gap: 8px;
+      padding: 24px 18px;
+    }
+
+    .drawer-empty-title {
+      font-size: 16px;
+      font-weight: 750;
+    }
+
+    .drawer-empty-copy {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
     }
 
     .side-scroll {
@@ -1637,7 +1836,7 @@ INDEX_HTML = """<!doctype html>
     }
 
     .detail {
-      padding: 16px;
+      padding: 18px;
       border-bottom: 1px solid var(--line);
     }
 
@@ -1646,7 +1845,9 @@ INDEX_HTML = """<!doctype html>
       align-items: flex-start;
       justify-content: space-between;
       gap: 12px;
-      margin-bottom: 12px;
+      margin-bottom: 14px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--line);
     }
 
     .detail-symbol {
@@ -1681,6 +1882,70 @@ INDEX_HTML = """<!doctype html>
       line-height: 1.45;
     }
 
+    .data-banner {
+      margin: 0 0 12px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .data-banner.partial {
+      color: var(--amber);
+      background: rgba(242, 184, 75, .08);
+      border-color: rgba(242, 184, 75, .22);
+    }
+
+    .data-banner.empty {
+      color: var(--muted);
+      background: rgba(255, 255, 255, .02);
+    }
+
+    .detail-callout-grid {
+      display: grid;
+      grid-template-columns: 1.25fr 1fr;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .detail-callout {
+      min-width: 0;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, .03);
+    }
+
+    .detail-callout.primary {
+      background: var(--blue-soft);
+      border-color: rgba(100, 168, 255, .2);
+    }
+
+    .callout-kicker {
+      color: var(--muted);
+      font-size: 11px;
+      margin-bottom: 6px;
+    }
+
+    .callout-title {
+      font-size: 15px;
+      font-weight: 750;
+      line-height: 1.25;
+      margin-bottom: 5px;
+    }
+
+    .callout-copy {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .callout-title.up { color: var(--green); }
+    .callout-title.down { color: var(--red); }
+    .callout-title.mixed { color: var(--amber); }
+    .callout-title.muted { color: var(--text); }
+
     .metric-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -1692,7 +1957,7 @@ INDEX_HTML = """<!doctype html>
       min-width: 0;
       padding: 10px;
       border: 1px solid var(--line);
-      border-radius: 6px;
+      border-radius: 8px;
       background: rgba(255, 255, 255, .025);
     }
 
@@ -1710,8 +1975,40 @@ INDEX_HTML = """<!doctype html>
       white-space: nowrap;
     }
 
+    .metric-copy {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.45;
+    }
+
+    .metric-grid.compact .metric {
+      padding: 9px 10px;
+    }
+
+    .metric-grid.compact .metric-value {
+      font-size: 12px;
+    }
+
     .detail-block {
       margin-top: 12px;
+    }
+
+    .detail-body-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.18fr) minmax(280px, .94fr);
+      gap: 12px;
+      align-items: start;
+    }
+
+    .detail-column {
+      display: grid;
+      gap: 12px;
+      align-content: start;
+    }
+
+    .detail-column .detail-block {
+      margin-top: 0;
     }
 
     .detail-title {
@@ -1727,6 +2024,489 @@ INDEX_HTML = """<!doctype html>
       color: var(--text);
       font-size: 12px;
       line-height: 1.45;
+    }
+
+    .visual-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr) minmax(0, 1fr);
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .chart-card {
+      min-width: 0;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, .025);
+    }
+
+    .chart-card.span-2 {
+      grid-column: span 2;
+    }
+
+    .chart-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .chart-title {
+      font-size: 13px;
+      font-weight: 700;
+      line-height: 1.25;
+    }
+
+    .chart-meta {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.4;
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .spark-wrap {
+      height: 92px;
+      color: var(--blue);
+    }
+
+    .spark-wrap.short {
+      height: 72px;
+    }
+
+    .spark-wrap.up {
+      color: var(--green);
+    }
+
+    .spark-wrap.down {
+      color: var(--red);
+    }
+
+    .spark-wrap.mixed {
+      color: var(--amber);
+    }
+
+    .spark-svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .spark-grid-line {
+      stroke: currentColor;
+      opacity: .11;
+      stroke-width: .9;
+    }
+
+    .spark-line {
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2.2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .spark-area {
+      fill: currentColor;
+      opacity: .08;
+    }
+
+    .spark-dot {
+      fill: currentColor;
+    }
+
+    .spark-bar {
+      fill: currentColor;
+      opacity: .78;
+    }
+
+    .chart-empty {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      color: var(--muted);
+      font-size: 12px;
+      border: 1px dashed var(--line);
+      border-radius: 6px;
+    }
+
+    .meter-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .mini-meter {
+      min-width: 0;
+      padding: 10px 11px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, .025);
+    }
+
+    .meter-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 7px;
+      font-size: 12px;
+    }
+
+    .meter-head span {
+      color: var(--muted);
+    }
+
+    .meter-head strong {
+      font-size: 13px;
+      font-weight: 750;
+      white-space: nowrap;
+    }
+
+    .meter-track {
+      position: relative;
+      height: 8px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, .06);
+      overflow: hidden;
+    }
+
+    .meter-fill {
+      display: block;
+      height: 100%;
+      border-radius: inherit;
+      background: var(--blue);
+    }
+
+    .meter-fill.up {
+      background: var(--green);
+    }
+
+    .meter-fill.down {
+      background: var(--red);
+    }
+
+    .meter-fill.mixed {
+      background: var(--amber);
+    }
+
+    .meter-copy {
+      margin-top: 7px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.45;
+    }
+
+    .detail-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+
+    .detail-tab {
+      height: 30px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, .025);
+      color: var(--muted);
+      padding: 0 12px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    .detail-tab:hover {
+      border-color: var(--blue);
+      color: var(--blue);
+    }
+
+    .detail-tab.active {
+      background: var(--blue-soft);
+      border-color: rgba(100, 168, 255, .28);
+      color: var(--blue);
+      font-weight: 700;
+    }
+
+    .detail-panel {
+      display: grid;
+      gap: 12px;
+    }
+
+    .insight-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .insight-card,
+    .ai-card,
+    .range-rail-card,
+    .depth-card {
+      min-width: 0;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, .025);
+    }
+
+    .insight-kicker {
+      color: var(--muted);
+      font-size: 11px;
+      margin-bottom: 6px;
+    }
+
+    .insight-value {
+      font-size: 15px;
+      font-weight: 750;
+      line-height: 1.25;
+      margin-bottom: 5px;
+    }
+
+    .insight-copy {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
+      overflow-wrap: anywhere;
+    }
+
+    .reason-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .reason-pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 0 10px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, .04);
+      border: 1px solid var(--line);
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .range-rail-card {
+      display: grid;
+      gap: 10px;
+    }
+
+    .range-rail-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .range-rail-title {
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .range-rail-meta {
+      color: var(--muted);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    .range-rail {
+      position: relative;
+      height: 70px;
+    }
+
+    .range-rail-track {
+      position: absolute;
+      left: 0;
+      right: 0;
+      top: 30px;
+      height: 10px;
+      border-radius: 999px;
+      background: linear-gradient(90deg, rgba(43, 213, 118, .18), rgba(100, 168, 255, .18), rgba(255, 90, 102, .18));
+      border: 1px solid rgba(255, 255, 255, .06);
+    }
+
+    .range-rail-marker {
+      position: absolute;
+      top: 0;
+      width: 0;
+      height: 64px;
+      z-index: 1;
+    }
+
+    .range-rail-marker strong {
+      position: absolute;
+      top: 0;
+      left: var(--label-offset, 0px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 46px;
+      height: 22px;
+      padding: 0 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel);
+      font-size: 11px;
+      white-space: nowrap;
+      line-height: 1;
+      transform: translateX(-50%);
+    }
+
+    .range-rail-marker strong::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      top: 100%;
+      width: 1px;
+      height: 5px;
+      background: currentColor;
+      opacity: .5;
+      transform: translateX(-50%);
+    }
+
+    .range-rail-marker.compact strong {
+      min-width: 42px;
+      height: 20px;
+      padding: 0 6px;
+      font-size: 10px;
+    }
+
+    .range-rail-marker .marker-leader {
+      position: absolute;
+      top: 27px;
+      left: 0;
+      display: none;
+      height: 1px;
+      width: var(--leader-width, 0px);
+      background: currentColor;
+      opacity: .42;
+    }
+
+    .range-rail-marker.has-shift .marker-leader {
+      display: block;
+    }
+
+    .range-rail-marker.shift-left .marker-leader {
+      left: calc(var(--leader-width, 0px) * -1);
+    }
+
+    .range-rail-marker.shift-right .marker-leader {
+      left: 0;
+    }
+
+    .range-rail-marker .marker-stem {
+      position: absolute;
+      top: 27px;
+      left: 0;
+      width: 2px;
+      height: 32px;
+      border-radius: 999px;
+      background: currentColor;
+    }
+
+    .range-rail-marker.lane-1 {
+      top: 16px;
+      z-index: 0;
+    }
+
+    .range-rail-footer {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .rail-stat {
+      min-width: 0;
+    }
+
+    .rail-stat-label {
+      color: var(--muted);
+      font-size: 11px;
+      margin-bottom: 4px;
+    }
+
+    .rail-stat-value {
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .ai-panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .ai-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .ai-card-title {
+      color: var(--blue);
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+
+    .ai-card-copy {
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.6;
+      overflow-wrap: anywhere;
+    }
+
+    .depth-split {
+      display: grid;
+      gap: 10px;
+    }
+
+    .depth-track {
+      display: flex;
+      width: 100%;
+      height: 12px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(255, 255, 255, .05);
+      border: 1px solid rgba(255, 255, 255, .04);
+    }
+
+    .depth-track span:first-child {
+      background: rgba(43, 213, 118, .7);
+    }
+
+    .depth-track span:last-child {
+      background: rgba(255, 90, 102, .7);
+    }
+
+    .depth-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.4;
+    }
+
+    .detail-placeholder {
+      padding: 16px 14px;
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.55;
+      text-align: center;
     }
 
     .event-list {
@@ -1854,8 +2634,31 @@ INDEX_HTML = """<!doctype html>
         grid-template-columns: 1fr;
         overflow: visible;
       }
+      .detail-callout-grid {
+        grid-template-columns: 1fr;
+      }
+      .metric-summary,
+      .metric-summary.always-visible,
+      .collapsible.collapsed .metric-summary {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .visual-grid,
+      .insight-grid,
+      .ai-grid,
+      .range-rail-footer {
+        grid-template-columns: 1fr;
+      }
+      .chart-card.span-2 {
+        grid-column: span 1;
+      }
+      .meter-grid {
+        grid-template-columns: 1fr;
+      }
+      .detail-body-grid {
+        grid-template-columns: 1fr;
+      }
       .events {
-        height: auto;
+        width: min(860px, calc(100vw - 20px));
       }
     }
 
@@ -1868,6 +2671,9 @@ INDEX_HTML = """<!doctype html>
       section { border-radius: 6px; }
       table { min-width: 1080px; }
       .profile-grid { grid-template-columns: 1fr; }
+      .events {
+        width: calc(100vw - 20px);
+      }
     }
   </style>
 </head>
@@ -2007,7 +2813,7 @@ INDEX_HTML = """<!doctype html>
   <div class="modal-backdrop" id="threshold-modal">
     <div class="modal-card">
       <div class="modal-head">
-        <div class="modal-title">推送阈值设置</div>
+        <div class="modal-title">推送规则设置</div>
         <button id="close-threshold-modal" class="modal-close" type="button">x</button>
       </div>
       <div class="modal-body">
@@ -2018,7 +2824,29 @@ INDEX_HTML = """<!doctype html>
         <div class="setting-group">
           <label>异常分阈值</label>
           <input id="threshold-input" type="number" min="0" max="100" placeholder="70">
-          <div class="setting-help" id="threshold-hint">留空或恢复默认时，将回退到全局阈值。</div>
+          <div class="setting-help" id="threshold-hint">留空时回退到全局默认；如果同时配置附加条件，则按组合规则推送。</div>
+        </div>
+        <div class="setting-group">
+          <label>组合模式</label>
+          <select id="threshold-trigger-mode" style="width:140px">
+            <option value="any">任一条件满足</option>
+            <option value="all">全部条件满足</option>
+          </select>
+        </div>
+        <div class="setting-group">
+          <label>附加条件</label>
+          <div class="condition-grid">
+            <label class="condition-row"><input id="threshold-trigger-score" type="checkbox"><span>异常分 >=</span><input id="threshold-trigger-score-value" type="number" min="0" max="100" value="70"></label>
+            <label class="condition-row"><input id="threshold-trigger-volume" type="checkbox"><span>1分钟成交额 >=</span><input id="threshold-trigger-volume-value" type="number" min="0" value="500000"></label>
+            <label class="condition-row"><input id="threshold-trigger-multiplier" type="checkbox"><span>量能倍数 >=</span><input id="threshold-trigger-multiplier-value" type="number" min="0" step="0.1" value="3"></label>
+            <label class="condition-row"><input id="threshold-trigger-price" type="checkbox"><span>1分钟波动绝对值 >=</span><input id="threshold-trigger-price-value" type="number" min="0" step="0.1" value="0.8"></label>
+            <label class="condition-row"><input id="threshold-trigger-oi" type="checkbox"><span>OI 5分钟绝对值 >=</span><input id="threshold-trigger-oi-value" type="number" min="0" step="0.1" value="1.5"></label>
+            <label class="condition-row"><input id="threshold-trigger-liquidation" type="checkbox"><span>1分钟爆仓额 >=</span><input id="threshold-trigger-liquidation-value" type="number" min="0" value="250000"></label>
+            <label class="condition-row"><input id="threshold-trigger-imbalance" type="checkbox"><span>盘口失衡绝对值 >=</span><input id="threshold-trigger-imbalance-value" type="number" min="0" step="0.1" value="18"></label>
+            <label class="condition-row"><input id="threshold-trigger-depth-drop" type="checkbox"><span>盘口深度下降 >=</span><input id="threshold-trigger-depth-drop-value" type="number" min="0" step="0.1" value="18"></label>
+            <label class="condition-row"><input id="threshold-trigger-spread" type="checkbox"><span>盘口点差 >=</span><input id="threshold-trigger-spread-value" type="number" min="0" step="0.1" value="4"></label>
+          </div>
+          <div class="setting-help">适合做急拉前兆、插针风险、爆仓连锁这类更灵活的推送过滤。</div>
         </div>
         <div class="modal-actions">
           <button class="small-btn danger" id="threshold-reset-btn" type="button">恢复默认</button>
@@ -2076,7 +2904,8 @@ INDEX_HTML = """<!doctype html>
     </div>
   </div>
 
-  <main>
+  <main id="dashboard-main">
+    <div class="detail-drawer-backdrop" id="detail-drawer-backdrop"></div>
     <section class="market">
       <div class="section-title">
         <span>我的 USDT 永续合约</span>
@@ -2105,10 +2934,15 @@ INDEX_HTML = """<!doctype html>
       </div>
     </section>
 
-    <section class="events">
+    <section class="events" id="detail-drawer">
       <div class="section-title">
-        <span>合约详情</span>
-        <span id="source-label">REST</span>
+        <div class="drawer-head">
+          <span>合约详情</span>
+          <div class="drawer-meta">
+            <span id="source-label">REST</span>
+            <button class="drawer-close" id="detail-close-btn" type="button">x</button>
+          </div>
+        </div>
       </div>
       <div class="side-scroll" id="side-scroll">
         <div class="detail" id="detail"></div>
@@ -2129,9 +2963,14 @@ INDEX_HTML = """<!doctype html>
   </main>
 
   <script>
+    const mainEl = document.getElementById("dashboard-main");
+    const detailDrawerBackdropEl = document.getElementById("detail-drawer-backdrop");
+    const detailDrawerEl = document.getElementById("detail-drawer");
+    const detailCloseBtn = document.getElementById("detail-close-btn");
     const symbolsEl = document.getElementById("symbols");
     const eventsEl = document.getElementById("events");
     const eventsCollapseBtn = document.getElementById("events-collapse-btn");
+    const sideScrollEl = document.getElementById("side-scroll");
     const updatedEl = document.getElementById("updated");
     const countEl = document.getElementById("count");
     const alertCountEl = document.getElementById("alert-count");
@@ -2149,6 +2988,7 @@ INDEX_HTML = """<!doctype html>
     const thresholdSymbolEl = document.getElementById("threshold-symbol");
     const thresholdInputEl = document.getElementById("threshold-input");
     const thresholdHintEl = document.getElementById("threshold-hint");
+    const thresholdTriggerMode = document.getElementById("threshold-trigger-mode");
     const profileNameEl = document.getElementById("profile-name");
     const profileRoleEl = document.getElementById("profile-role");
     const profileUserIdEl = document.getElementById("profile-user-id");
@@ -2179,6 +3019,24 @@ INDEX_HTML = """<!doctype html>
     let authToken = localStorage.getItem("cfm_auth_token") || "";
     let refreshTimer = null;
     let lastSymbols = [];
+    let drawerScrollBySymbol = {};
+    let aiScrollBySymbol = {};
+    let detailInteractionUntil = 0;
+    let detailInteractionTimer = null;
+    let pendingDetailRefresh = false;
+    let pendingAIRefreshSymbol = null;
+    const DETAIL_INTERACTION_LOCK_MS = 900;
+    const thresholdTriggerFields = {
+      score: [document.getElementById("threshold-trigger-score"), document.getElementById("threshold-trigger-score-value")],
+      quote_volume_1m: [document.getElementById("threshold-trigger-volume"), document.getElementById("threshold-trigger-volume-value")],
+      volume_multiplier: [document.getElementById("threshold-trigger-multiplier"), document.getElementById("threshold-trigger-multiplier-value")],
+      price_move_pct_1m_abs: [document.getElementById("threshold-trigger-price"), document.getElementById("threshold-trigger-price-value")],
+      oi_change_pct_5m_abs: [document.getElementById("threshold-trigger-oi"), document.getElementById("threshold-trigger-oi-value")],
+      liquidation_total_quote_1m: [document.getElementById("threshold-trigger-liquidation"), document.getElementById("threshold-trigger-liquidation-value")],
+      depth_imbalance_abs: [document.getElementById("threshold-trigger-imbalance"), document.getElementById("threshold-trigger-imbalance-value")],
+      depth_drop_pct_1m: [document.getElementById("threshold-trigger-depth-drop"), document.getElementById("threshold-trigger-depth-drop-value")],
+      spread_bps: [document.getElementById("threshold-trigger-spread"), document.getElementById("threshold-trigger-spread-value")]
+    };
 
     const directionText = {
       up: "向上异动",
@@ -2240,6 +3098,31 @@ INDEX_HTML = """<!doctype html>
       }
     }
 
+    function isDrawerOpen() {
+      return detailDrawerEl.classList.contains("open");
+    }
+
+    function setDrawerOpen(open) {
+      mainEl.classList.toggle("drawer-open", open);
+      detailDrawerEl.classList.toggle("open", open);
+    }
+
+    function openDetailDrawer(symbol = null) {
+      if (symbol) selectedSymbol = symbol;
+      if (!selectedSymbol) return;
+      setDrawerOpen(true);
+    }
+
+    function closeDetailDrawer(clearSelection = true) {
+      setDrawerOpen(false);
+      if (clearSelection) {
+        clearDeferredDetailState();
+        selectedSymbol = null;
+        renderSymbols(lastSymbols);
+        renderDetail(lastSymbols);
+      }
+    }
+
     function resetViewState() {
       selectedSymbol = null;
       inputTouched = false;
@@ -2250,12 +3133,22 @@ INDEX_HTML = """<!doctype html>
       aiResults = {};
       aiRequestedAt = {};
       aiMeta = {};
+      drawerScrollBySymbol = {};
+      aiScrollBySymbol = {};
+      clearDeferredDetailState();
       symbolInputEl.value = "";
       symbolsEl.innerHTML = "";
       eventsEl.innerHTML = `<div class="empty">暂无报警</div>`;
-      detailEl.innerHTML = `<div class="empty">等待行情数据</div>`;
+      delete detailEl.dataset.symbol;
+      detailEl.innerHTML = `
+        <div class="drawer-empty">
+          <div class="drawer-empty-title">点击左侧合约展开详情</div>
+          <div class="drawer-empty-copy">右侧会先给你价格、量能、OI 图，再切到 AI、结构位和流动性视图。</div>
+        </div>
+      `;
       countEl.textContent = "0 个合约";
       alertCountEl.textContent = "0";
+      setDrawerOpen(false);
     }
 
     function applyTheme(theme) {
@@ -2458,6 +3351,405 @@ INDEX_HTML = """<!doctype html>
       });
     }
 
+    function mutedValue(text = "--") {
+      return `<span class="muted">${esc(text)}</span>`;
+    }
+
+    function hasCoreTradeData(symbol) {
+      return Boolean(
+        symbol &&
+        Number(symbol.price || 0) > 0 &&
+        Number(symbol.trade_count_1m || 0) > 0 &&
+        Number(symbol.updated_at || 0) > 0
+      );
+    }
+
+    function hasDepthData(symbol) {
+      if (!symbol) return false;
+      if ((symbol.microstructure_status || "unavailable") !== "active") return false;
+      const bidDepth = Number(symbol.bid_depth_notional || 0);
+      const askDepth = Number(symbol.ask_depth_notional || 0);
+      const spread = Number(symbol.spread_bps || 0);
+      return bidDepth > 0 || askDepth > 0 || spread > 0;
+    }
+
+    function hasStructureData(symbol) {
+      return hasCoreTradeData(symbol) && Number(symbol.support_price || 0) > 0 && Number(symbol.resistance_price || 0) > 0;
+    }
+
+    function hasOiData(symbol) {
+      if (!symbol) return false;
+      return hasCoreTradeData(symbol) && (
+        Number(symbol.open_interest || 0) > 0 ||
+        Math.abs(Number(symbol.oi_change_pct_5m || 0)) > 0
+      );
+    }
+
+    function hasFundingData(symbol) {
+      if (!symbol) return false;
+      return hasCoreTradeData(symbol) && (
+        Math.abs(Number(symbol.funding_rate || 0)) > 0 ||
+        Number(symbol.open_interest || 0) > 0
+      );
+    }
+
+    function dataState(symbol) {
+      if (hasCoreTradeData(symbol)) return "live";
+      if (hasDepthData(symbol)) return "partial";
+      return "empty";
+    }
+
+    function dataBannerHtml(symbol) {
+      const state = dataState(symbol);
+      if (state === "live") return "";
+      if (state === "partial") {
+        return `<div class="data-banner partial">当前已接入盘口深度，但成交主数据暂未到位。价格、波动、量能和结构判断会在实时成交恢复后补齐。</div>`;
+      }
+      return `<div class="data-banner empty">当前未收到可用成交数据。请优先使用 WebSocket 行情源，避免 REST 受限时页面被默认值填满。</div>`;
+    }
+
+    function fmtPctMaybe(value, available = true, digits = 3) {
+      if (!available) return mutedValue();
+      const number = Number(value || 0);
+      const cls = number > 0 ? "up" : number < 0 ? "down" : "muted";
+      return `<span class="${cls}">${number >= 0 ? "+" : ""}${number.toFixed(digits)}%</span>`;
+    }
+
+    function fmtFundingMaybe(value, available = true) {
+      if (!available) return mutedValue();
+      const number = Number(value || 0) * 100;
+      const cls = number > 0 ? "up" : number < 0 ? "down" : "muted";
+      return `<span class="${cls}">${number >= 0 ? "+" : ""}${number.toFixed(4)}%</span>`;
+    }
+
+    function fmtBpsMaybe(value, available = true) {
+      if (!available) return mutedValue();
+      const number = Number(value || 0);
+      const cls = number >= 4 ? "down" : number >= 2 ? "mixed" : "muted";
+      return `<span class="${cls}">${number.toFixed(2)}</span>`;
+    }
+
+    function fmtNumberMaybe(value, digits = 2, available = true, suffix = "") {
+      if (!available) return mutedValue();
+      return `${fmtNumber(value, digits)}${suffix}`;
+    }
+
+    function fmtPlainPctMaybe(value, available = true, digits = 2) {
+      if (!available) return "--";
+      return fmtPlainPct(value, digits);
+    }
+
+    function fmtPriceMaybe(value, available = true) {
+      if (!available) return "--";
+      return fmtNumber(value, 8);
+    }
+
+    function clamp(value, min, max) {
+      return Math.min(max, Math.max(min, value));
+    }
+
+    function seriesValues(values) {
+      if (!Array.isArray(values)) return [];
+      return values
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value));
+    }
+
+    function chartEmptyHtml(text = "暂无可绘制数据") {
+      return `<div class="chart-empty">${esc(text)}</div>`;
+    }
+
+    function lineChartSvg(values, tone = "mixed") {
+      const series = seriesValues(values);
+      if (series.length < 2) return chartEmptyHtml("时序样本不足");
+      const width = 100;
+      const height = 44;
+      const top = 4;
+      const bottom = 40;
+      const min = Math.min(...series);
+      const max = Math.max(...series);
+      const range = Math.max(max - min, 1e-9);
+      const step = width / Math.max(series.length - 1, 1);
+      const points = series.map((value, index) => {
+        const x = index * step;
+        const y = bottom - ((value - min) / range) * (bottom - top);
+        return `${x.toFixed(2)},${y.toFixed(2)}`;
+      });
+      const area = [`0,${bottom}`, ...points, `${width},${bottom}`].join(" ");
+      const lastPoint = points[points.length - 1].split(",");
+      return `
+        <div class="spark-wrap ${tone}">
+          <svg class="spark-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
+            <line class="spark-grid-line" x1="0" y1="12" x2="${width}" y2="12"></line>
+            <line class="spark-grid-line" x1="0" y1="26" x2="${width}" y2="26"></line>
+            <line class="spark-grid-line" x1="0" y1="40" x2="${width}" y2="40"></line>
+            <polygon class="spark-area" points="${area}"></polygon>
+            <polyline class="spark-line" points="${points.join(" ")}"></polyline>
+            <circle class="spark-dot" cx="${lastPoint[0]}" cy="${lastPoint[1]}" r="2.8"></circle>
+          </svg>
+        </div>
+      `;
+    }
+
+    function barChartSvg(values, tone = "blue") {
+      const series = seriesValues(values);
+      if (!series.length || series.every((value) => value <= 0)) return chartEmptyHtml("暂无量能柱");
+      const width = 100;
+      const height = 44;
+      const max = Math.max(...series, 1);
+      const gap = 1.2;
+      const barWidth = Math.max((width - gap * (series.length - 1)) / Math.max(series.length, 1), 1.8);
+      return `
+        <div class="spark-wrap short ${tone}">
+          <svg class="spark-svg" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
+            <line class="spark-grid-line" x1="0" y1="40" x2="${width}" y2="40"></line>
+            ${series.map((value, index) => {
+              const heightValue = Math.max((value / max) * 34, 2);
+              const x = index * (barWidth + gap);
+              const y = 40 - heightValue;
+              return `<rect class="spark-bar" x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${barWidth.toFixed(2)}" height="${heightValue.toFixed(2)}" rx="1.8"></rect>`;
+            }).join("")}
+          </svg>
+        </div>
+      `;
+    }
+
+    function meterHtml(label, percent, display, tone = "blue", note = "") {
+      const width = clamp(Number(percent) || 0, 0, 100);
+      return `
+        <div class="mini-meter">
+          <div class="meter-head">
+            <span>${esc(label)}</span>
+            <strong>${display}</strong>
+          </div>
+          <div class="meter-track">
+            <span class="meter-fill ${esc(tone)}" style="width:${width.toFixed(1)}%"></span>
+          </div>
+          ${note ? `<div class="meter-copy">${esc(note)}</div>` : ""}
+        </div>
+      `;
+    }
+
+    function detailTab() {
+      const raw = localStorage.getItem(storageKey("cfm_detail_tab")) || "overview";
+      return ["overview", "ai", "structure", "liquidity"].includes(raw) ? raw : "overview";
+    }
+
+    function setDetailTab(tab) {
+      localStorage.setItem(storageKey("cfm_detail_tab"), tab);
+    }
+
+    function clearDeferredDetailState() {
+      detailInteractionUntil = 0;
+      pendingDetailRefresh = false;
+      pendingAIRefreshSymbol = null;
+      if (detailInteractionTimer) {
+        clearTimeout(detailInteractionTimer);
+        detailInteractionTimer = null;
+      }
+    }
+
+    function selectedSymbolSnapshot(symbols = lastSymbols) {
+      return (symbols || []).find((item) => item.symbol === selectedSymbol) || null;
+    }
+
+    function detailRefreshLocked(symbol = selectedSymbol) {
+      return Boolean(symbol && detailTab() === "ai" && Date.now() < detailInteractionUntil);
+    }
+
+    function scheduleDetailRefreshFlush() {
+      if (detailInteractionTimer) clearTimeout(detailInteractionTimer);
+      const delay = Math.max(DETAIL_INTERACTION_LOCK_MS, detailInteractionUntil - Date.now()) + 40;
+      detailInteractionTimer = setTimeout(() => {
+        detailInteractionTimer = null;
+        flushDeferredDetailRefresh();
+      }, delay);
+    }
+
+    function noteAIInteraction() {
+      detailInteractionUntil = Date.now() + DETAIL_INTERACTION_LOCK_MS;
+      scheduleDetailRefreshFlush();
+    }
+
+    function shouldDeferDetailRender(symbols) {
+      if (!detailRefreshLocked()) return false;
+      if ((detailEl.dataset.symbol || "") !== selectedSymbol) return false;
+      return Boolean(selectedSymbolSnapshot(symbols));
+    }
+
+    function flushDeferredDetailRefresh() {
+      if (detailRefreshLocked()) {
+        scheduleDetailRefreshFlush();
+        return;
+      }
+      if (!selectedSymbol) {
+        pendingDetailRefresh = false;
+        pendingAIRefreshSymbol = null;
+        return;
+      }
+      if (pendingDetailRefresh) {
+        pendingDetailRefresh = false;
+        pendingAIRefreshSymbol = null;
+        renderDetail(lastSymbols);
+        return;
+      }
+      if (pendingAIRefreshSymbol && pendingAIRefreshSymbol === selectedSymbol && detailTab() === "ai") {
+        const symbol = pendingAIRefreshSymbol;
+        pendingAIRefreshSymbol = null;
+        refreshAIBlock(symbol, false);
+      }
+    }
+
+    function captureDetailScroll(symbol = selectedSymbol) {
+      if (!symbol) return { drawer: 0, ai: 0, sameSymbol: false };
+      const sameSymbol = (detailEl.dataset.symbol || "") === symbol;
+      const aiBlock = document.getElementById("ai-block");
+      const drawerTop = sideScrollEl ? sideScrollEl.scrollTop : (drawerScrollBySymbol[symbol] || 0);
+      const aiTop = aiBlock ? aiBlock.scrollTop : (aiScrollBySymbol[symbol] || 0);
+      drawerScrollBySymbol[symbol] = drawerTop;
+      aiScrollBySymbol[symbol] = aiTop;
+      return { drawer: drawerTop, ai: aiTop, sameSymbol };
+    }
+
+    function applyScrollRestore(element, top) {
+      if (!element) return;
+      const nextTop = Math.max(0, Number(top) || 0);
+      if (Math.abs(element.scrollTop - nextTop) < 1) return;
+      element.scrollTop = nextTop;
+      requestAnimationFrame(() => {
+        if (element && element.isConnected && Math.abs(element.scrollTop - nextTop) >= 1) {
+          element.scrollTop = nextTop;
+        }
+      });
+    }
+
+    function restoreDetailScroll(symbol, preserved, activeTab) {
+      requestAnimationFrame(() => {
+        if (sideScrollEl) {
+          const drawerTop = preserved && preserved.sameSymbol
+            ? preserved.drawer
+            : (drawerScrollBySymbol[symbol] || 0);
+          applyScrollRestore(sideScrollEl, drawerTop);
+        }
+        const aiBlock = document.getElementById("ai-block");
+        if (aiBlock && activeTab === "ai") {
+          const aiTop = preserved && preserved.sameSymbol
+            ? preserved.ai
+            : (aiScrollBySymbol[symbol] || 0);
+          applyScrollRestore(aiBlock, aiTop);
+        }
+      });
+    }
+
+    function refreshAIBlock(symbol, deferIfLocked = true) {
+      const aiBlock = document.getElementById("ai-block");
+      if (!aiBlock) return;
+      const scrollTop = aiBlock.scrollTop;
+      aiScrollBySymbol[symbol] = scrollTop;
+      if (deferIfLocked && selectedSymbol === symbol && detailRefreshLocked(symbol)) {
+        pendingAIRefreshSymbol = symbol;
+        scheduleDetailRefreshFlush();
+        return;
+      }
+      pendingAIRefreshSymbol = null;
+      aiBlock.innerHTML = renderAIBlock(symbol);
+      const nextBlock = document.getElementById("ai-block");
+      applyScrollRestore(nextBlock, aiScrollBySymbol[symbol] || 0);
+    }
+
+    function structureMarkerHtml(marker) {
+      const classes = ["range-rail-marker", marker.tone || "muted", `lane-${marker.lane || 0}`];
+      if (marker.compact) classes.push("compact");
+      const shift = Number(marker.shift || 0);
+      if (shift < 0) classes.push("has-shift", "shift-left");
+      if (shift > 0) classes.push("has-shift", "shift-right");
+      return `
+        <div class="${classes.join(" ")}" style="left:${marker.left.toFixed(2)}%; --label-offset:${shift.toFixed(0)}px; --leader-width:${Math.abs(shift).toFixed(0)}px">
+          <strong>${esc(marker.label)}</strong>
+          <span class="marker-leader"></span>
+          <span class="marker-stem"></span>
+        </div>
+      `;
+    }
+
+    function structureMarkerPriority(label) {
+      if (label === "支撑") return 0;
+      if (label === "VWAP") return 1;
+      if (label === "现价") return 2;
+      if (label === "压力") return 3;
+      return 4;
+    }
+
+    function sortStructureMarkers(left, right) {
+      const diff = Number(left.left || 0) - Number(right.left || 0);
+      if (Math.abs(diff) >= 0.01) return diff;
+      return structureMarkerPriority(left.label) - structureMarkerPriority(right.label);
+    }
+
+    function applyStructureCluster(cluster) {
+      if (!cluster.length) return;
+      const averageLeft = cluster.reduce((sum, marker) => sum + Number(marker.left || 0), 0) / cluster.length;
+      const compact = cluster.length >= 3;
+      const step = compact ? 54 : 42;
+      cluster.forEach((marker) => {
+        marker.compact = compact;
+        marker.lane = 0;
+        marker.shift = 0;
+      });
+
+      if (averageLeft >= 82) {
+        const ordered = [...cluster].sort((left, right) => {
+          const diff = Number(right.left || 0) - Number(left.left || 0);
+          if (Math.abs(diff) >= 0.01) return diff;
+          return structureMarkerPriority(right.label) - structureMarkerPriority(left.label);
+        });
+        ordered.forEach((marker, index) => {
+          marker.shift = -(24 + index * step);
+        });
+        return;
+      }
+
+      if (averageLeft <= 18) {
+        const ordered = [...cluster].sort(sortStructureMarkers);
+        ordered.forEach((marker, index) => {
+          marker.shift = 24 + index * step;
+        });
+        return;
+      }
+
+      const ordered = [...cluster].sort(sortStructureMarkers);
+      const centerIndex = (ordered.length - 1) / 2;
+      ordered.forEach((marker, index) => {
+        marker.shift = Math.round((index - centerIndex) * step);
+      });
+    }
+
+    function structureMarkers(symbol, rangePos, vwapPos) {
+      const markers = [
+        { label: "支撑", left: 0, tone: "up", lane: 0 },
+        { label: "VWAP", left: vwapPos, tone: "mixed", lane: 0 },
+        { label: "现价", left: rangePos, tone: valueClass(symbol.price_move_pct_1m), lane: 0 },
+        { label: "压力", left: 100, tone: "down", lane: 0 }
+      ];
+      const closenessThreshold = 9;
+      markers.forEach((marker) => {
+        if (marker.left <= 6) marker.shift = 24;
+        if (marker.left >= 94) marker.shift = -24;
+      });
+      const sorted = [...markers].sort(sortStructureMarkers);
+      const clusters = [];
+      sorted.forEach((marker) => {
+        const current = clusters[clusters.length - 1];
+        if (!current || Math.abs(marker.left - current[current.length - 1].left) >= closenessThreshold) {
+          clusters.push([marker]);
+          return;
+        }
+        current.push(marker);
+      });
+      clusters.filter((cluster) => cluster.length > 1).forEach(applyStructureCluster);
+      return markers.map((marker) => structureMarkerHtml(marker)).join("");
+    }
+
     function fmtPct(value) {
       const number = Number(value || 0);
       const cls = number > 0 ? "up" : number < 0 ? "down" : "muted";
@@ -2474,6 +3766,17 @@ INDEX_HTML = """<!doctype html>
       const number = Number(value || 0);
       const cls = number >= 4 ? "down" : number >= 2 ? "mixed" : "muted";
       return `<span class="${cls}">${number.toFixed(2)}</span>`;
+    }
+
+    function fmtPriceLevel(value) {
+      const number = Number(value || 0);
+      if (!number) return "--";
+      return fmtNumber(number, 8);
+    }
+
+    function fmtPlainPct(value, digits = 2) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "--";
+      return `${Number(value).toFixed(digits)}%`;
     }
 
     function liquidationStatusText(symbol) {
@@ -2565,11 +3868,132 @@ INDEX_HTML = """<!doctype html>
     }
 
     function currentThresholdText(symbol) {
-      const threshold = symbolThresholds[symbol];
-      if (threshold && threshold.anomaly_score !== undefined && threshold.anomaly_score !== null) {
-        return `${fmtNumber(threshold.anomaly_score, 1)} 分`;
+      const config = symbolThresholds[symbol] || {};
+      const hasRules = hasEnabledThresholdRules(config.push_rules);
+      if (hasRules && config.anomaly_score !== undefined && config.anomaly_score !== null) {
+        return `规则 + ${fmtNumber(config.anomaly_score, 1)} 分`;
+      }
+      if (hasRules) {
+        return "组合规则";
+      }
+      if (config && config.anomaly_score !== undefined && config.anomaly_score !== null) {
+        return `${fmtNumber(config.anomaly_score, 1)} 分`;
       }
       return `全局 ${fmtNumber(globalThreshold, 1)} 分`;
+    }
+
+    function thresholdButtonText(symbol) {
+      const config = symbolThresholds[symbol] || {};
+      const hasRules = hasEnabledThresholdRules(config.push_rules);
+      const hasScore = config.anomaly_score !== undefined && config.anomaly_score !== null;
+      if (hasRules && hasScore) return "自定义";
+      if (hasRules) return "组合";
+      if (hasScore) return "分数";
+      return "规则";
+    }
+
+    function structureState(symbol) {
+      const supportDistance = Number(symbol.support_distance_pct || 0);
+      const resistanceDistance = Number(symbol.resistance_distance_pct || 0);
+      const rangePosition = Number(symbol.range_position_pct || 50);
+      const vwapDeviation = Number(symbol.vwap_deviation_pct || 0);
+      if (supportDistance <= 0.12 && resistanceDistance <= 0.12) return "区间极窄";
+      if (supportDistance <= 0.18 && supportDistance <= resistanceDistance) return "贴近支撑";
+      if (resistanceDistance <= 0.18 && resistanceDistance < supportDistance) return "贴近压力";
+      if (rangePosition >= 80) return "区间上沿";
+      if (rangePosition <= 20) return "区间下沿";
+      if (vwapDeviation >= 0.35) return "高于 VWAP";
+      if (vwapDeviation <= -0.35) return "低于 VWAP";
+      return "区间中部";
+    }
+
+    function structureMeta(symbol) {
+      const supportDistance = fmtPlainPct(symbol.support_distance_pct, 2);
+      const resistanceDistance = fmtPlainPct(symbol.resistance_distance_pct, 2);
+      return `距撑 ${supportDistance} / 距压 ${resistanceDistance}`;
+    }
+
+    function structureNarrative(symbol) {
+      const state = structureState(symbol);
+      const support = fmtPriceLevel(symbol.support_price);
+      const resistance = fmtPriceLevel(symbol.resistance_price);
+      const supportDistance = fmtPlainPct(symbol.support_distance_pct, 2);
+      const resistanceDistance = fmtPlainPct(symbol.resistance_distance_pct, 2);
+      const bidWall = fmtPriceLevel(symbol.bid_wall_price);
+      const askWall = fmtPriceLevel(symbol.ask_wall_price);
+      if (state === "区间极窄") {
+        return `价格挤在 ${support} - ${resistance} 的窄区间里，短线更容易先走假突破，先等放量确认。`;
+      }
+      if (state === "贴近支撑") {
+        return `当前更靠近支撑 ${support}，距支撑约 ${supportDistance}；若买盘墙 ${bidWall} 继续承接，短线更利于反抽观察。`;
+      }
+      if (state === "贴近压力") {
+        return `当前更靠近压力 ${resistance}，距压力约 ${resistanceDistance}；若卖盘墙 ${askWall} 持续压制，短线更容易先遇阻。`;
+      }
+      if (state === "区间上沿") {
+        return `价格运行在区间上半段，离压力更近，重点看是否放量站上 ${resistance}。`;
+      }
+      if (state === "区间下沿") {
+        return `价格运行在区间下半段，离支撑更近，重点看 ${support} 是否继续被动承接。`;
+      }
+      if (state === "高于 VWAP") {
+        return `当前价格在区间 VWAP 上方，说明短线均价偏强，但若无法继续抬高压力位，容易回归均价。`;
+      }
+      if (state === "低于 VWAP") {
+        return `当前价格在区间 VWAP 下方，说明短线均价偏弱，除非快速收回 VWAP，否则更偏震荡偏弱。`;
+      }
+      return `当前处在区间中部，支撑 ${support} 与压力 ${resistance} 都还有效，优先观察哪一侧先被放量突破。`;
+    }
+
+    function flowNarrative(symbol) {
+      const buyRatio = Number(symbol.taker_buy_ratio_1m || 0) * 100;
+      const depthDrop = Number(symbol.depth_drop_pct_1m || 0);
+      const imbalance = Number(symbol.depth_imbalance || 0) * 100;
+      const spread = Number(symbol.spread_bps || 0);
+      if (depthDrop >= 18 && spread >= 4) {
+        return `盘口明显变薄，点差 ${spread.toFixed(2)} bps，当前更要防插针和瞬时滑点。`;
+      }
+      if (buyRatio >= 65 && imbalance >= 10) {
+        return `主动买入和买盘深度都偏强，若价格还能站稳 VWAP，上冲延续性会更好。`;
+      }
+      if (buyRatio <= 35 && imbalance <= -10) {
+        return `主动卖出与卖盘深度都偏强，除非快速收回均价，否则下压更占优。`;
+      }
+      return `当前流向没有形成极端单边，先把盘口墙、VWAP 和区间边界一起看。`;
+    }
+
+    function structureStateClass(state) {
+      if (state.includes("支撑")) return "up";
+      if (state.includes("压力")) return "down";
+      if (state.includes("上沿") || state.includes("下沿") || state.includes("窄")) return "mixed";
+      return "muted";
+    }
+
+    function hasEnabledThresholdRules(rules) {
+      const conditions = rules && rules.conditions ? rules.conditions : {};
+      return Object.values(conditions).some((cfg) => Boolean(cfg && cfg.enabled));
+    }
+
+    function applyThresholdRuleForm(rules, fallbackScore = globalThreshold) {
+      const conditions = rules && rules.conditions ? rules.conditions : {};
+      thresholdTriggerMode.value = rules && rules.mode === "all" ? "all" : "any";
+      Object.entries(thresholdTriggerFields).forEach(([key, fields]) => {
+        const cfg = conditions[key] || {};
+        fields[0].checked = Boolean(cfg.enabled);
+        const defaultValue = key === "score" ? fallbackScore : fields[1].value;
+        fields[1].value = cfg.threshold ?? defaultValue;
+      });
+    }
+
+    function collectThresholdRules() {
+      const conditions = {};
+      Object.entries(thresholdTriggerFields).forEach(([key, fields]) => {
+        conditions[key] = {
+          enabled: fields[0].checked,
+          threshold: Number(fields[1].value) || 0
+        };
+      });
+      return { mode: thresholdTriggerMode.value || "any", conditions };
     }
 
     function aiStatusLine(symbol) {
@@ -2579,16 +4003,243 @@ INDEX_HTML = """<!doctype html>
       return `<div class="ai-status"><strong>${esc(meta.status)}</strong><span>${esc(timeText)}</span></div>`;
     }
 
+    function aiSections(text) {
+      const lines = String(text || "").split("\\n").map((line) => line.trim()).filter(Boolean);
+      if (!lines.length) return [];
+      const sections = [];
+      let current = null;
+
+      function flushCurrent() {
+        if (!current) return;
+        const body = current.bodyLines.join(" ").trim();
+        sections.push({ title: current.title, body: body || "等待补充内容" });
+        current = null;
+      }
+
+      lines.forEach((line) => {
+        const markdownHeading = line.match(/^(?:\\d+[\\.、]\\s*)?\\*\\*(.+?)\\*\\*[:：]?\\s*(.*)$/);
+        if (markdownHeading) {
+          flushCurrent();
+          current = { title: markdownHeading[1], bodyLines: [] };
+          if (markdownHeading[2]) current.bodyLines.push(markdownHeading[2]);
+          return;
+        }
+
+        const titledLine = line.match(/^(?:\\d+[\\.、]\\s*)?([^:：]{2,20})[:：]\\s*(.+)$/);
+        if (titledLine) {
+          flushCurrent();
+          sections.push({ title: titledLine[1], body: titledLine[2] });
+          return;
+        }
+
+        const numberedLine = line.match(/^(\\d+)[\\.、]\\s*(.+)$/);
+        if (numberedLine) {
+          flushCurrent();
+          sections.push({ title: `要点 ${numberedLine[1]}`, body: numberedLine[2] });
+          return;
+        }
+
+        if (current) {
+          current.bodyLines.push(line);
+          return;
+        }
+
+        sections.push({ title: sections.length ? `补充 ${sections.length + 1}` : "AI 摘要", body: line });
+      });
+
+      flushCurrent();
+      return sections;
+    }
+
     function renderAIBlock(symbol) {
       const text = aiResults[symbol];
       if (!text) {
-        return `${aiStatusLine(symbol)}<div class="muted">等待 AI 根据当前合约指标生成观察建议。</div>`;
+        return `${aiStatusLine(symbol)}<div class="detail-placeholder">等待 AI 根据当前合约指标生成观察建议。</div>`;
       }
-      return aiStatusLine(symbol) + text.split("\\n")
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .map((line) => `<div>${esc(line)}</div>`)
-        .join("");
+      const sections = aiSections(text);
+      const cardsHtml = sections.length
+        ? `<div class="ai-grid">${sections.map((item) => `
+            <div class="ai-card">
+              <div class="ai-card-title">${esc(item.title)}</div>
+              <div class="ai-card-copy">${esc(item.body)}</div>
+            </div>
+          `).join("")}</div>`
+        : `<div class="detail-placeholder">AI 返回了空内容，请稍后重试。</div>`;
+      return aiStatusLine(symbol) + cardsHtml;
+    }
+
+    function detailTabButton(tab, label) {
+      return `<button class="detail-tab ${detailTab() === tab ? "active" : ""}" data-detail-tab="${esc(tab)}" type="button">${esc(label)}</button>`;
+    }
+
+    function insightCard(kicker, value, copy, tone = "muted") {
+      return `
+        <div class="insight-card">
+          <div class="insight-kicker">${esc(kicker)}</div>
+          <div class="insight-value ${esc(tone)}">${esc(value)}</div>
+          <div class="insight-copy">${esc(copy)}</div>
+        </div>
+      `;
+    }
+
+    function chartCard(title, meta, body, extraClass = "") {
+      return `
+        <div class="chart-card ${extraClass}">
+          <div class="chart-head">
+            <div class="chart-title">${esc(title)}</div>
+            <div class="chart-meta">${meta}</div>
+          </div>
+          ${body}
+        </div>
+      `;
+    }
+
+    function renderOverviewPanel(symbol) {
+      const tradeLive = hasCoreTradeData(symbol);
+      const oiLive = hasOiData(symbol);
+      const depthLive = hasDepthData(symbol);
+      const structureLive = hasStructureData(symbol);
+      const reasons = (symbol.reasons || []).length ? symbol.reasons : ["暂无明确触发项"];
+      const structureText = structureLive ? structureNarrative(symbol) : "等待成交数据后补齐结构判断。";
+      const flowText = depthLive ? flowNarrative(symbol) : "盘口深度暂未到位，先以价格与量能为主。";
+      const liquidationText = (symbol.liquidation_data_status || "unavailable") === "recent_event"
+        ? `近 1 分钟爆仓 ${fmtNumber(symbol.liquidation_total_quote_1m, 0)} USDT`
+        : (symbol.liquidation_data_status || "unavailable") === "no_recent_event"
+          ? "近 1 分钟暂无可识别爆仓"
+          : "当前数据源未给到有效爆仓流";
+      return `
+        <div class="detail-panel">
+          <div class="insight-grid">
+            ${insightCard("结构", structureLive ? structureState(symbol) : "等待结构", structureText, structureLive ? structureStateClass(structureState(symbol)) : "muted")}
+            ${insightCard("盘口", shortBias(symbol.bias || "观察"), flowText, rowClass(symbol))}
+            ${insightCard("爆仓", liquidationStatusText(symbol), liquidationText, liquidationStatusClass(symbol))}
+          </div>
+          <div>
+            <div class="detail-title">本次关注点</div>
+            <div class="reason-pills">
+              ${reasons.map((item) => `<span class="reason-pill">${esc(item)}</span>`).join("")}
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderStructurePanel(symbol) {
+      const available = hasStructureData(symbol);
+      if (!available) {
+        return `<div class="detail-panel"><div class="detail-placeholder">等待成交序列稳定后，再展示支撑、压力、VWAP 与区间位置。</div></div>`;
+      }
+      const support = Number(symbol.support_price || 0);
+      const resistance = Number(symbol.resistance_price || 0);
+      const price = Number(symbol.price || 0);
+      const vwap = Number(symbol.window_vwap || 0);
+      const spread = Math.max(resistance - support, 1e-9);
+      const rangePos = clamp(Number(symbol.range_position_pct || 50), 0, 100);
+      const vwapPos = clamp(((vwap - support) / spread) * 100, 0, 100);
+      return `
+        <div class="detail-panel">
+          <div class="range-rail-card">
+            <div class="range-rail-head">
+              <div class="range-rail-title">支撑 / 压力结构带</div>
+              <div class="range-rail-meta">${esc(structureState(symbol))}</div>
+            </div>
+            <div class="range-rail">
+              <div class="range-rail-track"></div>
+              ${structureMarkers(symbol, rangePos, vwapPos)}
+            </div>
+            <div class="range-rail-footer">
+              <div class="rail-stat">
+                <div class="rail-stat-label">支撑位</div>
+                <div class="rail-stat-value">${fmtPriceLevel(support)}</div>
+              </div>
+              <div class="rail-stat">
+                <div class="rail-stat-label">现价</div>
+                <div class="rail-stat-value">${fmtPriceLevel(price)}</div>
+              </div>
+              <div class="rail-stat">
+                <div class="rail-stat-label">VWAP</div>
+                <div class="rail-stat-value">${fmtPriceLevel(vwap)}</div>
+              </div>
+              <div class="rail-stat">
+                <div class="rail-stat-label">压力位</div>
+                <div class="rail-stat-value">${fmtPriceLevel(resistance)}</div>
+              </div>
+            </div>
+          </div>
+          <div class="metric-grid compact">
+            <div class="metric">
+              <div class="metric-label">距支撑</div>
+              <div class="metric-value up">${fmtPlainPct(symbol.support_distance_pct, 2)}</div>
+              <div class="metric-copy">越短说明越接近下沿承接区</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">距压力</div>
+              <div class="metric-value down">${fmtPlainPct(symbol.resistance_distance_pct, 2)}</div>
+              <div class="metric-copy">越短说明越接近上沿抛压区</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">区间位置</div>
+              <div class="metric-value">${fmtPlainPct(symbol.range_position_pct, 2)}</div>
+              <div class="metric-copy">${esc(structureState(symbol))}</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">VWAP 偏离</div>
+              <div class="metric-value ${valueClass(symbol.vwap_deviation_pct)}">${fmtPlainPct(symbol.vwap_deviation_pct, 3)}</div>
+              <div class="metric-copy">短线均价偏离度</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">买盘墙</div>
+              <div class="metric-value">${fmtPriceLevel(symbol.bid_wall_price)}</div>
+              <div class="metric-copy">金额 ${fmtNumber(symbol.bid_wall_notional, 0)}</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">卖盘墙</div>
+              <div class="metric-value">${fmtPriceLevel(symbol.ask_wall_price)}</div>
+              <div class="metric-copy">金额 ${fmtNumber(symbol.ask_wall_notional, 0)}</div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderLiquidityPanel(symbol) {
+      const depthLive = hasDepthData(symbol);
+      const tradeLive = hasCoreTradeData(symbol);
+      const totalDepth = Number(symbol.bid_depth_notional || 0) + Number(symbol.ask_depth_notional || 0);
+      const bidPct = totalDepth > 0 ? (Number(symbol.bid_depth_notional || 0) / totalDepth) * 100 : 50;
+      const askPct = 100 - bidPct;
+      return `
+        <div class="detail-panel">
+          ${depthLive ? `
+            <div class="depth-card">
+              <div class="chart-head">
+                <div class="chart-title">买卖盘深度对比</div>
+                <div class="chart-meta">${fmtBps(symbol.spread_bps)} bps</div>
+              </div>
+              <div class="depth-split">
+                <div class="depth-track">
+                  <span style="width:${bidPct.toFixed(1)}%"></span>
+                  <span style="width:${askPct.toFixed(1)}%"></span>
+                </div>
+                <div class="depth-meta">
+                  <span>买盘 ${fmtNumber(symbol.bid_depth_notional, 0)}</span>
+                  <span>卖盘 ${fmtNumber(symbol.ask_depth_notional, 0)}</span>
+                </div>
+              </div>
+            </div>
+          ` : `<div class="detail-placeholder">当前数据源没有稳定盘口深度，流动性看板先保持静默。</div>`}
+          <div class="metric-grid compact">
+            <div class="metric"><div class="metric-label">强平状态</div><div class="metric-value ${liquidationStatusClass(symbol)}">${esc(liquidationStatusText(symbol))}</div><div class="metric-copy">总额 ${liquidationTotalHtml(symbol)}</div></div>
+            <div class="metric"><div class="metric-label">强平事件 1m</div><div class="metric-value">${fmtNumber(symbol.liquidation_event_count_1m, 0)}</div><div class="metric-copy">近一分钟记录数</div></div>
+            <div class="metric"><div class="metric-label">多头爆仓</div><div class="metric-value">${liquidationSideHtml(symbol, "long_liquidation_quote_1m")}</div><div class="metric-copy">USDT</div></div>
+            <div class="metric"><div class="metric-label">空头爆仓</div><div class="metric-value">${liquidationSideHtml(symbol, "short_liquidation_quote_1m")}</div><div class="metric-copy">USDT</div></div>
+            <div class="metric"><div class="metric-label">盘口点差</div><div class="metric-value">${depthLive ? `${fmtBps(symbol.spread_bps)} bps` : mutedValue()}</div><div class="metric-copy">越大越易滑点</div></div>
+            <div class="metric"><div class="metric-label">深度下降</div><div class="metric-value">${depthLive ? `${fmtNumber(symbol.depth_drop_pct_1m, 1)}%` : mutedValue()}</div><div class="metric-copy">越快越易插针</div></div>
+            <div class="metric"><div class="metric-label">盘口失衡</div><div class="metric-value">${depthLive ? `${fmtNumber(Number(symbol.depth_imbalance || 0) * 100, 1)}%` : mutedValue()}</div><div class="metric-copy">正值偏买盘，负值偏卖盘</div></div>
+            <div class="metric"><div class="metric-label">主动买入</div><div class="metric-value">${tradeLive ? `${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%` : mutedValue()}</div><div class="metric-copy">成交主导方向</div></div>
+          </div>
+        </div>
+      `;
     }
 
     function eventLevel(event) {
@@ -2620,8 +4271,18 @@ INDEX_HTML = """<!doctype html>
       }
     }
 
+    const defaultCollapsedSections = {
+      detail_micro: true,
+      detail_reasons: true,
+      events: false,
+    };
+
     function isCollapsed(section) {
-      return Boolean(readCollapseState()[section]);
+      const state = readCollapseState();
+      if (Object.prototype.hasOwnProperty.call(state, section)) {
+        return Boolean(state[section]);
+      }
+      return Boolean(defaultCollapsedSections[section]);
     }
 
     function setCollapsed(section, collapsed) {
@@ -2661,17 +4322,25 @@ INDEX_HTML = """<!doctype html>
       updateCollapseButton(eventsCollapseBtn, collapsed);
     }
 
-    function renderMetricSummary(symbol) {
+    function renderMetricSummary(symbol, extraClass = "") {
+      const tradeLive = hasCoreTradeData(symbol);
+      const oiLive = hasOiData(symbol);
+      const depthLive = hasDepthData(symbol);
+      const structureLive = hasStructureData(symbol);
       const items = [
         ["风险", `<span class="${riskClass(symbol.risk_level)}">${esc(symbol.risk_level || "低风险")}</span>`],
-        ["置信度", `${fmtNumber(symbol.confidence, 1)}%`],
-        ["1m成交额", fmtNumber(symbol.quote_volume_1m, 0)],
-        ["量能", `<span class="${rowClass(symbol)}">${fmtNumber(symbol.volume_multiplier, 2)}x</span>`],
-        ["OI 5m", fmtPct(symbol.oi_change_pct_5m)],
-        ["爆仓", `<span class="${liquidationStatusClass(symbol)}">${liquidationStatusText(symbol)}</span>`]
+        ["置信度", tradeLive ? `${fmtNumber(symbol.confidence, 1)}%` : mutedValue()],
+        ["1m波动", fmtPctMaybe(symbol.price_move_pct_1m, tradeLive)],
+        ["1m成交额", fmtNumberMaybe(symbol.quote_volume_1m, 0, tradeLive)],
+        ["量能", tradeLive ? `<span class="${rowClass(symbol)}">${fmtNumber(symbol.volume_multiplier, 2)}x</span>` : mutedValue()],
+        ["OI 5m", fmtPctMaybe(symbol.oi_change_pct_5m, oiLive)],
+        ["主动买入", tradeLive ? `${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%` : mutedValue()],
+        ["结构", structureLive ? `<span class="${structureStateClass(structureState(symbol))}">${esc(structureState(symbol))}</span>` : mutedValue("等待结构")],
+        ["爆仓", `<span class="${liquidationStatusClass(symbol)}">${esc(liquidationStatusText(symbol))}</span>`],
+        ["点差", depthLive ? `${fmtBps(symbol.spread_bps)} bps` : mutedValue()]
       ];
       return `
-        <div class="metric-summary">
+        <div class="metric-summary ${extraClass}">
           ${items.map(([label, value]) => `
             <div class="summary-chip">
               <span class="summary-label">${esc(label)}</span>
@@ -2685,9 +4354,9 @@ INDEX_HTML = """<!doctype html>
     function renderSymbols(symbols) {
       lastSymbols = symbols || [];
       countEl.textContent = `${symbols.length} 个合约`;
-      if (!selectedSymbol && symbols.length) selectedSymbol = symbols[0].symbol;
       if (selectedSymbol && !symbols.some((symbol) => symbol.symbol === selectedSymbol)) {
         selectedSymbol = symbols[0] ? symbols[0].symbol : null;
+        if (!selectedSymbol) setDrawerOpen(false);
       }
       if (!inputTouched) {
         symbolInputEl.value = symbols.map((symbol) => symbol.symbol).join(", ");
@@ -2699,7 +4368,7 @@ INDEX_HTML = """<!doctype html>
             <div class="symbol">${esc(symbol.symbol)}</div>
             <div class="symbol-meta">
               <span class="sub-pill">${esc(signalTag(symbol))}</span>
-              <button class="row-action-btn js-threshold" data-symbol="${esc(symbol.symbol)}" type="button" title="设置推送阈值">阈值</button>
+              <button class="row-action-btn js-threshold ${thresholdButtonText(symbol.symbol) !== "规则" ? "active" : ""}" data-symbol="${esc(symbol.symbol)}" type="button" title="${esc(currentThresholdText(symbol.symbol))}">${esc(thresholdButtonText(symbol.symbol))}</button>
             </div>
           </td>
           <td><span class="score">${fmtNumber(symbol.score, 1)}</span></td>
@@ -2719,6 +4388,7 @@ INDEX_HTML = """<!doctype html>
       symbolsEl.querySelectorAll("tr").forEach((row) => {
         row.addEventListener("click", () => {
           selectedSymbol = row.dataset.symbol;
+          openDetailDrawer(selectedSymbol);
           renderSymbols(symbols);
           renderDetail(symbols);
         });
@@ -2727,6 +4397,7 @@ INDEX_HTML = """<!doctype html>
         button.addEventListener("click", (event) => {
           event.stopPropagation();
           selectedSymbol = button.dataset.symbol;
+          openDetailDrawer(selectedSymbol);
           renderSymbols(symbols);
           renderDetail(symbols);
           openThresholdModal(selectedSymbol);
@@ -2735,64 +4406,93 @@ INDEX_HTML = """<!doctype html>
     }
 
     function renderDetail(symbols) {
-      const symbol = symbols.find((item) => item.symbol === selectedSymbol) || symbols[0];
+      const symbol = symbols.find((item) => item.symbol === selectedSymbol);
       if (!symbol) {
-        detailEl.innerHTML = `<div class="empty">等待行情数据</div>`;
+        delete detailEl.dataset.symbol;
+        detailEl.innerHTML = `
+          <div class="drawer-empty">
+            <div class="drawer-empty-title">点击左侧合约展开详情</div>
+            <div class="drawer-empty-copy">这里会先看 5 分钟价格、量能、OI 图，再切到 AI、结构位和流动性视图。</div>
+          </div>
+        `;
         return;
       }
 
       selectedSymbol = symbol.symbol;
-      const reasons = (symbol.reasons || []).length ? symbol.reasons : ["暂无明确触发项"];
+      const preservedScroll = captureDetailScroll(symbol.symbol);
+      const tradeLive = hasCoreTradeData(symbol);
+      const depthLive = hasDepthData(symbol);
+      const oiLive = hasOiData(symbol);
+      const activeTab = detailTab();
+      const priceChart = tradeLive
+        ? lineChartSvg(symbol.price_series_5m, valueClass(symbol.price_move_pct_5m))
+        : chartEmptyHtml("等待成交时序");
+      const volumeChart = tradeLive
+        ? barChartSvg(symbol.volume_series_5m, rowClass(symbol))
+        : chartEmptyHtml("等待成交时序");
+      const oiTone = Number(symbol.oi_change_pct_5m || 0) > 0 ? "up" : Number(symbol.oi_change_pct_5m || 0) < 0 ? "down" : "mixed";
+      const oiChart = oiLive
+        ? lineChartSvg(symbol.oi_series_5m, oiTone)
+        : chartEmptyHtml("OI 尚未稳定");
+      const depthBalance = clamp((Number(symbol.depth_imbalance || 0) + 1) * 50, 0, 100);
       maybeLoadAIAnalysis(symbol);
       detailEl.innerHTML = `
         <div class="detail-head">
           <div class="detail-meta">
-            <div class="detail-symbol">${esc(symbol.symbol)}</div>
+            <div class="detail-title-row">
+              <div class="detail-symbol">${esc(symbol.symbol)}</div>
+              <div class="detail-tools">
+                <span class="risk ${riskClass(symbol.risk_level)}">${esc(symbol.risk_level || "低风险")}</span>
+                <span class="tag ${biasClass(symbol.bias)}">${esc(shortBias(symbol.bias || ""))}</span>
+              </div>
+            </div>
             <div class="detail-price-wrap">
               <div class="detail-price-label">当前价格</div>
-              <div class="detail-price ${valueClass(symbol.price_move_pct_1m)}">${fmtNumber(symbol.price, 8)}</div>
+              <div class="detail-price ${valueClass(symbol.price_move_pct_1m)}">${tradeLive ? fmtNumber(symbol.price, 8) : "--"}</div>
             </div>
             <div class="detail-bias">${esc(symbol.bias || "观察：暂无明确方向")}</div>
           </div>
-          <span class="score">${fmtNumber(symbol.score, 1)}</span>
+          <div>
+            <span class="score">${fmtNumber(symbol.score, 1)}</span>
+            <div class="cell-sub" style="margin-top:8px;text-align:right">置信度 ${tradeLive ? `${fmtNumber(symbol.confidence, 1)}%` : "--"}</div>
+          </div>
         </div>
-        <div class="detail-block collapsible${collapseClass("detail_metrics")}">
-          <div class="collapse-bar">${collapseHead("detail_metrics", "核心指标", "折叠显示6项 / 展开17项")}</div>
-          ${renderMetricSummary(symbol)}
-          <div class="collapsible-body">
-            <div class="metric-grid">
-              <div class="metric"><div class="metric-label">风险</div><div class="metric-value ${riskClass(symbol.risk_level)}">${esc(symbol.risk_level || "低风险")}</div></div>
-              <div class="metric"><div class="metric-label">置信度</div><div class="metric-value">${fmtNumber(symbol.confidence, 1)}%</div></div>
-              <div class="metric"><div class="metric-label">1分钟成交额</div><div class="metric-value">${fmtNumber(symbol.quote_volume_1m, 0)}</div></div>
-              <div class="metric"><div class="metric-label">量能倍数</div><div class="metric-value ${rowClass(symbol)}">${fmtNumber(symbol.volume_multiplier, 2)}x</div></div>
-              <div class="metric"><div class="metric-label">OI 5分钟</div><div class="metric-value">${fmtPct(symbol.oi_change_pct_5m)}</div></div>
-              <div class="metric"><div class="metric-label">资金费率</div><div class="metric-value">${fmtFunding(symbol.funding_rate)}</div></div>
-              <div class="metric"><div class="metric-label">爆仓状态</div><div class="metric-value ${liquidationStatusClass(symbol)}">${liquidationStatusText(symbol)}</div></div>
-              <div class="metric"><div class="metric-label">强平事件 1m</div><div class="metric-value">${fmtNumber(symbol.liquidation_event_count_1m, 0)}</div></div>
-              <div class="metric"><div class="metric-label">多头爆仓 1m</div><div class="metric-value">${liquidationSideHtml(symbol, "long_liquidation_quote_1m")}</div></div>
-              <div class="metric"><div class="metric-label">空头爆仓 1m</div><div class="metric-value">${liquidationSideHtml(symbol, "short_liquidation_quote_1m")}</div></div>
-              <div class="metric"><div class="metric-label">微观结构</div><div class="metric-value">${microstructureStatusHtml(symbol)}</div></div>
-              <div class="metric"><div class="metric-label">盘口点差</div><div class="metric-value">${fmtBps(symbol.spread_bps)} bps</div></div>
-              <div class="metric"><div class="metric-label">盘口深度下降</div><div class="metric-value">${fmtNumber(symbol.depth_drop_pct_1m, 1)}%</div></div>
-              <div class="metric"><div class="metric-label">买盘深度</div><div class="metric-value">${fmtNumber(symbol.bid_depth_notional, 0)}</div></div>
-              <div class="metric"><div class="metric-label">卖盘深度</div><div class="metric-value">${fmtNumber(symbol.ask_depth_notional, 0)}</div></div>
-              <div class="metric"><div class="metric-label">盘口失衡</div><div class="metric-value">${fmtNumber(Number(symbol.depth_imbalance || 0) * 100, 1)}%</div></div>
-              <div class="metric"><div class="metric-label">主动买入</div><div class="metric-value">${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%</div></div>
+        ${dataBannerHtml(symbol)}
+        ${renderMetricSummary(symbol, "always-visible")}
+        <div class="visual-grid">
+          ${chartCard("5分钟价格轨迹", tradeLive ? fmtPctMaybe(symbol.price_move_pct_5m, true) : mutedValue(), priceChart, "span-2")}
+          ${chartCard("1分钟量能", tradeLive ? `${fmtNumber(symbol.quote_volume_1m, 0)} USDT` : mutedValue(), volumeChart)}
+          ${chartCard("5分钟 OI", oiLive ? fmtPctMaybe(symbol.oi_change_pct_5m, true) : mutedValue(), oiChart)}
+        </div>
+        <div class="meter-grid">
+          ${meterHtml("主动买入", tradeLive ? Number(symbol.taker_buy_ratio_1m || 0) * 100 : 0, tradeLive ? `${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%` : "--", Number(symbol.taker_buy_ratio_1m || 0) >= 0.6 ? "up" : Number(symbol.taker_buy_ratio_1m || 0) <= 0.4 ? "down" : "mixed", "看主动成交方向是否持续。")}
+          ${meterHtml("区间位置", tradeLive ? Number(symbol.range_position_pct || 50) : 0, tradeLive ? fmtPlainPct(symbol.range_position_pct, 1) : "--", Number(symbol.range_position_pct || 50) >= 70 ? "down" : Number(symbol.range_position_pct || 50) <= 30 ? "up" : "mixed", "越靠上沿越接近抛压区。")}
+          ${meterHtml("盘口失衡", depthLive ? depthBalance : 0, depthLive ? `${fmtNumber(Number(symbol.depth_imbalance || 0) * 100, 1)}%` : "--", Number(symbol.depth_imbalance || 0) >= 0.1 ? "up" : Number(symbol.depth_imbalance || 0) <= -0.1 ? "down" : "mixed", "正值偏买盘，负值偏卖盘。")}
+          ${meterHtml("量能倍数", tradeLive ? clamp((Number(symbol.volume_multiplier || 0) / 5) * 100, 0, 100) : 0, tradeLive ? `${fmtNumber(symbol.volume_multiplier, 2)}x` : "--", Number(symbol.volume_multiplier || 0) >= 3 ? "up" : Number(symbol.volume_multiplier || 0) >= 1.5 ? "mixed" : "blue", "5x 以上视作极强放量。")}
+        </div>
+        <div class="detail-tabs">
+          ${detailTabButton("overview", "总览")}
+          ${detailTabButton("ai", "AI 分析")}
+          ${detailTabButton("structure", "结构位")}
+          ${detailTabButton("liquidity", "流动性")}
+        </div>
+        ${activeTab === "ai" ? `
+          <div class="detail-panel">
+            <div class="ai-panel-head">
+              <div class="detail-title">AI 只在触发条件满足或手动刷新时更新</div>
+              <button class="inline-link" id="ai-refresh-btn" type="button">刷新</button>
             </div>
+            <div class="detail-list ai-inline" id="ai-block">${renderAIBlock(symbol.symbol)}</div>
           </div>
-        </div>
-        <div class="detail-block collapsible${collapseClass("detail_reasons")}">
-          <div class="collapse-bar">${collapseHead("detail_reasons", "触发原因", `${reasons.length}项`)}</div>
-          <div class="detail-list collapsible-body">${reasons.map((item) => `<div>${esc(item)}</div>`).join("")}</div>
-        </div>
-        <div class="detail-block collapsible${collapseClass("detail_ai")}">
-          <div class="collapse-bar">
-            ${collapseHead("detail_ai", "观察建议", aiResults[symbol.symbol] ? "AI已生成" : "等待AI")}
-            <button class="inline-link" id="ai-refresh-btn" type="button">刷新</button>
-          </div>
-          <div class="detail-list ai-inline collapsible-body" id="ai-block">${renderAIBlock(symbol.symbol)}</div>
-        </div>
+        ` : ""}
+        ${activeTab === "overview" ? renderOverviewPanel(symbol) : ""}
+        ${activeTab === "structure" ? renderStructurePanel(symbol) : ""}
+        ${activeTab === "liquidity" ? renderLiquidityPanel(symbol) : ""}
       `;
+      detailEl.dataset.symbol = symbol.symbol;
+      pendingDetailRefresh = false;
+      if (activeTab === "ai") pendingAIRefreshSymbol = null;
+      restoreDetailScroll(symbol.symbol, preservedScroll, activeTab);
     }
 
     function renderEvents(events) {
@@ -2805,6 +4505,7 @@ INDEX_HTML = """<!doctype html>
       eventsEl.innerHTML = events.map((event) => {
         const reasons = (event.reasons || []).join("; ") || "暂无明确触发项";
         const suggestions = (event.suggestions || []).join("; ") || "继续观察盘口与量价变化";
+        const aiSummary = (event.ai_summary || []).join("; ").trim();
         const directionClass = eventDirectionClass(event);
         const directionLabel = directionText[event.direction] || event.direction || "异常";
         return `
@@ -2823,6 +4524,7 @@ INDEX_HTML = """<!doctype html>
             </div>
             <div class="event-row"><span class="event-label">触发</span><span class="event-text">${esc(reasons)}</span></div>
             <div class="event-row"><span class="event-label">观察</span><span class="event-text muted">${esc(suggestions)}</span></div>
+            ${aiSummary ? `<div class="event-row"><span class="event-label">AI</span><span class="event-text">${esc(aiSummary)}</span></div>` : ""}
           </div>
         `;
       }).join("");
@@ -2835,11 +4537,19 @@ INDEX_HTML = """<!doctype html>
         const data = await response.json();
         const exchangeLabel = (data.exchange || "binance_usdm").startsWith("okx") ? "OKX" : "Binance";
         const transportLabel = data.data_source === "websocket" ? "WebSocket" : "REST";
+        const symbols = data.symbols || [];
         sourceLabelEl.textContent = `${exchangeLabel} ${transportLabel}`;
-        renderSymbols(data.symbols || []);
-        renderDetail(data.symbols || []);
+        renderSymbols(symbols);
+        if (shouldDeferDetailRender(symbols)) {
+          pendingDetailRefresh = true;
+        } else {
+          pendingDetailRefresh = false;
+          pendingAIRefreshSymbol = null;
+          renderDetail(symbols);
+        }
         renderEvents(data.events || []);
-        updatedEl.textContent = `已更新 ${new Date().toLocaleTimeString()}`;
+        const timeText = new Date().toLocaleTimeString();
+        updatedEl.textContent = data.source_note ? `${data.source_note} · ${timeText}` : `已更新 ${timeText}`;
       } catch (error) {
         updatedEl.textContent = "面板连接中断";
       }
@@ -3112,51 +4822,70 @@ INDEX_HTML = """<!doctype html>
 
     function openThresholdModal(symbol) {
       thresholdEditingSymbol = symbol;
-      const threshold = symbolThresholds[symbol];
+      const threshold = symbolThresholds[symbol] || {};
       thresholdSymbolEl.value = symbol;
       thresholdInputEl.value = threshold && threshold.anomaly_score !== undefined ? threshold.anomaly_score : "";
       thresholdInputEl.placeholder = String(globalThreshold);
-      thresholdHintEl.textContent = `全局默认 ${fmtNumber(globalThreshold, 1)} 分，当前 ${currentThresholdText(symbol)}。`;
+      applyThresholdRuleForm(threshold.push_rules, threshold.anomaly_score ?? globalThreshold);
+      thresholdHintEl.textContent = `全局默认 ${fmtNumber(globalThreshold, 1)} 分；当前 ${currentThresholdText(symbol)}。`;
       openModal(thresholdModal);
       thresholdInputEl.focus();
     }
 
-    async function saveSymbolThreshold(symbol, score) {
+    async function saveSymbolThreshold(symbol, config) {
       try {
         const response = await apiFetch("/api/symbol_thresholds", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ symbol, anomaly_score: score })
+          body: JSON.stringify({ symbol, anomaly_score: config.anomaly_score, push_rules: config.push_rules })
         });
         const data = await response.json();
         if (!response.ok || !data.ok) throw new Error(data.error || "保存失败");
-        if (score === null) delete symbolThresholds[symbol];
-        else symbolThresholds[symbol] = { anomaly_score: Number(score) };
-        updatedEl.textContent = `${symbol} 推送阈值已更新`;
+        if (config.anomaly_score === null && !hasEnabledThresholdRules(config.push_rules)) {
+          delete symbolThresholds[symbol];
+        } else {
+          const nextConfig = {};
+          if (config.anomaly_score !== null) nextConfig.anomaly_score = Number(config.anomaly_score);
+          if (hasEnabledThresholdRules(config.push_rules)) nextConfig.push_rules = config.push_rules;
+          symbolThresholds[symbol] = nextConfig;
+        }
+        updatedEl.textContent = `${symbol} 推送规则已更新`;
         closeModal(thresholdModal);
         await refresh();
       } catch (error) {
-        updatedEl.textContent = error.message || "阈值保存失败";
+        updatedEl.textContent = error.message || "规则保存失败";
       }
     }
 
     document.getElementById("threshold-save-btn").addEventListener("click", () => {
       if (!thresholdEditingSymbol) return;
       const raw = thresholdInputEl.value.trim();
+      const pushRules = collectThresholdRules();
+      const parsedScore = Number(raw);
+      const anomalyScore = raw === "" || Number.isNaN(parsedScore)
+        ? null
+        : Math.max(0, Math.min(100, parsedScore));
       if (raw === "") {
-        saveSymbolThreshold(thresholdEditingSymbol, null);
-        return;
+        saveSymbolThreshold(thresholdEditingSymbol, { anomaly_score: null, push_rules: pushRules });
+      } else {
+        saveSymbolThreshold(thresholdEditingSymbol, { anomaly_score: anomalyScore, push_rules: pushRules });
       }
-      const score = Math.max(0, Math.min(100, Number(raw)));
-      saveSymbolThreshold(thresholdEditingSymbol, score);
     });
     document.getElementById("threshold-reset-btn").addEventListener("click", () => {
-      if (thresholdEditingSymbol) saveSymbolThreshold(thresholdEditingSymbol, null);
+      if (thresholdEditingSymbol) {
+        applyThresholdRuleForm(null, globalThreshold);
+        thresholdInputEl.value = "";
+        saveSymbolThreshold(thresholdEditingSymbol, { anomaly_score: null, push_rules: null });
+      }
     });
 
     async function fetchAIAnalysis(symbol, force = false) {
       const aiBlock = document.getElementById("ai-block");
-      if (aiBlock) aiBlock.innerHTML = `<div class="muted">分析中...</div>`;
+      if (aiBlock) {
+        aiScrollBySymbol[symbol] = aiBlock.scrollTop;
+        aiMeta[symbol] = { status: "分析中", ts: Date.now() };
+        refreshAIBlock(symbol);
+      }
       aiRequestedAt[symbol] = Date.now();
       try {
         const url = `/api/ai/analysis?symbol=${encodeURIComponent(symbol)}${force ? "&force=1" : ""}`;
@@ -3172,9 +4901,7 @@ INDEX_HTML = """<!doctype html>
           const reason = data.reason || "暂无分析";
           if (reason === "ai trigger not met") {
             aiMeta[symbol] = { status: "触发条件未满足", ts: Date.now() };
-            if (aiBlock && selectedSymbol === symbol) {
-              aiBlock.innerHTML = renderAIBlock(symbol);
-            }
+            if (aiBlock && selectedSymbol === symbol) refreshAIBlock(symbol);
             updatedEl.textContent = "AI 触发条件未满足";
             return;
           }
@@ -3185,12 +4912,13 @@ INDEX_HTML = """<!doctype html>
             aiResults[symbol] = reason;
           }
         }
-        if (aiBlock && selectedSymbol === symbol) {
-          aiBlock.innerHTML = renderAIBlock(symbol);
-        }
+        if (aiBlock && selectedSymbol === symbol) refreshAIBlock(symbol);
         updatedEl.textContent = data.cached ? "AI 分析使用缓存" : "AI 分析已更新";
       } catch (error) {
-        if (aiBlock) aiBlock.innerHTML = `<div class="muted">AI 请求失败</div>`;
+        if (aiBlock) {
+          aiMeta[symbol] = { status: "AI 请求失败", ts: Date.now() };
+          refreshAIBlock(symbol);
+        }
         updatedEl.textContent = "AI 请求失败";
       }
     }
@@ -3203,10 +4931,40 @@ INDEX_HTML = """<!doctype html>
     }
 
     detailEl.addEventListener("click", (event) => {
+      const tabButton = event.target.closest("[data-detail-tab]");
+      if (tabButton) {
+        captureDetailScroll(selectedSymbol);
+        setDetailTab(tabButton.dataset.detailTab);
+        renderDetail(lastSymbols);
+        return;
+      }
       if (event.target.id === "ai-refresh-btn" && selectedSymbol) {
         fetchAIAnalysis(selectedSymbol, true);
       }
     });
+    detailEl.addEventListener("scroll", (event) => {
+      if (event.target && event.target.id === "ai-block" && selectedSymbol) {
+        aiScrollBySymbol[selectedSymbol] = event.target.scrollTop;
+        noteAIInteraction();
+      }
+    }, true);
+    detailEl.addEventListener("wheel", (event) => {
+      if (event.target && event.target.closest && event.target.closest("#ai-block") && selectedSymbol) {
+        noteAIInteraction();
+      }
+    }, { passive: true });
+    detailEl.addEventListener("touchmove", (event) => {
+      if (event.target && event.target.closest && event.target.closest("#ai-block") && selectedSymbol) {
+        noteAIInteraction();
+      }
+    }, { passive: true });
+    if (sideScrollEl) {
+      sideScrollEl.addEventListener("scroll", () => {
+        if (selectedSymbol) drawerScrollBySymbol[selectedSymbol] = sideScrollEl.scrollTop;
+      });
+    }
+    detailCloseBtn.addEventListener("click", () => closeDetailDrawer(true));
+    detailDrawerBackdropEl.addEventListener("click", () => closeDetailDrawer(true));
 
     document.addEventListener("click", (event) => {
       const button = event.target.closest("[data-collapse]");
@@ -3259,6 +5017,7 @@ INDEX_HTML = """<!doctype html>
         closeModal(telegramModal);
         closeModal(aiModal);
         closeModal(thresholdModal);
+        closeDetailDrawer(true);
       }
     });
 

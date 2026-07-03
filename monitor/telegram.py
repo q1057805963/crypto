@@ -1,8 +1,11 @@
 import json
 import logging
+from dataclasses import asdict
+from time import time
 from urllib.request import Request, urlopen
 
 from monitor.anomaly import AnomalyEvent
+from monitor.rules import enabled_trigger_count, evaluate_trigger_rules
 
 
 def normalize_telegram_users(
@@ -99,22 +102,59 @@ class TelegramAlert:
         bot_token: str = "",
         chat_ids: list[str] | None = None,
         users: list[dict] | None = None,
+        cooldown_seconds: float = 120,
     ) -> None:
         self.requested_enabled = bool(enabled)
         self.users = normalize_telegram_users(users, bot_token, chat_ids or [])
+        self.cooldown_seconds = float(cooldown_seconds)
+        self._last_sent_at: dict[str, float] = {}
         self.enabled = self.requested_enabled and any(self._user_ready(user) for user in self.users)
 
     def send(self, event: AnomalyEvent) -> None:
         if not self.enabled:
             return
-        text = self._format(event)
+        payload = asdict(event)
+        payload["updated_at"] = time()
+        self._send_payload(payload)
+
+    def send_snapshot(self, snapshot: dict) -> None:
+        if not self.enabled or not snapshot:
+            return
+        self._send_payload(snapshot)
+
+    def has_ready_targets(self, snapshot: dict) -> bool:
+        if not self.enabled or not snapshot:
+            return False
+        symbol = str(snapshot.get("symbol", "")).upper()
+        if not symbol:
+            return False
+        event_time = float(snapshot.get("updated_at") or time())
         for user in self.users:
             if not self._user_ready(user):
                 continue
-            if not self._user_wants_event(user, event):
+            if not self._user_wants_snapshot(user, snapshot):
                 continue
             for chat_id in user["chat_ids"]:
-                self._send_to(user["bot_token"], chat_id, text)
+                if self._can_send(user["bot_token"], chat_id, symbol, event_time):
+                    return True
+        return False
+
+    def _send_payload(self, snapshot: dict) -> None:
+        symbol = str(snapshot.get("symbol", "")).upper()
+        if not symbol:
+            return
+        event_time = float(snapshot.get("updated_at") or time())
+        text = self._format_snapshot(snapshot)
+        for user in self.users:
+            if not self._user_ready(user):
+                continue
+            if not self._user_wants_snapshot(user, snapshot):
+                continue
+            for chat_id in user["chat_ids"]:
+                if not self._can_send(user["bot_token"], chat_id, symbol, event_time):
+                    continue
+                if self._send_to(user["bot_token"], chat_id, text):
+                    self._mark_sent(user["bot_token"], chat_id, symbol, event_time)
 
     def set_chat_ids(self, chat_ids: list[str]) -> None:
         if not self.users:
@@ -140,36 +180,79 @@ class TelegramAlert:
 
     @staticmethod
     def _user_wants_event(user: dict, event: AnomalyEvent) -> bool:
+        return TelegramAlert._user_wants_snapshot(user, asdict(event))
+
+    @staticmethod
+    def _user_wants_snapshot(user: dict, snapshot: dict) -> bool:
         symbols = {str(symbol).upper() for symbol in user.get("symbols", [])}
-        if symbols and event.symbol.upper() not in symbols:
+        symbol = str(snapshot.get("symbol", "")).upper()
+        if symbols and symbol not in symbols:
             return False
         symbol_thresholds = user.get("symbol_thresholds") or {}
-        threshold = (
-            symbol_thresholds.get(event.symbol.upper(), {}).get("anomaly_score")
+        symbol_config = (
+            symbol_thresholds.get(symbol, {})
             if isinstance(symbol_thresholds, dict)
-            else None
+            else {}
         )
+        push_rules = symbol_config.get("push_rules") if isinstance(symbol_config, dict) else None
+        if enabled_trigger_count(push_rules) > 0:
+            return evaluate_trigger_rules(push_rules, snapshot)
+        threshold = symbol_config.get("anomaly_score") if isinstance(symbol_config, dict) else None
         if threshold is None:
             threshold = user.get("default_score", 70)
-        return float(event.score) >= float(threshold)
+        return float(snapshot.get("score", 0) or 0) >= float(threshold)
 
-    def _send_to(self, bot_token: str, chat_id: str, text: str) -> None:
+    def _can_send(self, bot_token: str, chat_id: str, symbol: str, event_time: float) -> bool:
+        last_sent_at = self._last_sent_at.get(self._cooldown_key(bot_token, chat_id, symbol), 0.0)
+        return event_time - last_sent_at >= self.cooldown_seconds
+
+    def _mark_sent(self, bot_token: str, chat_id: str, symbol: str, event_time: float) -> None:
+        self._last_sent_at[self._cooldown_key(bot_token, chat_id, symbol)] = event_time
+
+    @staticmethod
+    def _cooldown_key(bot_token: str, chat_id: str, symbol: str) -> str:
+        return f"{bot_token}:{chat_id}:{symbol.upper()}"
+
+    def _send_to(self, bot_token: str, chat_id: str, text: str) -> bool:
         error = send_telegram_message(bot_token, chat_id, text)
         if error:
             logging.warning("Telegram alert to %s failed: %s", chat_id, error)
+            return False
+        return True
 
     @staticmethod
-    def _format(event: AnomalyEvent) -> str:
-        reasons = "\n".join(f"- {reason}" for reason in event.reasons) or "- 暂无"
-        suggestions = "\n".join(f"- {item}" for item in event.suggestions) or "- 继续观察"
+    def _format_snapshot(snapshot: dict) -> str:
+        reasons = "\n".join(f"- {reason}" for reason in snapshot.get("reasons", [])) or "- 暂无"
+        suggestions = "\n".join(f"- {item}" for item in snapshot.get("suggestions", [])) or "- 继续观察"
+        ai_summary = [
+            str(item).strip()
+            for item in snapshot.get("ai_summary", [])
+            if str(item).strip()
+        ]
+        ai_analysis = str(snapshot.get("ai_analysis", "") or "").strip()
+        ai_block = ""
+        if ai_summary:
+            ai_block = "\n\nAI分析:\n" + "\n".join(f"- {item}" for item in ai_summary)
+        elif ai_analysis:
+            ai_block = f"\n\nAI分析:\n- {ai_analysis}"
+        support = float(snapshot.get("support_price", 0) or 0)
+        resistance = float(snapshot.get("resistance_price", 0) or 0)
+        bid_wall_price = float(snapshot.get("bid_wall_price", 0) or 0)
+        ask_wall_price = float(snapshot.get("ask_wall_price", 0) or 0)
+        support_text = f"{support:.8f}" if support > 0 else "--"
+        resistance_text = f"{resistance:.8f}" if resistance > 0 else "--"
+        bid_wall_text = f"{bid_wall_price:.8f}" if bid_wall_price > 0 else "--"
+        ask_wall_text = f"{ask_wall_price:.8f}" if ask_wall_price > 0 else "--"
         return (
-            f"[{event.risk_level}] {event.symbol} {event.bias}\n"
-            f"异常分: {event.score}/100\n"
-            f"价格: {event.price}\n"
-            f"1分钟: {event.price_move_pct_1m:+.3f}% | 5分钟: {event.price_move_pct_5m:+.3f}%\n"
-            f"1分钟成交额: {event.quote_volume_1m:,.0f} USDT\n"
-            f"OI变化: {event.oi_change_pct_5m:+.3f}% | 资金费率: {event.funding_rate:.4%}\n"
-            f"多头爆仓1m: {event.long_liquidation_quote_1m:,.0f} | 空头爆仓1m: {event.short_liquidation_quote_1m:,.0f}\n"
-            f"点差: {event.spread_bps:.2f} bps | 深度下降: {event.depth_drop_pct_1m:.1f}%\n"
-            f"\n触发原因:\n{reasons}\n\n观察建议:\n{suggestions}"
+            f"[{snapshot.get('risk_level', '风险提示')}] {snapshot.get('symbol', '')} {snapshot.get('bias', '')}\n"
+            f"异常分: {float(snapshot.get('score', 0) or 0):.1f}/100\n"
+            f"价格: {snapshot.get('price')}\n"
+            f"1分钟: {float(snapshot.get('price_move_pct_1m', 0) or 0):+.3f}% | 5分钟: {float(snapshot.get('price_move_pct_5m', 0) or 0):+.3f}%\n"
+            f"1分钟成交额: {float(snapshot.get('quote_volume_1m', 0) or 0):,.0f} USDT\n"
+            f"OI变化: {float(snapshot.get('oi_change_pct_5m', 0) or 0):+.3f}% | 资金费率: {float(snapshot.get('funding_rate', 0) or 0):.4%}\n"
+            f"区间支撑: {support_text} | 区间压力: {resistance_text}\n"
+            f"买盘墙: {bid_wall_text} | 卖盘墙: {ask_wall_text}\n"
+            f"多头爆仓1m: {float(snapshot.get('long_liquidation_quote_1m', 0) or 0):,.0f} | 空头爆仓1m: {float(snapshot.get('short_liquidation_quote_1m', 0) or 0):,.0f}\n"
+            f"点差: {float(snapshot.get('spread_bps', 0) or 0):.2f} bps | 深度下降: {float(snapshot.get('depth_drop_pct_1m', 0) or 0):.1f}%\n"
+            f"\n触发原因:\n{reasons}\n\n观察建议:\n{suggestions}{ai_block}"
         )
