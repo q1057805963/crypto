@@ -14,6 +14,7 @@ from monitor.binance_rest import BinanceFuturesTickerPoller
 from monitor.binance_ws import BinanceFuturesAggTradeStream
 from monitor.dashboard import DashboardServer, DashboardState
 from monitor.microstructure import BinanceFuturesMicrostructureStream, MarketMicrostructureState
+from monitor.okx_rest import OkxSwapTickerPoller
 from monitor.storage import AlertStore
 from monitor.telegram import TelegramAlert, normalize_telegram_users
 from monitor.user_config import UserConfigStore
@@ -68,6 +69,20 @@ def apply_env_overrides(config: dict) -> dict:
     dashboard = dict(config.get("dashboard", {}))
     ai = dict(config.get("ai", {}))
     auth = dict(config.get("auth", {}))
+    microstructure = dict(config.get("microstructure", {}))
+
+    if "CFM_EXCHANGE" in os.environ:
+        config["exchange"] = os.environ["CFM_EXCHANGE"]
+    if "CFM_DATA_SOURCE" in os.environ:
+        config["data_source"] = os.environ["CFM_DATA_SOURCE"]
+    if "CFM_REST_POLL_INTERVAL_SECONDS" in os.environ:
+        config["rest_poll_interval_seconds"] = float(os.environ["CFM_REST_POLL_INTERVAL_SECONDS"])
+    if "CFM_REST_PER_SYMBOL_DELAY_MS" in os.environ:
+        config["rest_per_symbol_delay_ms"] = int(os.environ["CFM_REST_PER_SYMBOL_DELAY_MS"])
+    if "CFM_OI_POLL_INTERVAL_SECONDS" in os.environ:
+        config["oi_poll_interval_seconds"] = float(os.environ["CFM_OI_POLL_INTERVAL_SECONDS"])
+    if "CFM_FUNDING_POLL_INTERVAL_SECONDS" in os.environ:
+        config["funding_poll_interval_seconds"] = float(os.environ["CFM_FUNDING_POLL_INTERVAL_SECONDS"])
 
     telegram = _migrate_telegram_config(telegram)
 
@@ -114,6 +129,16 @@ def apply_env_overrides(config: dict) -> dict:
     if os.environ.get("CFM_AUTH_SECRET"):
         auth["jwt_secret"] = os.environ["CFM_AUTH_SECRET"]
         config["_auth_secret_from_env"] = True
+
+    if "CFM_MICROSTRUCTURE_ENABLED" in os.environ:
+        microstructure["enabled"] = _env_flag(
+            "CFM_MICROSTRUCTURE_ENABLED",
+            bool(microstructure.get("enabled", True)),
+        )
+    if "CFM_REST_DEPTH_POLL_INTERVAL_SECONDS" in os.environ:
+        microstructure["rest_depth_poll_interval_seconds"] = float(
+            os.environ["CFM_REST_DEPTH_POLL_INTERVAL_SECONDS"]
+        )
 
     ai_key = os.environ.get("CFM_AI_API_KEY")
     if ai_key is None:
@@ -164,7 +189,16 @@ def apply_env_overrides(config: dict) -> dict:
     config["dashboard"] = dashboard
     config["ai"] = ai
     config["auth"] = auth
+    config["microstructure"] = microstructure
     return config
+
+
+def _normalized_exchange(config: dict) -> str:
+    return str(config.get("exchange", "binance_usdm")).strip().lower()
+
+
+def _is_okx_exchange(exchange: str) -> bool:
+    return exchange in {"okx", "okx_swap", "okx_usdt_swap"}
 
 
 async def run(config: dict) -> None:
@@ -222,17 +256,48 @@ async def run(config: dict) -> None:
             snapshot_interval_seconds=int(storage_config.get("snapshot_interval_seconds", 60)),
         )
 
+    exchange = _normalized_exchange(config)
+    configured_data_source = str(config.get("data_source", "rest")).lower()
+    data_source = configured_data_source
+    if _is_okx_exchange(exchange) and configured_data_source != "rest":
+        logging.warning("OKX exchange currently uses REST polling; ignoring data_source=%s", configured_data_source)
+        data_source = "rest"
+
     microstructure_config = config.get("microstructure", {})
-    microstructure_state = MarketMicrostructureState(runtime_symbols)
+    microstructure_state = MarketMicrostructureState(
+        runtime_symbols,
+        liquidations_enabled=not _is_okx_exchange(exchange),
+    )
     microstructure_stream = None
-    if microstructure_config.get("enabled", True):
+    if microstructure_config.get("enabled", True) and not _is_okx_exchange(exchange):
         microstructure_stream = BinanceFuturesMicrostructureStream(
             runtime_symbols,
             depth_levels=int(microstructure_config.get("depth_levels", 10)),
             depth_interval=str(microstructure_config.get("depth_interval", "500ms")),
         )
 
-    if config.get("data_source", "rest") == "websocket":
+    if _is_okx_exchange(exchange):
+        stream = OkxSwapTickerPoller(
+            runtime_symbols,
+            poll_interval_seconds=float(config.get("rest_poll_interval_seconds", 2)),
+            per_symbol_delay_ms=int(config.get("rest_per_symbol_delay_ms", 150)),
+            oi_poll_interval_seconds=float(config.get("oi_poll_interval_seconds", 30)),
+            funding_poll_interval_seconds=float(
+                config.get("funding_poll_interval_seconds", 60)
+            ),
+            depth_poll_interval_seconds=float(
+                microstructure_config.get(
+                    "rest_depth_poll_interval_seconds",
+                    config.get("rest_poll_interval_seconds", 5),
+                )
+            ),
+            microstructure_state=(
+                microstructure_state
+                if microstructure_config.get("enabled", True)
+                else None
+            ),
+        )
+    elif data_source == "websocket":
         stream = BinanceFuturesAggTradeStream(
             runtime_symbols,
             microstructure_state=microstructure_state,
@@ -250,7 +315,8 @@ async def run(config: dict) -> None:
         )
     dashboard_state = DashboardState(
         runtime_symbols,
-        data_source=config.get("data_source", "rest"),
+        data_source=data_source,
+        exchange=exchange,
     )
 
     dashboard_config = config.get("dashboard", {})
@@ -301,9 +367,10 @@ async def run(config: dict) -> None:
             dashboard_state.set_events(store.recent(50))
 
     logging.info(
-        "Monitoring %s via %s",
+        "Monitoring %s on %s via %s",
         ", ".join(runtime_symbols),
-        config.get("data_source", "rest"),
+        exchange,
+        data_source,
     )
 
     background_tasks = []

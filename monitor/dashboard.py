@@ -75,9 +75,10 @@ def merge_telegram_users(existing_users: list[dict], incoming_users: list[dict])
 
 
 class DashboardState:
-    def __init__(self, symbols: list[str], data_source: str) -> None:
+    def __init__(self, symbols: list[str], data_source: str, exchange: str = "binance_usdm") -> None:
         self._lock = threading.Lock()
         self._data_source = data_source
+        self._exchange = exchange
         self._symbols = {
             symbol: {
                 "symbol": symbol,
@@ -199,6 +200,7 @@ class DashboardState:
             return {
                 "generated_at": time(),
                 "data_source": self._data_source,
+                "exchange": self._exchange,
                 "symbols": symbols,
                 "events": events,
             }
@@ -2777,7 +2779,9 @@ INDEX_HTML = """<!doctype html>
         const response = await apiFetch("/api/state", { cache: "no-store" });
         if (!response.ok) return;
         const data = await response.json();
-        sourceLabelEl.textContent = data.data_source === "websocket" ? "WebSocket" : "REST";
+        const exchangeLabel = (data.exchange || "binance_usdm").startsWith("okx") ? "OKX" : "Binance";
+        const transportLabel = data.data_source === "websocket" ? "WebSocket" : "REST";
+        sourceLabelEl.textContent = `${exchangeLabel} ${transportLabel}`;
         renderSymbols(data.symbols || []);
         renderDetail(data.symbols || []);
         renderEvents(data.events || []);

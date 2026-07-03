@@ -1,12 +1,12 @@
 # Crypto Futures Monitor
 
-Binance U 本位合约异常波动监控 MVP。
+USDT 永续合约异常波动监控 MVP，支持 Binance U 本位合约和 OKX USDT Swap 数据源。
 
 Deployment and Telegram guide:
 
 - [docs/DEPLOY.md](/C:/Users/Admin/Documents/Codex/2026-07-02/wo-x/outputs/crypto-futures-monitor/docs/DEPLOY.md)
 
-这个版本会读取 Binance Futures 公开行情和微结构信号，监控配置里的 USDT 永续合约，按滚动窗口计算价格、成交量、持仓量、爆仓和盘口变化，并在控制台、Telegram 和本地 UI 输出异常提醒。
+这个版本会读取交易所公开行情和微结构信号，监控配置里的 USDT 永续合约，按滚动窗口计算价格、成交量、持仓量、爆仓和盘口变化，并在控制台、Telegram 和本地 UI 输出异常提醒。
 
 ## 安装
 
@@ -47,7 +47,8 @@ BTC, ETH, SOL
 编辑 `config.yaml`：
 
 - `symbols`: 要监控的合约，例如 `BTCUSDT`、`SOLUSDT`
-- `data_source`: 数据源，`rest` 为 REST 轮询，`websocket` 为 Binance 推送流
+- `exchange`: 交易所数据源，`binance_usdm` 或 `okx_swap`
+- `data_source`: 数据传输方式，`rest` 为 REST 轮询，`websocket` 目前只支持 Binance 推送流
 - `rest_poll_interval_seconds`: REST 轮询间隔
 - `rest_per_symbol_delay_ms`: REST 模式下，每个合约请求之间的间隔
 - `oi_poll_interval_seconds`: OI 拉取间隔
@@ -76,7 +77,18 @@ BTC, ETH, SOL
 - 买卖盘深度失衡
 - 最低 1 分钟成交额过滤，避免小额噪音
 
-当前默认使用 REST 轮询源，适合本机网络对 Binance WebSocket 推送不稳定的情况。切换到 `data_source: websocket` 后，主动买卖比例会更接近真实逐笔成交。
+当前默认使用 REST 轮询源，适合本机网络对 WebSocket 推送不稳定的情况。切换到 `data_source: websocket` 后，主动买卖比例会更接近真实逐笔成交；该模式目前仅适用于 Binance。若 VPS 访问 Binance Futures 返回 HTTP 451，可设置 `exchange: okx_swap` 或环境变量 `CFM_EXCHANGE=okx_swap`，改用 OKX 合约公开行情源。
+
+## Binance 451 处理
+
+Binance Futures 如果返回 HTTP 451，通常是交易所按服务条款对该服务器线路或地区拒绝服务。程序不会绕过该限制，推荐切换到可正常访问的数据源：
+
+```bash
+CFM_EXCHANGE=okx_swap
+CFM_DATA_SOURCE=rest
+```
+
+OKX 源支持主行情、1 分钟成交额估算、持仓量、资金费率和 REST 盘口深度。强平流目前仍是 Binance WebSocket 能力；使用 OKX 源时爆仓字段会显示为数据不可用，避免把“没有数据”误读成“没有爆仓”。
 
 ## 页面字段说明
 

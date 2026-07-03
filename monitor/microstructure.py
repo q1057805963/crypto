@@ -8,12 +8,13 @@ import websockets
 
 
 class MarketMicrostructureState:
-    def __init__(self, symbols: list[str]) -> None:
+    def __init__(self, symbols: list[str], liquidations_enabled: bool = True) -> None:
         self._depth: dict[str, dict[str, float]] = {}
         self._depth_history: dict[str, deque[tuple[float, float]]] = {}
         self._liquidations: dict[str, deque[dict[str, float | str]]] = {}
         self._last_depth_at: dict[str, float] = {}
         self._last_liquidation_at: dict[str, float] = {}
+        self.liquidations_enabled = liquidations_enabled
         self.set_symbols(symbols)
 
     def set_symbols(self, symbols: list[str]) -> None:
@@ -141,7 +142,7 @@ class MarketMicrostructureState:
             else "unavailable"
         )
         liquidation_event_count_1m = len(liquidations)
-        if microstructure_status != "active":
+        if not self.liquidations_enabled or microstructure_status != "active":
             liquidation_data_status = "unavailable"
         elif liquidation_event_count_1m:
             liquidation_data_status = "recent_event"

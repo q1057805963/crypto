@@ -26,6 +26,8 @@ Supported variables:
 CFM_TELEGRAM_ENABLED=true
 CFM_TELEGRAM_BOT_TOKEN=your_bot_token
 CFM_TELEGRAM_CHAT_IDS=your_chat_id
+CFM_EXCHANGE=okx_swap
+CFM_DATA_SOURCE=rest
 CFM_DASHBOARD_HOST=0.0.0.0
 CFM_DASHBOARD_PORT=8765
 CFM_AUTH_ENABLED=true
@@ -185,6 +187,10 @@ Edit it and fill in real values:
 CFM_TELEGRAM_ENABLED=true
 CFM_TELEGRAM_BOT_TOKEN=your_bot_token
 CFM_TELEGRAM_CHAT_IDS=your_chat_id
+CFM_EXCHANGE=okx_swap
+CFM_DATA_SOURCE=rest
+CFM_REST_POLL_INTERVAL_SECONDS=5
+CFM_REST_DEPTH_POLL_INTERVAL_SECONDS=5
 CFM_DASHBOARD_HOST=0.0.0.0
 CFM_DASHBOARD_PORT=8765
 CFM_AUTH_ENABLED=true
@@ -226,16 +232,30 @@ sudo systemctl restart crypto-futures-monitor
 For a stable first deployment:
 
 ```yaml
+exchange: okx_swap
 data_source: rest
 rest_poll_interval_seconds: 5
 rest_per_symbol_delay_ms: 150
 oi_poll_interval_seconds: 30
 funding_poll_interval_seconds: 60
+microstructure:
+  rest_depth_poll_interval_seconds: 5
 ```
 
 After the VPS is stable, you can evaluate moving from REST mode to WebSocket mode.
 
-## 8. What Not to Commit
+## 8. Binance HTTP 451
+
+If Binance Futures returns HTTP 451 on the VPS, that is a server-side availability restriction from Binance. Do not rely on Binance Futures from that VPS. Use a reachable exchange data source instead:
+
+```bash
+CFM_EXCHANGE=okx_swap
+CFM_DATA_SOURCE=rest
+```
+
+The OKX source supports ticker price, estimated 1-minute quote volume, open interest, funding rate and REST order-book depth. Binance-only forced liquidation streams are marked unavailable under OKX, so the dashboard will not treat missing liquidation data as zero liquidation.
+
+## 9. What Not to Commit
 
 Do not commit:
 
