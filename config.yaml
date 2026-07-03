@@ -50,7 +50,7 @@ telegram:
   chat_ids: []
   users: []
 telegram_bot:
-  enabled: true
+  enabled: false
   poll_interval_seconds: 2
   request_timeout_seconds: 20
   ai_cooldown_seconds: 20
