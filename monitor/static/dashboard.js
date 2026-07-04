@@ -1358,11 +1358,11 @@
               </div>
               <div class="range-rail-footer">
                 <div class="rail-stat">
-                  <div class="rail-stat-label">支撑位</div>
+                  <div class="rail-stat-label">K线最低</div>
                   <div class="rail-stat-value">${fmtPriceLevel(support)}</div>
                 </div>
                 <div class="rail-stat">
-                  <div class="rail-stat-label">${esc(period)} 收盘</div>
+                  <div class="rail-stat-label">${periodData.candle_confirmed ? esc(period) + " 收盘" : esc(period) + " 最新"}</div>
                   <div class="rail-stat-value">${fmtPriceLevel(price)}</div>
                 </div>
                 <div class="rail-stat">
@@ -1370,7 +1370,7 @@
                   <div class="rail-stat-value">${fmtPriceLevel(vwap)}</div>
                 </div>
                 <div class="rail-stat">
-                  <div class="rail-stat-label">压力位</div>
+                  <div class="rail-stat-label">K线最高</div>
                   <div class="rail-stat-value">${fmtPriceLevel(resistance)}</div>
                 </div>
               </div>
@@ -1379,12 +1379,12 @@
               <div class="metric">
                 <div class="metric-label">距支撑</div>
                 <div class="metric-value up">${fmtPlainPct(periodData.support_distance_pct, 2)}</div>
-                <div class="metric-copy">越短说明越接近下沿承接区</div>
+                <div class="metric-copy">最近 24 根 ${esc(period)} low 的最低值</div>
               </div>
               <div class="metric">
                 <div class="metric-label">距压力</div>
                 <div class="metric-value down">${fmtPlainPct(periodData.resistance_distance_pct, 2)}</div>
-                <div class="metric-copy">越短说明越接近上沿抛压区</div>
+                <div class="metric-copy">最近 24 根 ${esc(period)} high 的最高值</div>
               </div>
               <div class="metric">
                 <div class="metric-label">区间位置</div>
@@ -2605,8 +2605,8 @@
             ${chartCard(`${data.period_label} 标记价`, data.mark_move_pct === null || data.mark_move_pct === undefined ? mutedValue() : fmtPctMaybe(data.mark_move_pct, true), markChart)}
           </div>
           <div class="metric-grid compact" style="margin-top:12px">
-            <div class="metric"><div class="metric-label">支撑位</div><div class="metric-value up">${fmtPriceLevel(data.support_price)}</div><div class="metric-copy">距现价 ${fmtPlainPct(data.support_distance_pct, 2)}</div></div>
-            <div class="metric"><div class="metric-label">压力位</div><div class="metric-value down">${fmtPriceLevel(data.resistance_price)}</div><div class="metric-copy">距现价 ${fmtPlainPct(data.resistance_distance_pct, 2)}</div></div>
+            <div class="metric"><div class="metric-label">K线最低</div><div class="metric-value up">${fmtPriceLevel(data.support_price)}</div><div class="metric-copy">距现价 ${fmtPlainPct(data.support_distance_pct, 2)}</div></div>
+            <div class="metric"><div class="metric-label">K线最高</div><div class="metric-value down">${fmtPriceLevel(data.resistance_price)}</div><div class="metric-copy">距现价 ${fmtPlainPct(data.resistance_distance_pct, 2)}</div></div>
             <div class="metric"><div class="metric-label">VWAP</div><div class="metric-value ${valueClass(data.vwap_deviation_pct)}">${fmtPriceLevel(data.window_vwap)}</div><div class="metric-copy">偏离 ${fmtPlainPct(data.vwap_deviation_pct, 3)}</div></div>
             <div class="metric"><div class="metric-label">区间位置</div><div class="metric-value">${fmtPlainPct(data.range_position_pct, 1)}</div><div class="metric-copy">${esc(structureState(data))}</div></div>
           </div>

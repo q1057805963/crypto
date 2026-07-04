@@ -186,8 +186,10 @@ def build_timeframe_analysis(
         previous = candles[-2]
     previous = previous or current
 
-    support_price = min(float(item["low"]) for item in candles)
-    resistance_price = max(float(item["high"]) for item in candles)
+    support_candle = min(candles, key=lambda item: float(item["low"]))
+    resistance_candle = max(candles, key=lambda item: float(item["high"]))
+    support_price = float(support_candle["low"])
+    resistance_price = float(resistance_candle["high"])
     base_volume_window = sum(float(item.get("base_volume") or 0) for item in candles)
     quote_volume_window = sum(float(item.get("quote_volume") or 0) for item in candles)
     if base_volume_window > 0 and quote_volume_window > 0:
@@ -267,7 +269,13 @@ def build_timeframe_analysis(
         "resistance_distance_pct": round(resistance_distance_pct, 3),
         "range_position_pct": round(range_position_pct, 2),
         "price_series": [round(float(item["close"]), 8) for item in candles],
+        "low_series": [round(float(item["low"]), 8) for item in candles],
+        "high_series": [round(float(item["high"]), 8) for item in candles],
         "volume_series": [round(float(item.get("quote_volume") or 0), 2) for item in candles],
+        "support_open_time": float(support_candle["open_time"]),
+        "resistance_open_time": float(resistance_candle["open_time"]),
+        "support_source": "low",
+        "resistance_source": "high",
         "mark_price": round(mark_price, 8) if mark_price is not None else None,
         "mark_move_pct": round(mark_move_pct, 3) if mark_move_pct is not None else None,
         "mark_prev_close_pct": round(mark_prev_close_pct, 3) if mark_prev_close_pct is not None else None,
