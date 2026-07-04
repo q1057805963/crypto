@@ -74,14 +74,16 @@
     }
 
     .toolbar {
-      display: grid;
-      grid-template-columns: minmax(220px, 1fr) auto auto auto auto auto;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
       gap: 10px;
       width: min(900px, 100%);
     }
 
     .symbol-input {
-      width: 100%;
+      flex: 1 1 420px;
+      min-width: 220px;
       height: 36px;
       border: 1px solid var(--line);
       border-radius: 6px;
@@ -97,6 +99,7 @@
     }
 
     .save-btn {
+      flex: 0 0 auto;
       height: 36px;
       border: 1px solid #3a4655;
       border-radius: 6px;

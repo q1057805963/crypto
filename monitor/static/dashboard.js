@@ -12,7 +12,6 @@
     const symbolInputEl = document.getElementById("symbol-input");
     const saveSymbolsEl = document.getElementById("save-symbols");
     const btnTheme = document.getElementById("btn-theme");
-    const btnLogout = document.getElementById("btn-logout");
     const userScopeEl = document.getElementById("user-scope");
     const detailEl = document.getElementById("detail");
     const sourceLabelEl = document.getElementById("source-label");
@@ -328,11 +327,9 @@
       try {
         await loadAuthStatus();
         if (!authStatus.enabled) {
-          btnLogout.style.display = "none";
           startApp();
           return;
         }
-        btnLogout.style.display = "inline-block";
         const ok = await verifyStoredToken();
         if (ok) {
           startApp();
@@ -354,7 +351,6 @@
         if (event.key === "Enter") submitAuth();
       });
     });
-    btnLogout.addEventListener("click", logout);
     userScopeEl.addEventListener("click", openProfileModal);
 
     function loadStoredAIResults() {
