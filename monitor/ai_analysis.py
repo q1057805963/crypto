@@ -9,6 +9,9 @@ from urllib.request import Request, urlopen
 from monitor.rules import evaluate_trigger_rules, normalize_trigger_rules
 
 
+AI_ANALYSIS_SCHEMA_VERSION = "structure-levels-v2"
+
+
 def summarize_analysis(text: str, max_items: int = 3, max_chars: int = 110) -> list[str]:
     items: list[str] = []
     seen: set[str] = set()
@@ -67,8 +70,8 @@ class AIAnalyzer:
     def _cache_key(symbol: str, period: str | None = None) -> str:
         normalized_symbol = str(symbol or "").upper()
         if not period:
-            return normalized_symbol
-        return f"{normalized_symbol}::{period}"
+            return f"{normalized_symbol}::{AI_ANALYSIS_SCHEMA_VERSION}"
+        return f"{normalized_symbol}::{period}::{AI_ANALYSIS_SCHEMA_VERSION}"
 
     def _normalize_triggers(self, config: dict) -> dict:
         return normalize_trigger_rules(
@@ -233,6 +236,8 @@ class AIAnalyzer:
         if timeframe_data:
             selected_period = str(timeframe_data.get("period_label") or period or "当前周期")
             candle_state = "已收线" if timeframe_data.get("candle_confirmed") else "进行中"
+            support_source = str(timeframe_data.get("support_source") or "unknown")
+            resistance_source = str(timeframe_data.get("resistance_source") or "unknown")
             mark_move = timeframe_data.get("mark_move_pct")
             mark_premium = timeframe_data.get("mark_premium_bps")
             mark_move_text = "--" if mark_move is None else f"{float(mark_move):+.3f}%"
@@ -257,8 +262,17 @@ class AIAnalyzer:
                 f"- 相对前收: {float(timeframe_data.get('prev_close_pct', 0)):+.3f}%\n"
                 f"- 周期成交额: {float(timeframe_data.get('quote_volume', 0)):,.0f} USDT\n"
                 f"- 周期量能倍数: {float(timeframe_data.get('volume_multiplier', 0)):.2f}x\n"
-                f"- 周期支撑: {timeframe_data.get('support_price')}\n"
-                f"- 周期压力: {timeframe_data.get('resistance_price')}\n"
+                f"- 结构支撑: {timeframe_data.get('support_price')} "
+                f"(来源={support_source}, 触碰={int(timeframe_data.get('support_touch_count') or 0)}, "
+                f"摆动点={int(timeframe_data.get('support_pivot_count') or 0)}, "
+                f"强度={float(timeframe_data.get('support_strength') or 0):.2f})\n"
+                f"- 结构压力: {timeframe_data.get('resistance_price')} "
+                f"(来源={resistance_source}, 触碰={int(timeframe_data.get('resistance_touch_count') or 0)}, "
+                f"摆动点={int(timeframe_data.get('resistance_pivot_count') or 0)}, "
+                f"强度={float(timeframe_data.get('resistance_strength') or 0):.2f})\n"
+                f"- 阶段最低/最高: {timeframe_data.get('period_low_price')} / {timeframe_data.get('period_high_price')}\n"
+                f"- 结构样本: {int(timeframe_data.get('structure_sample_count') or 0)} 根K线, "
+                f"聚类容差 {float(timeframe_data.get('structure_tolerance_pct') or 0):.3f}%\n"
                 f"- 周期VWAP: {timeframe_data.get('window_vwap')}\n"
                 f"- 偏离VWAP: {float(timeframe_data.get('vwap_deviation_pct', 0)):+.3f}%\n"
                 f"- 距支撑: {float(timeframe_data.get('support_distance_pct', 0)):.3f}%\n"
@@ -274,6 +288,8 @@ class AIAnalyzer:
             period_focus = (
                 f"本次分析请优先围绕 {selected_period} 周期组织判断，"
                 "实时 1m / 盘口 / 强平数据只作为验证和补充，不要喧宾夺主。"
+                "支撑/压力必须使用结构支撑/结构压力字段；阶段最低/最高仅用于说明区间边界，"
+                "不要把旧的单根最高最低当作主支撑压力。"
             )
         elif period:
             period_label = "实时" if period == "realtime" else period

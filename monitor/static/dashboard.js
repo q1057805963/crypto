@@ -66,6 +66,7 @@
     let pendingDetailRefresh = false;
     let pendingAIRefreshSymbol = null;
     const DETAIL_INTERACTION_LOCK_MS = 900;
+    const AI_ANALYSIS_CACHE_VERSION = "structure-levels-v2";
     const TIMEFRAME_OPTIONS = ["5m", "15m", "1h", "4h", "1d"];
     const DETAIL_PERIOD_OPTIONS = [...TIMEFRAME_OPTIONS];
     const thresholdTriggerFields = {
@@ -360,6 +361,7 @@
         const now = Date.now();
         Object.entries(raw).forEach(([key, value]) => {
           if (value && value.text && now - Number(value.ts || 0) < 30 * 60 * 1000) {
+            if (value.version !== AI_ANALYSIS_CACHE_VERSION) return;
             aiResults[key] = value.text;
           }
         });
@@ -371,7 +373,7 @@
       aiResults[key] = text;
       try {
         const raw = JSON.parse(localStorage.getItem(storageKey("cfm_ai_results")) || "{}");
-        raw[key] = { text, ts: Date.now() };
+        raw[key] = { text, ts: Date.now(), version: AI_ANALYSIS_CACHE_VERSION };
         localStorage.setItem(storageKey("cfm_ai_results"), JSON.stringify(raw));
       } catch (error) {}
     }
@@ -610,7 +612,7 @@
     }
 
     function aiAnalysisKey(symbol, period = detailPeriod()) {
-      return `${String(symbol || "").toUpperCase()}::${period}`;
+      return `${String(symbol || "").toUpperCase()}::${period}::${AI_ANALYSIS_CACHE_VERSION}`;
     }
 
     function detailTab() {

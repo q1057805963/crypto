@@ -57,6 +57,18 @@ class AIAnalyzerTests(unittest.TestCase):
             "volume_multiplier": 1.67,
             "support_price": 61200,
             "resistance_price": 62500,
+            "period_low_price": 60400,
+            "period_high_price": 63100,
+            "support_source": "swing_cluster",
+            "resistance_source": "touch_cluster",
+            "support_touch_count": 4,
+            "resistance_touch_count": 3,
+            "support_pivot_count": 2,
+            "resistance_pivot_count": 1,
+            "support_strength": 12.4,
+            "resistance_strength": 10.2,
+            "structure_sample_count": 96,
+            "structure_tolerance_pct": 0.35,
             "window_vwap": 61880,
             "vwap_deviation_pct": 0.19,
             "support_distance_pct": 1.31,
@@ -72,6 +84,11 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertIn("12,345,000 USDT", prompt)
         self.assertIn("1.67x", prompt)
         self.assertIn("-3.50 bps", prompt)
+        self.assertIn("结构支撑: 61200", prompt)
+        self.assertIn("来源=swing_cluster", prompt)
+        self.assertIn("阶段最低/最高: 60400 / 63100", prompt)
+        self.assertIn("96 根K线", prompt)
+        self.assertIn("不要把旧的单根最高最低当作主支撑压力", prompt)
 
     def test_extract_text_supports_anthropic_style_content(self) -> None:
         payload = {
