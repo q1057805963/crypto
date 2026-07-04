@@ -4,7 +4,6 @@
     const detailCloseBtn = document.getElementById("detail-close-btn");
     const symbolsEl = document.getElementById("symbols");
     const eventsEl = document.getElementById("events");
-    const reviewStatsEl = document.getElementById("review-stats");
     const eventsCollapseBtn = document.getElementById("events-collapse-btn");
     const sideScrollEl = document.getElementById("side-scroll");
     const updatedEl = document.getElementById("updated");
@@ -55,6 +54,7 @@
     let authToken = localStorage.getItem("cfm_auth_token") || "";
     let refreshTimer = null;
     let lastSymbols = [];
+    let lastEvents = [];
     let drawerScrollBySymbol = {};
     let aiScrollBySymbol = {};
     let timeframeAnalysisCache = {};
@@ -1756,6 +1756,7 @@
           openDetailDrawer(selectedSymbol);
           renderSymbols(symbols);
           renderDetail(symbols);
+          renderEvents(lastEvents);
         });
       });
       symbolsEl.querySelectorAll(".js-threshold").forEach((button) => {
@@ -1765,6 +1766,7 @@
           openDetailDrawer(selectedSymbol);
           renderSymbols(symbols);
           renderDetail(symbols);
+          renderEvents(lastEvents);
           openThresholdModal(selectedSymbol);
         });
       });
@@ -1840,10 +1842,13 @@
     }
 
     function renderEvents(events) {
-      alertCountEl.textContent = String(events.length);
+      const visibleEvents = selectedSymbol
+        ? (events || []).filter((event) => String(event.symbol || "").toUpperCase() === selectedSymbol)
+        : (events || []);
+      alertCountEl.textContent = String(visibleEvents.length);
       applyEventsCollapseState();
-      if (!events.length) {
-        eventsEl.innerHTML = `<div class="empty">暂无报警</div>`;
+      if (!visibleEvents.length) {
+        eventsEl.innerHTML = `<div class="empty">${selectedSymbol ? "暂无该合约报警" : "暂无报警"}</div>`;
         return;
       }
       function followupTone(item) {
@@ -1869,7 +1874,7 @@
           </div>
         `;
       }
-      eventsEl.innerHTML = events.map((event) => {
+      eventsEl.innerHTML = visibleEvents.map((event) => {
         const reasons = (event.reasons || []).join("; ") || "暂无明确触发项";
         const suggestions = (event.suggestions || []).join("; ") || "继续观察盘口与量价变化";
         const aiSummary = (event.ai_summary || []).join("; ").trim();
@@ -1900,60 +1905,6 @@
       }).join("");
     }
 
-    function reviewTone(value) {
-      const numeric = Number(value || 0);
-      if (numeric > 0) return "up";
-      if (numeric < 0) return "down";
-      return "mixed";
-    }
-
-    function renderReviewStats(stats) {
-      if (!reviewStatsEl) return;
-      const groups = (stats && stats.groups) || [];
-      if (!groups.length) {
-        reviewStatsEl.innerHTML = `
-          <div class="review-head">
-            <span>报警复盘统计</span>
-            <span>暂无已回写</span>
-          </div>
-        `;
-        return;
-      }
-      reviewStatsEl.innerHTML = `
-        <div class="review-head">
-          <span>报警复盘统计</span>
-          <span>${fmtNumber(stats.resolved_count || 0, 0)} 个样本</span>
-        </div>
-        <div class="review-groups">
-          ${groups.map((group) => `
-            <div class="review-group">
-              <div class="review-type">
-                <span>${esc(group.label || "报警")}</span>
-                <span>${fmtNumber(group.alert_count || 0, 0)} 条报警</span>
-              </div>
-              <div class="review-period-grid">
-                ${(group.periods || []).map((period) => {
-                  const hasData = Number(period.count || 0) > 0;
-                  const avgClose = hasData ? Number(period.avg_close_bps || 0) : null;
-                  return `
-                    <div class="review-period ${hasData ? "" : "empty"}">
-                      <div class="review-period-label">${esc(period.label || "")}</div>
-                      <div class="review-period-value ${hasData ? reviewTone(avgClose) : ""}">
-                        ${hasData ? `${fmtSignedNumber(avgClose, 1)}bp` : "--"}
-                      </div>
-                      <div class="review-period-sub">
-                        ${hasData ? `${period.count} 样本 · 向上 ${fmtNumber(period.positive_rate_pct || 0, 0)}%` : "待回写"}
-                      </div>
-                    </div>
-                  `;
-                }).join("")}
-              </div>
-            </div>
-          `).join("")}
-        </div>
-      `;
-    }
-
     async function refresh() {
       try {
         const response = await apiFetch("/api/state", { cache: "no-store" });
@@ -1971,8 +1922,8 @@
           pendingAIRefreshSymbol = null;
           renderDetail(symbols);
         }
-        renderEvents(data.events || []);
-        renderReviewStats(data.review_stats || {});
+        lastEvents = data.events || [];
+        renderEvents(lastEvents);
         const timeText = new Date().toLocaleTimeString();
         updatedEl.textContent = data.source_note ? `${data.source_note} · ${timeText}` : `已更新 ${timeText}`;
       } catch (error) {
