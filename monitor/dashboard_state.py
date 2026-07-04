@@ -6,6 +6,15 @@ from time import time
 from monitor.anomaly import AnomalyEvent, SymbolSnapshot
 
 
+REVIEW_PERIODS = (
+    (5, "5m"),
+    (15, "15m"),
+    (60, "1h"),
+    (240, "4h"),
+    (1440, "1d"),
+)
+
+
 def normalize_symbols(symbols: list[str]) -> list[str]:
     normalized = []
     seen = set()
@@ -69,6 +78,83 @@ def _empty_symbol_snapshot(symbol: str) -> dict:
         "confidence": 0,
         "reasons": [],
         "suggestions": [],
+    }
+
+
+def _review_type_label(direction: str) -> str:
+    mapping = {
+        "up": "上涨报警",
+        "down": "下跌报警",
+        "mixed": "震荡报警",
+    }
+    return mapping.get(direction, "其他报警")
+
+
+def _average(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return round(sum(values) / len(values), 3)
+
+
+def _build_review_group(label: str, events: list[dict]) -> dict:
+    period_rows = []
+    resolved_total = 0
+    for horizon_minutes, period_label in REVIEW_PERIODS:
+        rows = []
+        for event in events:
+            for followup in event.get("followups", []) or []:
+                if followup.get("status") != "resolved":
+                    continue
+                if int(followup.get("horizon_minutes") or 0) != horizon_minutes:
+                    continue
+                rows.append(followup)
+
+        close_values = [float(row.get("close_bps") or 0) for row in rows]
+        positive_count = sum(1 for value in close_values if value > 0)
+        resolved_total += len(rows)
+        period_rows.append(
+            {
+                "horizon_minutes": horizon_minutes,
+                "label": period_label,
+                "count": len(rows),
+                "avg_close_bps": _average(close_values),
+                "avg_max_up_bps": _average(
+                    [float(row.get("max_up_bps") or 0) for row in rows]
+                ),
+                "avg_max_down_bps": _average(
+                    [float(row.get("max_down_bps") or 0) for row in rows]
+                ),
+                "positive_rate_pct": (
+                    round(positive_count / len(rows) * 100, 1)
+                    if rows
+                    else None
+                ),
+            }
+        )
+
+    return {
+        "label": label,
+        "alert_count": len(events),
+        "resolved_count": resolved_total,
+        "periods": period_rows,
+    }
+
+
+def build_review_stats(events: list[dict]) -> dict:
+    groups = [_build_review_group("全部报警", events)]
+    direction_order = ("up", "down", "mixed")
+    for direction in direction_order:
+        direction_events = [
+            event for event in events
+            if str(event.get("direction", "")).lower() == direction
+        ]
+        if direction_events:
+            groups.append(_build_review_group(_review_type_label(direction), direction_events))
+
+    return {
+        "event_count": len(events),
+        "resolved_count": groups[0]["resolved_count"] if groups else 0,
+        "groups": [group for group in groups if group["resolved_count"] > 0],
     }
 
 
@@ -138,6 +224,7 @@ class DashboardState:
             if symbols_filter is not None:
                 wanted = {symbol.upper() for symbol in symbols_filter}
                 events = [event for event in events if str(event.get("symbol", "")).upper() in wanted]
+            review_stats = build_review_stats(events)
             return {
                 "generated_at": time(),
                 "data_source": self._data_source,
@@ -145,6 +232,7 @@ class DashboardState:
                 "source_note": self._source_note,
                 "symbols": symbols,
                 "events": events,
+                "review_stats": review_stats,
             }
 
     def get_source(self) -> dict:
