@@ -17,7 +17,8 @@ class ConsoleAlert:
             f"[异常] {event.symbol} | 分数 {event.score}/100 | {event.risk_level} | {direction_text}"
         )
         print(f"倾向: {event.bias} | 置信度: {event.confidence:.1f}%")
-        print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        event_at = datetime.fromtimestamp(event.event_time) if event.event_time else datetime.now()
+        print(f"时间: {event_at.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"价格: {event.price}")
         print(f"1分钟波动: {event.price_move_pct_1m:+.3f}%")
         print(f"5分钟波动: {event.price_move_pct_5m:+.3f}%")

@@ -21,6 +21,7 @@ from monitor.okx_rest import OkxSwapTickerPoller
 from monitor.storage import AlertStore
 from monitor.telegram import TelegramAlert, normalize_telegram_users
 from monitor.telegram_bot import TelegramBotResponder
+from monitor.timeframe_analysis import TimeframeAnalysisService
 from monitor.user_config import UserConfigStore
 
 
@@ -312,6 +313,9 @@ def _build_source_context(config: dict, symbols: list[str], spec: SourceSpec) ->
             else True
         ),
         liquidation_feed_mode="poll" if _is_okx_exchange(spec.exchange) else "stream",
+        liquidation_retention_seconds=int(
+            microstructure_config.get("liquidation_retention_seconds", 86400)
+        ),
     )
     microstructure_stream = None
     if microstructure_config.get("enabled", True) and not _is_okx_exchange(spec.exchange):
@@ -404,6 +408,15 @@ class SourceFailoverManager:
     @property
     def active_data_source(self) -> str:
         return self._active_context.data_source if self._active_context else self.specs[self._active_index].data_source
+
+    def liquidation_summary(self, symbol: str, seconds: int) -> dict:
+        if not self._active_context:
+            return {}
+        return self._active_context.microstructure_state.liquidation_summary(
+            symbol,
+            seconds,
+            now=time.time(),
+        )
 
     def set_symbols(self, symbols: list[str]) -> None:
         self.symbols = list(symbols)
@@ -543,7 +556,7 @@ async def run(config: dict) -> None:
             cooldown_seconds=float(config.get("alert_cooldown_seconds", 120)),
         )
     ai_analyzer = AIAnalyzer(config.get("ai", {}))
-    analysis_tasks: dict[str, asyncio.Task] = {}
+    analysis_tasks: dict[tuple[int, str], asyncio.Task] = {}
     notification_tasks: dict[str, asyncio.Task] = {}
     runtime_tasks: set[asyncio.Task] = set()
 
@@ -570,38 +583,95 @@ async def run(config: dict) -> None:
             ai_summary=tuple(summarize_analysis(analysis)),
         )
 
-    async def ensure_ai_analysis(symbol: str, snapshot_data: dict, force: bool = False) -> str | None:
-        if not ai_analyzer.enabled or not ai_analyzer.api_key or not snapshot_data:
+    def alert_ai_analyzer_candidates(snapshot_data: dict) -> list[AIAnalyzer]:
+        symbol = str(snapshot_data.get("symbol", "")).upper()
+        candidates: list[AIAnalyzer] = []
+        seen: set[int] = set()
+
+        def append(analyzer: AIAnalyzer | None) -> None:
+            if not analyzer or not analyzer.enabled or not analyzer.api_key:
+                return
+            marker = id(analyzer)
+            if marker in seen:
+                return
+            candidates.append(analyzer)
+            seen.add(marker)
+
+        if user_store and dashboard:
+            for user in telegram_alert.users:
+                owner_id = str(user.get("owner_id", ""))
+                if not owner_id or not TelegramAlert._user_wants_snapshot(user, snapshot_data):
+                    continue
+                append(dashboard._get_ai_analyzer(owner_id))
+            for owner_id, user_config in user_store.all().items():
+                symbols = {str(item).upper() for item in user_config.get("symbols", [])}
+                if symbol and symbols and symbol not in symbols:
+                    continue
+                append(dashboard._get_ai_analyzer(owner_id))
+        else:
+            append(ai_analyzer)
+
+        return candidates
+
+    def has_alert_ai(snapshot_data: dict | None) -> bool:
+        return bool(snapshot_data and alert_ai_analyzer_candidates(snapshot_data))
+
+    async def ensure_ai_analysis(
+        symbol: str,
+        snapshot_data: dict,
+        force: bool = False,
+        analyzer: AIAnalyzer | None = None,
+        period: str | None = None,
+    ) -> str | None:
+        analyzer = analyzer or ai_analyzer
+        if not analyzer.enabled or not analyzer.api_key or not snapshot_data:
             return None
-        cached = ai_analyzer.get_cached(symbol)
+        cached = analyzer.get_cached(symbol, period=period)
         if cached:
             return cached
         symbol = symbol.upper()
-        existing = analysis_tasks.get(symbol)
+        task_key = (id(analyzer), f"{symbol}::{period or ''}")
+        existing = analysis_tasks.get(task_key)
         if existing and not existing.done():
             return await existing
         task = track_task(
-            asyncio.create_task(ai_analyzer.analyze(symbol, snapshot_data, force=force))
+            asyncio.create_task(
+                analyzer.analyze(symbol, snapshot_data, period=period, force=force)
+            )
         )
-        analysis_tasks[symbol] = task
+        analysis_tasks[task_key] = task
 
-        def cleanup(done: asyncio.Task, tracked_symbol: str = symbol, tracked_task: asyncio.Task = task) -> None:
-            if analysis_tasks.get(tracked_symbol) is tracked_task:
-                analysis_tasks.pop(tracked_symbol, None)
+        def cleanup(done: asyncio.Task, tracked_key: tuple[int, str] = task_key, tracked_task: asyncio.Task = task) -> None:
+            if analysis_tasks.get(tracked_key) is tracked_task:
+                analysis_tasks.pop(tracked_key, None)
 
         task.add_done_callback(cleanup)
         return await task
 
     async def get_alert_ai_analysis(symbol: str, snapshot_data: dict) -> str | None:
-        timeout_seconds = max(3.0, min(float(ai_analyzer.request_timeout), 12.0))
-        try:
-            return await asyncio.wait_for(
-                asyncio.shield(ensure_ai_analysis(symbol, snapshot_data, force=True)),
-                timeout=timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            logging.warning("AI analysis timeout for %s during alert enrichment", symbol)
-            return ai_analyzer.get_cached(symbol)
+        for analyzer in alert_ai_analyzer_candidates(snapshot_data):
+            timeout_seconds = max(3.0, min(float(analyzer.request_timeout), 12.0))
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.shield(
+                        ensure_ai_analysis(
+                            symbol,
+                            snapshot_data,
+                            force=True,
+                            analyzer=analyzer,
+                            period="alert",
+                        )
+                    ),
+                    timeout=timeout_seconds,
+                )
+                if result:
+                    return result
+            except asyncio.TimeoutError:
+                logging.warning("AI analysis timeout for %s during alert enrichment", symbol)
+                cached = analyzer.get_cached(symbol, period="alert")
+                if cached:
+                    return cached
+        return None
 
     async def dispatch_event(event: AnomalyEvent, snapshot_data: dict | None) -> None:
         enriched_event = event
@@ -611,7 +681,9 @@ async def run(config: dict) -> None:
         alert.send(enriched_event)
         if store:
             store.record_event(enriched_event)
-        dashboard_state.add_event(enriched_event)
+            dashboard_state.set_events(store.recent(50))
+        else:
+            dashboard_state.add_event(enriched_event)
 
     def queue_snapshot_notification(snapshot_data: dict) -> None:
         symbol = str(snapshot_data.get("symbol", "")).upper()
@@ -634,12 +706,25 @@ async def run(config: dict) -> None:
 
         task.add_done_callback(cleanup)
 
+    followup_timeframes = TimeframeAnalysisService(cache_ttl_seconds=0)
+
+    def resolve_alert_followup(request: dict) -> dict | None:
+        return followup_timeframes.resolve_followup(
+            symbol=str(request.get("symbol", "")),
+            exchange=source_manager.active_exchange,
+            horizon_minutes=int(request.get("horizon_minutes") or 0),
+            event_time=float(request.get("event_time") or 0),
+            target_time=float(request.get("target_time") or 0),
+            anchor_price=float(request.get("anchor_price") or 0),
+        )
+
     store = None
     storage_config = config.get("storage", {})
     if storage_config.get("enabled", True):
         store = AlertStore(
             str(storage_config.get("path", "data/monitor.db")),
             snapshot_interval_seconds=int(storage_config.get("snapshot_interval_seconds", 60)),
+            followup_resolver=resolve_alert_followup,
         )
 
     exchange = _normalized_exchange(config)
@@ -710,6 +795,7 @@ async def run(config: dict) -> None:
             user_config_store=user_store,
             on_user_config_change=apply_user_runtime_config,
             auth_manager=auth_manager,
+            period_liquidation_provider=source_manager.liquidation_summary,
         )
         dashboard.start()
         dashboard.set_event_loop(asyncio.get_running_loop())
@@ -758,12 +844,14 @@ async def run(config: dict) -> None:
                 if snapshot_data:
                     snapshot_payload = clone_payload(snapshot_data)
                     if snapshot_payload and telegram_alert.has_ready_targets(snapshot_payload):
-                        if ai_analyzer.enabled and ai_analyzer.api_key:
+                        if has_alert_ai(snapshot_payload):
                             queue_snapshot_notification(snapshot_payload)
                         else:
                             telegram_alert.send_snapshot(snapshot_payload)
                 if store:
-                    store.record_snapshot(snapshot)
+                    followups_updated = store.record_snapshot(snapshot)
+                    if followups_updated:
+                        dashboard_state.set_events(store.recent(50))
                 if (
                     not user_store
                     and ai_analyzer.enabled
@@ -774,13 +862,15 @@ async def run(config: dict) -> None:
                             asyncio.create_task(ai_analyzer.analyze(snapshot.symbol, snapshot_payload))
                         )
             if event:
-                if snapshot_payload and ai_analyzer.enabled and ai_analyzer.api_key:
+                if snapshot_payload and has_alert_ai(snapshot_payload):
                     track_task(asyncio.create_task(dispatch_event(event, snapshot_payload)))
                 else:
                     alert.send(event)
                     if store:
                         store.record_event(event)
-                    dashboard_state.add_event(event)
+                        dashboard_state.set_events(store.recent(50))
+                    else:
+                        dashboard_state.add_event(event)
     finally:
         await source_manager.close()
         active_tasks = [task for task in background_tasks if not task.done()]

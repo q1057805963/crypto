@@ -1,32 +1,16 @@
 import json
 import logging
 import threading
-from dataclasses import asdict
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import time
 
 from monitor.ai_analysis import AIAnalyzer
 from monitor.auth import AuthError, AuthManager
-from monitor.anomaly import AnomalyEvent, SymbolSnapshot
+from monitor.dashboard_state import DashboardState, normalize_symbols
 from monitor.rules import enabled_trigger_count
 from monitor.telegram import normalize_telegram_users, send_text_to_telegram_users
+from monitor.timeframe_analysis import TIMEFRAME_CONFIG, TimeframeAnalysisService
 from monitor.user_config import UserConfigStore
-
-
-def normalize_symbols(symbols: list[str]) -> list[str]:
-    normalized = []
-    seen = set()
-    for raw_symbol in symbols:
-        symbol = "".join(ch for ch in raw_symbol.upper().strip() if ch.isalnum())
-        if not symbol:
-            continue
-        if not symbol.endswith("USDT"):
-            symbol = f"{symbol}USDT"
-        if symbol not in seen:
-            normalized.append(symbol)
-            seen.add(symbol)
-    return normalized
 
 
 def _masked(value: str) -> bool:
@@ -75,179 +59,6 @@ def merge_telegram_users(existing_users: list[dict], incoming_users: list[dict])
     return merged
 
 
-class DashboardState:
-    def __init__(self, symbols: list[str], data_source: str, exchange: str = "binance_usdm") -> None:
-        self._lock = threading.Lock()
-        self._data_source = data_source
-        self._exchange = exchange
-        self._source_note = ""
-        self._symbols = {
-            symbol: {
-                "symbol": symbol,
-                "score": 0,
-                "direction": "waiting",
-                "price": None,
-                "updated_at": None,
-                "price_move_pct_1m": 0,
-                "price_move_pct_5m": 0,
-                "quote_volume_1m": 0,
-                "volume_multiplier": 0,
-                "taker_buy_ratio_1m": 0.5,
-                "trade_count_1m": 0,
-                "open_interest": 0,
-                "oi_change_pct_5m": 0,
-                "funding_rate": 0,
-                "spread_bps": 0,
-                "depth_imbalance": 0,
-                "bid_depth_notional": 0,
-                "ask_depth_notional": 0,
-                "depth_drop_pct_1m": 0,
-                "support_price": 0,
-                "resistance_price": 0,
-                "support_distance_pct": 0,
-                "resistance_distance_pct": 0,
-                "window_vwap": 0,
-                "vwap_deviation_pct": 0,
-                "range_position_pct": 50,
-                "bid_wall_price": 0,
-                "bid_wall_notional": 0,
-                "ask_wall_price": 0,
-                "ask_wall_notional": 0,
-                "long_liquidation_quote_1m": 0,
-                "short_liquidation_quote_1m": 0,
-                "liquidation_total_quote_1m": 0,
-                "liquidation_event_count_1m": 0,
-                "liquidation_data_status": "unavailable",
-                "microstructure_status": "unavailable",
-                "depth_data_age_seconds": None,
-                "last_liquidation_age_seconds": None,
-                "price_series_5m": [],
-                "volume_series_5m": [],
-                "oi_series_5m": [],
-                "risk_level": "低风险",
-                "bias": "观察：暂无明确方向",
-                "confidence": 0,
-                "reasons": [],
-                "suggestions": [],
-            }
-            for symbol in normalize_symbols(symbols)
-        }
-        self._events: list[dict] = []
-
-    def set_symbols(self, symbols: list[str]) -> None:
-        with self._lock:
-            normalized = normalize_symbols(symbols)
-            self._symbols = {
-                symbol: self._symbols.get(
-                    symbol,
-                    {
-                        "symbol": symbol,
-                        "score": 0,
-                        "direction": "waiting",
-                        "price": None,
-                        "updated_at": None,
-                        "price_move_pct_1m": 0,
-                        "price_move_pct_5m": 0,
-                        "quote_volume_1m": 0,
-                        "volume_multiplier": 0,
-                        "taker_buy_ratio_1m": 0.5,
-                        "trade_count_1m": 0,
-                        "open_interest": 0,
-                        "oi_change_pct_5m": 0,
-                        "funding_rate": 0,
-                        "spread_bps": 0,
-                        "depth_imbalance": 0,
-                        "bid_depth_notional": 0,
-                        "ask_depth_notional": 0,
-                        "depth_drop_pct_1m": 0,
-                        "support_price": 0,
-                        "resistance_price": 0,
-                        "support_distance_pct": 0,
-                        "resistance_distance_pct": 0,
-                        "window_vwap": 0,
-                        "vwap_deviation_pct": 0,
-                        "range_position_pct": 50,
-                        "bid_wall_price": 0,
-                        "bid_wall_notional": 0,
-                        "ask_wall_price": 0,
-                        "ask_wall_notional": 0,
-                        "long_liquidation_quote_1m": 0,
-                        "short_liquidation_quote_1m": 0,
-                        "liquidation_total_quote_1m": 0,
-                        "liquidation_event_count_1m": 0,
-                        "liquidation_data_status": "unavailable",
-                        "microstructure_status": "unavailable",
-                        "depth_data_age_seconds": None,
-                        "last_liquidation_age_seconds": None,
-                        "price_series_5m": [],
-                        "volume_series_5m": [],
-                        "oi_series_5m": [],
-                        "risk_level": "低风险",
-                        "bias": "观察：暂无明确方向",
-                        "confidence": 0,
-                        "reasons": [],
-                        "suggestions": [],
-                    },
-                )
-                for symbol in normalized
-            }
-
-    def update_snapshot(self, snapshot: SymbolSnapshot) -> None:
-        with self._lock:
-            data = asdict(snapshot)
-            data["reasons"] = list(data["reasons"])
-            data["suggestions"] = list(data["suggestions"])
-            self._symbols[snapshot.symbol] = data
-
-    def set_events(self, events: list[dict]) -> None:
-        with self._lock:
-            self._events = events[:50]
-
-    def add_event(self, event: AnomalyEvent) -> None:
-        with self._lock:
-            data = asdict(event)
-            data["reasons"] = list(data["reasons"])
-            data["suggestions"] = list(data["suggestions"])
-            data["ai_summary"] = list(data.get("ai_summary", ()))
-            data["created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self._events.insert(0, data)
-            self._events = self._events[:50]
-
-    def get_symbol_data(self, symbol: str) -> dict | None:
-        with self._lock:
-            return self._symbols.get(symbol.upper())
-
-    def set_source(self, *, exchange: str, data_source: str, note: str = "") -> None:
-        with self._lock:
-            self._exchange = exchange
-            self._data_source = data_source
-            self._source_note = note
-
-    def clear_source_note(self) -> None:
-        with self._lock:
-            self._source_note = ""
-
-    def as_payload(self, symbols_filter: list[str] | None = None) -> dict:
-        with self._lock:
-            symbols = list(self._symbols.values())
-            if symbols_filter is not None:
-                wanted = {symbol.upper() for symbol in symbols_filter}
-                symbols = [symbol for symbol in symbols if symbol["symbol"].upper() in wanted]
-            symbols.sort(key=lambda item: (-float(item.get("score") or 0), item["symbol"]))
-            events = list(self._events)
-            if symbols_filter is not None:
-                wanted = {symbol.upper() for symbol in symbols_filter}
-                events = [event for event in events if str(event.get("symbol", "")).upper() in wanted]
-            return {
-                "generated_at": time(),
-                "data_source": self._data_source,
-                "exchange": self._exchange,
-                "source_note": self._source_note,
-                "symbols": symbols,
-                "events": events,
-            }
-
-
 class DashboardServer:
     def __init__(
         self,
@@ -263,6 +74,7 @@ class DashboardServer:
         user_config_store: UserConfigStore | None = None,
         on_user_config_change=None,
         auth_manager: AuthManager | None = None,
+        period_liquidation_provider=None,
     ) -> None:
         self.state = state
         self.host = host
@@ -276,6 +88,7 @@ class DashboardServer:
         self.user_config_store = user_config_store
         self.on_user_config_change = on_user_config_change
         self.auth_manager = auth_manager
+        self.period_liquidation_provider = period_liquidation_provider
         self._ai_analyzers: dict[str, AIAnalyzer] = {}
         self._event_loop = None
         self._server: ThreadingHTTPServer | None = None
@@ -283,6 +96,7 @@ class DashboardServer:
         self._config_lock = threading.Lock()
         self._auth_attempt_lock = threading.Lock()
         self._auth_attempts: dict[str, list[float]] = {}
+        self.timeframe_analysis = TimeframeAnalysisService()
 
     def set_event_loop(self, loop) -> None:
         self._event_loop = loop
@@ -405,6 +219,10 @@ class DashboardServer:
 
                 if path == "/api/ai/analysis":
                     self._handle_ai_analysis_get()
+                    return
+
+                if path == "/api/timeframe":
+                    self._handle_timeframe_analysis_get()
                     return
 
                 self.send_error(404)
@@ -674,9 +492,13 @@ class DashboardServer:
                 parsed = urlparse(self.path)
                 params = parse_qs(parsed.query)
                 symbol = (params.get("symbol", [""])[0]).upper()
+                period = params.get("period", ["5m"])[0]
                 force_refresh = (params.get("force", ["0"])[0] == "1")
                 if not symbol:
                     self._send_json({"analysis": None, "reason": "symbol required"})
+                    return
+                if period != "realtime" and period not in TIMEFRAME_CONFIG:
+                    self._send_json({"analysis": None, "reason": "unsupported period"}, status=400)
                     return
                 user_id = self._user_id()
                 analyzer = server_ref._get_ai_analyzer(user_id)
@@ -687,7 +509,26 @@ class DashboardServer:
                 if not snapshot_data:
                     self._send_json({"analysis": None, "reason": "no data"})
                     return
-                cached = analyzer.get_cached(symbol)
+                timeframe_data = None
+                if period != "realtime":
+                    try:
+                        source = state.get_source()
+                        timeframe_data = server_ref.timeframe_analysis.analyze(
+                            symbol=symbol,
+                            period=period,
+                            exchange=str(source.get("exchange", "binance_usdm")),
+                            force=force_refresh,
+                        )
+                        if server_ref.period_liquidation_provider:
+                            timeframe_data.update(
+                                server_ref.period_liquidation_provider(
+                                    symbol,
+                                    int(TIMEFRAME_CONFIG[period]["seconds"]),
+                                )
+                            )
+                    except Exception:
+                        timeframe_data = None
+                cached = analyzer.get_cached(symbol, period=period)
                 if cached and not force_refresh:
                     self._send_json({"analysis": cached, "cached": True})
                     return
@@ -695,7 +536,14 @@ class DashboardServer:
                 if loop:
                     import asyncio
                     future = asyncio.run_coroutine_threadsafe(
-                        analyzer.analyze(symbol, snapshot_data, force=force_refresh), loop
+                        analyzer.analyze(
+                            symbol,
+                            snapshot_data,
+                            timeframe_data=timeframe_data,
+                            period=period,
+                            force=force_refresh,
+                        ),
+                        loop,
                     )
                     try:
                         result = future.result(timeout=35)
@@ -716,6 +564,38 @@ class DashboardServer:
                         self._send_json({"analysis": None, "reason": "analysis timeout"})
                 else:
                     self._send_json({"analysis": None, "reason": "event loop not ready"})
+
+            def _handle_timeframe_analysis_get(self) -> None:
+                from urllib.parse import urlparse, parse_qs
+                parsed = urlparse(self.path)
+                params = parse_qs(parsed.query)
+                symbol = (params.get("symbol", [""])[0]).upper()
+                period = params.get("period", ["5m"])[0]
+                force = params.get("force", ["0"])[0] == "1"
+                if not symbol:
+                    self._send_json({"ok": False, "error": "symbol required"}, status=400)
+                    return
+                if period not in TIMEFRAME_CONFIG:
+                    self._send_json({"ok": False, "error": "unsupported period"}, status=400)
+                    return
+                try:
+                    source = state.get_source()
+                    analysis = server_ref.timeframe_analysis.analyze(
+                        symbol=symbol,
+                        period=period,
+                        exchange=str(source.get("exchange", "binance_usdm")),
+                        force=force,
+                    )
+                    if server_ref.period_liquidation_provider:
+                        analysis.update(
+                            server_ref.period_liquidation_provider(
+                                symbol,
+                                int(TIMEFRAME_CONFIG[period]["seconds"]),
+                            )
+                        )
+                    self._send_json({"ok": True, "analysis": analysis})
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=502)
 
             def _read_json(self) -> dict:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -2208,6 +2088,128 @@ INDEX_HTML = """<!doctype html>
       margin-bottom: 12px;
     }
 
+    .period-section {
+      margin: 14px 0 16px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, .02);
+    }
+
+    .period-floating {
+      position: sticky;
+      top: 0;
+      z-index: 6;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 0 0 12px;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: 0 10px 28px rgba(0, 0, 0, .22);
+      backdrop-filter: blur(14px);
+    }
+
+    .period-floating-title {
+      padding-left: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 750;
+      white-space: nowrap;
+    }
+
+    .period-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 12px;
+    }
+
+    .period-meta {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .period-switch {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      justify-content: flex-end;
+      min-width: 0;
+    }
+
+    .period-btn {
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .period-btn:hover {
+      color: var(--text);
+      border-color: rgba(255, 255, 255, .22);
+    }
+
+    .period-btn.active {
+      background: var(--blue-soft);
+      color: var(--blue);
+      border-color: transparent;
+    }
+
+    .period-status {
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .period-status.error {
+      color: var(--red);
+    }
+
+    .period-summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .period-pill {
+      padding: 10px 11px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, .025);
+    }
+
+    .period-pill-label {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.4;
+    }
+
+    .period-pill-value {
+      margin-top: 5px;
+      font-size: 16px;
+      font-weight: 760;
+      line-height: 1.2;
+    }
+
+    .period-note {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+
     .detail-tab {
       height: 30px;
       border: 1px solid var(--line);
@@ -2616,6 +2618,44 @@ INDEX_HTML = """<!doctype html>
       color: var(--muted);
     }
 
+    .followup-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .followup-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: var(--card-soft);
+      color: var(--text);
+      font-size: 11px;
+      line-height: 1.3;
+      white-space: nowrap;
+    }
+
+    .followup-pill.pending {
+      color: var(--muted);
+    }
+
+    .followup-pill.up {
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .followup-pill.down {
+      background: var(--red-soft);
+      color: var(--red);
+    }
+
+    .followup-pill.mixed {
+      background: rgba(242, 184, 75, .12);
+      color: var(--amber);
+    }
+
     .reason {
       color: var(--muted);
       font-size: 12px;
@@ -2636,6 +2676,16 @@ INDEX_HTML = """<!doctype html>
       }
       .detail-callout-grid {
         grid-template-columns: 1fr;
+      }
+      .period-summary {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .period-floating {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+      .period-switch {
+        justify-content: flex-start;
       }
       .metric-summary,
       .metric-summary.always-visible,
@@ -3021,11 +3071,16 @@ INDEX_HTML = """<!doctype html>
     let lastSymbols = [];
     let drawerScrollBySymbol = {};
     let aiScrollBySymbol = {};
+    let timeframeAnalysisCache = {};
+    let timeframeRequestedAt = {};
+    let timeframeMeta = {};
     let detailInteractionUntil = 0;
     let detailInteractionTimer = null;
     let pendingDetailRefresh = false;
     let pendingAIRefreshSymbol = null;
     const DETAIL_INTERACTION_LOCK_MS = 900;
+    const TIMEFRAME_OPTIONS = ["5m", "15m", "1h", "4h", "1d"];
+    const DETAIL_PERIOD_OPTIONS = [...TIMEFRAME_OPTIONS];
     const thresholdTriggerFields = {
       score: [document.getElementById("threshold-trigger-score"), document.getElementById("threshold-trigger-score-value")],
       quote_volume_1m: [document.getElementById("threshold-trigger-volume"), document.getElementById("threshold-trigger-volume-value")],
@@ -3133,6 +3188,9 @@ INDEX_HTML = """<!doctype html>
       aiResults = {};
       aiRequestedAt = {};
       aiMeta = {};
+      timeframeAnalysisCache = {};
+      timeframeRequestedAt = {};
+      timeframeMeta = {};
       drawerScrollBySymbol = {};
       aiScrollBySymbol = {};
       clearDeferredDetailState();
@@ -3316,19 +3374,20 @@ INDEX_HTML = """<!doctype html>
       try {
         const raw = JSON.parse(localStorage.getItem(storageKey("cfm_ai_results")) || "{}");
         const now = Date.now();
-        Object.entries(raw).forEach(([symbol, value]) => {
+        Object.entries(raw).forEach(([key, value]) => {
           if (value && value.text && now - Number(value.ts || 0) < 30 * 60 * 1000) {
-            aiResults[symbol] = value.text;
+            aiResults[key] = value.text;
           }
         });
       } catch (error) {}
     }
 
-    function saveAIResult(symbol, text) {
-      aiResults[symbol] = text;
+    function saveAIResult(symbol, text, period = detailPeriod()) {
+      const key = aiAnalysisKey(symbol, period);
+      aiResults[key] = text;
       try {
         const raw = JSON.parse(localStorage.getItem(storageKey("cfm_ai_results")) || "{}");
-        raw[symbol] = { text, ts: Date.now() };
+        raw[key] = { text, ts: Date.now() };
         localStorage.setItem(storageKey("cfm_ai_results"), JSON.stringify(raw));
       } catch (error) {}
     }
@@ -3349,6 +3408,12 @@ INDEX_HTML = """<!doctype html>
         maximumFractionDigits: digits,
         minimumFractionDigits: 0
       });
+    }
+
+    function fmtSignedNumber(value, digits = 2) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "--";
+      const number = Number(value);
+      return `${number > 0 ? "+" : ""}${fmtNumber(number, digits)}`;
     }
 
     function mutedValue(text = "--") {
@@ -3530,13 +3595,31 @@ INDEX_HTML = """<!doctype html>
       `;
     }
 
+    function aiAnalysisKey(symbol, period = detailPeriod()) {
+      return `${String(symbol || "").toUpperCase()}::${period}`;
+    }
+
     function detailTab() {
       const raw = localStorage.getItem(storageKey("cfm_detail_tab")) || "overview";
+      if (raw === "realtime") return "overview";
       return ["overview", "ai", "structure", "liquidity"].includes(raw) ? raw : "overview";
     }
 
     function setDetailTab(tab) {
       localStorage.setItem(storageKey("cfm_detail_tab"), tab);
+    }
+
+    function detailPeriod() {
+      const raw = localStorage.getItem(storageKey("cfm_detail_period")) || "5m";
+      return DETAIL_PERIOD_OPTIONS.includes(raw) ? raw : "5m";
+    }
+
+    function setDetailPeriod(period) {
+      localStorage.setItem(storageKey("cfm_detail_period"), period);
+    }
+
+    function detailPeriodLabel(period = detailPeriod()) {
+      return period === "realtime" ? "实时" : period;
     }
 
     function clearDeferredDetailState() {
@@ -3601,14 +3684,15 @@ INDEX_HTML = """<!doctype html>
     }
 
     function captureDetailScroll(symbol = selectedSymbol) {
-      if (!symbol) return { drawer: 0, ai: 0, sameSymbol: false };
+      if (!symbol) return { drawer: 0, ai: 0, sameSymbol: false, period: detailPeriod() };
       const sameSymbol = (detailEl.dataset.symbol || "") === symbol;
       const aiBlock = document.getElementById("ai-block");
       const drawerTop = sideScrollEl ? sideScrollEl.scrollTop : (drawerScrollBySymbol[symbol] || 0);
-      const aiTop = aiBlock ? aiBlock.scrollTop : (aiScrollBySymbol[symbol] || 0);
+      const aiStorageKey = aiAnalysisKey(symbol);
+      const aiTop = aiBlock ? aiBlock.scrollTop : (aiScrollBySymbol[aiStorageKey] || 0);
       drawerScrollBySymbol[symbol] = drawerTop;
-      aiScrollBySymbol[symbol] = aiTop;
-      return { drawer: drawerTop, ai: aiTop, sameSymbol };
+      aiScrollBySymbol[aiStorageKey] = aiTop;
+      return { drawer: drawerTop, ai: aiTop, sameSymbol, period: detailPeriod() };
     }
 
     function applyScrollRestore(element, top) {
@@ -3633,9 +3717,10 @@ INDEX_HTML = """<!doctype html>
         }
         const aiBlock = document.getElementById("ai-block");
         if (aiBlock && activeTab === "ai") {
-          const aiTop = preserved && preserved.sameSymbol
+          const aiStorageKey = aiAnalysisKey(symbol);
+          const aiTop = preserved && preserved.sameSymbol && preserved.period === detailPeriod()
             ? preserved.ai
-            : (aiScrollBySymbol[symbol] || 0);
+            : (aiScrollBySymbol[aiStorageKey] || 0);
           applyScrollRestore(aiBlock, aiTop);
         }
       });
@@ -3645,7 +3730,8 @@ INDEX_HTML = """<!doctype html>
       const aiBlock = document.getElementById("ai-block");
       if (!aiBlock) return;
       const scrollTop = aiBlock.scrollTop;
-      aiScrollBySymbol[symbol] = scrollTop;
+      const key = aiAnalysisKey(symbol);
+      aiScrollBySymbol[key] = scrollTop;
       if (deferIfLocked && selectedSymbol === symbol && detailRefreshLocked(symbol)) {
         pendingAIRefreshSymbol = symbol;
         scheduleDetailRefreshFlush();
@@ -3654,7 +3740,7 @@ INDEX_HTML = """<!doctype html>
       pendingAIRefreshSymbol = null;
       aiBlock.innerHTML = renderAIBlock(symbol);
       const nextBlock = document.getElementById("ai-block");
-      applyScrollRestore(nextBlock, aiScrollBySymbol[symbol] || 0);
+      applyScrollRestore(nextBlock, aiScrollBySymbol[key] || 0);
     }
 
     function structureMarkerHtml(marker) {
@@ -3728,7 +3814,7 @@ INDEX_HTML = """<!doctype html>
       const markers = [
         { label: "支撑", left: 0, tone: "up", lane: 0 },
         { label: "VWAP", left: vwapPos, tone: "mixed", lane: 0 },
-        { label: "现价", left: rangePos, tone: valueClass(symbol.price_move_pct_1m), lane: 0 },
+        { label: "现价", left: rangePos, tone: valueClass(symbol.price_move_pct !== undefined ? symbol.price_move_pct : symbol.price_move_pct_1m), lane: 0 },
         { label: "压力", left: 100, tone: "down", lane: 0 }
       ];
       const closenessThreshold = 9;
@@ -3808,6 +3894,23 @@ INDEX_HTML = """<!doctype html>
         return `<span class="mixed">未接入</span>`;
       }
       return fmtNumber(symbol[key], 0);
+    }
+
+    function periodLiquidationHtml(data) {
+      if (!data || (data.period_liquidation_data_status || "unavailable") === "unavailable") {
+        return `<span class="mixed">未接入</span>`;
+      }
+      if ((data.period_liquidation_data_status || "") === "no_recent_event") {
+        return `<span class="muted">本周期无</span>`;
+      }
+      const longQuote = Number(data.period_long_liquidation_quote || 0);
+      const shortQuote = Number(data.period_short_liquidation_quote || 0);
+      if (longQuote > 0 && shortQuote > 0) {
+        return `<span class="mixed">多 ${fmtNumber(longQuote, 0)} / 空 ${fmtNumber(shortQuote, 0)}</span>`;
+      }
+      if (longQuote > 0) return `<span class="down">多 ${fmtNumber(longQuote, 0)}</span>`;
+      if (shortQuote > 0) return `<span class="up">空 ${fmtNumber(shortQuote, 0)}</span>`;
+      return `<span class="muted">本周期无</span>`;
     }
 
     function microstructureStatusHtml(symbol) {
@@ -3997,7 +4100,7 @@ INDEX_HTML = """<!doctype html>
     }
 
     function aiStatusLine(symbol) {
-      const meta = aiMeta[symbol];
+      const meta = aiMeta[aiAnalysisKey(symbol)];
       if (!meta) return "";
       const timeText = meta.ts ? new Date(meta.ts).toLocaleTimeString() : "";
       return `<div class="ai-status"><strong>${esc(meta.status)}</strong><span>${esc(timeText)}</span></div>`;
@@ -4052,9 +4155,11 @@ INDEX_HTML = """<!doctype html>
     }
 
     function renderAIBlock(symbol) {
-      const text = aiResults[symbol];
+      const period = detailPeriod();
+      const periodLabel = detailPeriodLabel(period);
+      const text = aiResults[aiAnalysisKey(symbol, period)];
       if (!text) {
-        return `${aiStatusLine(symbol)}<div class="detail-placeholder">等待 AI 根据当前合约指标生成观察建议。</div>`;
+        return `${aiStatusLine(symbol)}<div class="detail-placeholder">等待 AI 基于当前 ${esc(periodLabel)} 档位生成观察建议。</div>`;
       }
       const sections = aiSections(text);
       const cardsHtml = sections.length
@@ -4094,9 +4199,95 @@ INDEX_HTML = """<!doctype html>
       `;
     }
 
+    function activeTimeframeData(symbol) {
+      if (!symbol || !symbol.symbol || detailPeriod() === "realtime") return null;
+      return cachedTimeframeAnalysis(symbol.symbol, detailPeriod());
+    }
+
+    function timeframeAmplitudePct(data) {
+      if (!data) return null;
+      const low = Number(data.low_price || 0);
+      const high = Number(data.high_price || 0);
+      if (low <= 0 || high <= 0 || high < low) return null;
+      return (high / low - 1) * 100;
+    }
+
+    function timeframeImpulseLabel(data) {
+      if (!data) return "等待周期分析";
+      const move = Number(data.price_move_pct || 0);
+      const volume = Number(data.volume_multiplier || 0);
+      if (move >= 1 && volume >= 1.5) return "放量上攻";
+      if (move <= -1 && volume >= 1.5) return "放量下压";
+      if (volume >= 2) return move >= 0 ? "放量试高" : "放量试低";
+      if (Math.abs(move) <= 0.3 && volume <= 0.9) return "缩量整理";
+      return move >= 0 ? "偏强震荡" : "偏弱震荡";
+    }
+
+    function timeframeImpulseCopy(data) {
+      const amplitude = timeframeAmplitudePct(data);
+      const amplitudeText = amplitude === null ? "--" : fmtPlainPct(amplitude, 2);
+      return `${data.period_label} 涨跌 ${fmtPlainPct(data.price_move_pct, 2)}，量能 ${fmtNumber(data.volume_multiplier, 2)}x，振幅 ${amplitudeText}。`;
+    }
+
+    function timeframeMarkLabel(data) {
+      if (!data || data.mark_premium_bps === null || data.mark_premium_bps === undefined) return "标记价待补齐";
+      const premium = Number(data.mark_premium_bps || 0);
+      if (premium >= 4) return "明显升水";
+      if (premium <= -4) return "明显贴水";
+      return "贴近现价";
+    }
+
+    function timeframeMarkCopy(data) {
+      if (!data || data.mark_premium_bps === null || data.mark_premium_bps === undefined) {
+        return "当前还没有足够的标记价序列。";
+      }
+      const markMove = data.mark_move_pct === null || data.mark_move_pct === undefined
+        ? "--"
+        : fmtPlainPct(data.mark_move_pct, 2);
+      return `${data.period_label} 标记价偏离 ${fmtSignedNumber(data.mark_premium_bps, 1)} bps，区间涨跌 ${markMove}。`;
+    }
+
+    function timeframeFocusItems(data) {
+      if (!data) return [];
+      const items = [
+        `${data.period_label}涨跌 ${fmtPlainPct(data.price_move_pct, 2)}`,
+        `量能 ${fmtNumber(data.volume_multiplier, 2)}x`,
+        `结构 ${structureState(data)}`
+      ];
+      const amplitude = timeframeAmplitudePct(data);
+      if (amplitude !== null) items.push(`振幅 ${fmtPlainPct(amplitude, 2)}`);
+      if (data.mark_premium_bps !== null && data.mark_premium_bps !== undefined) {
+        items.push(`标记偏离 ${fmtSignedNumber(data.mark_premium_bps, 1)} bps`);
+      }
+      return items.slice(0, 4);
+    }
+
+    function timeframeCandleStatus(data) {
+      return data && data.candle_confirmed ? "已收线" : "进行中";
+    }
+
     function renderOverviewPanel(symbol) {
+      const periodData = activeTimeframeData(symbol);
+      if (periodData) {
+        const period = periodData.period_label || detailPeriod();
+        const focusItems = timeframeFocusItems(periodData);
+        return `
+          <div class="detail-panel">
+            <div class="insight-grid">
+              ${insightCard(`${period} 动能`, timeframeImpulseLabel(periodData), timeframeImpulseCopy(periodData), valueClass(periodData.price_move_pct))}
+              ${insightCard("结构", structureState(periodData), timeframeNarrative(periodData), structureStateClass(structureState(periodData)))}
+              ${insightCard("标记价", timeframeMarkLabel(periodData), timeframeMarkCopy(periodData), valueClass(periodData.mark_premium_bps))}
+            </div>
+            <div>
+              <div class="detail-title">${esc(period)} 关注点</div>
+              <div class="reason-pills">
+                ${focusItems.map((item) => `<span class="reason-pill">${esc(item)}</span>`).join("")}
+              </div>
+            </div>
+          </div>
+        `;
+      }
       const tradeLive = hasCoreTradeData(symbol);
-      const oiLive = hasOiData(symbol);
       const depthLive = hasDepthData(symbol);
       const structureLive = hasStructureData(symbol);
       const reasons = (symbol.reasons || []).length ? symbol.reasons : ["暂无明确触发项"];
@@ -4125,6 +4316,87 @@ INDEX_HTML = """<!doctype html>
     }
 
     function renderStructurePanel(symbol) {
+      const periodData = activeTimeframeData(symbol);
+      if (periodData) {
+        const available = Number(periodData.support_price || 0) > 0 && Number(periodData.resistance_price || 0) > 0;
+        if (!available) {
+          return `<div class="detail-panel"><div class="detail-placeholder">等待 ${esc(detailPeriod())} 周期结构数据稳定后，再展示支撑、压力、VWAP 与区间位置。</div></div>`;
+        }
+        const period = periodData.period_label || detailPeriod();
+        const support = Number(periodData.support_price || 0);
+        const resistance = Number(periodData.resistance_price || 0);
+        const price = Number(periodData.price || 0);
+        const vwap = Number(periodData.window_vwap || 0);
+        const spread = Math.max(resistance - support, 1e-9);
+        const rangePos = clamp(Number(periodData.range_position_pct || 50), 0, 100);
+        const vwapPos = clamp(((vwap - support) / spread) * 100, 0, 100);
+        const amplitude = timeframeAmplitudePct(periodData);
+        return `
+          <div class="detail-panel">
+            <div class="range-rail-card">
+              <div class="range-rail-head">
+                <div class="range-rail-title">${esc(period)} 支撑 / 压力结构带</div>
+                <div class="range-rail-meta">${esc(structureState(periodData))}</div>
+              </div>
+              <div class="range-rail">
+                <div class="range-rail-track"></div>
+                ${structureMarkers(periodData, rangePos, vwapPos)}
+              </div>
+              <div class="range-rail-footer">
+                <div class="rail-stat">
+                  <div class="rail-stat-label">支撑位</div>
+                  <div class="rail-stat-value">${fmtPriceLevel(support)}</div>
+                </div>
+                <div class="rail-stat">
+                  <div class="rail-stat-label">${esc(period)} 收盘</div>
+                  <div class="rail-stat-value">${fmtPriceLevel(price)}</div>
+                </div>
+                <div class="rail-stat">
+                  <div class="rail-stat-label">VWAP</div>
+                  <div class="rail-stat-value">${fmtPriceLevel(vwap)}</div>
+                </div>
+                <div class="rail-stat">
+                  <div class="rail-stat-label">压力位</div>
+                  <div class="rail-stat-value">${fmtPriceLevel(resistance)}</div>
+                </div>
+              </div>
+            </div>
+            <div class="metric-grid compact">
+              <div class="metric">
+                <div class="metric-label">距支撑</div>
+                <div class="metric-value up">${fmtPlainPct(periodData.support_distance_pct, 2)}</div>
+                <div class="metric-copy">越短说明越接近下沿承接区</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">距压力</div>
+                <div class="metric-value down">${fmtPlainPct(periodData.resistance_distance_pct, 2)}</div>
+                <div class="metric-copy">越短说明越接近上沿抛压区</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">区间位置</div>
+                <div class="metric-value">${fmtPlainPct(periodData.range_position_pct, 2)}</div>
+                <div class="metric-copy">${esc(structureState(periodData))}</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">VWAP 偏离</div>
+                <div class="metric-value ${valueClass(periodData.vwap_deviation_pct)}">${fmtPlainPct(periodData.vwap_deviation_pct, 3)}</div>
+                <div class="metric-copy">${esc(period)} 均价偏离度</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">高低振幅</div>
+                <div class="metric-value ${amplitude !== null && amplitude >= 2 ? "mixed" : "muted"}">${amplitude === null ? "--" : fmtPlainPct(amplitude, 2)}</div>
+                <div class="metric-copy">${esc(timeframeCandleStatus(periodData))}</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">相对前收</div>
+                <div class="metric-value ${valueClass(periodData.prev_close_pct)}">${fmtPlainPct(periodData.prev_close_pct, 2)}</div>
+                <div class="metric-copy">看上一根收盘后的延续性</div>
+              </div>
+            </div>
+            <div class="period-note">${esc(timeframeNarrative(periodData))}</div>
+          </div>
+        `;
+      }
       const available = hasStructureData(symbol);
       if (!available) {
         return `<div class="detail-panel"><div class="detail-placeholder">等待成交序列稳定后，再展示支撑、压力、VWAP 与区间位置。</div></div>`;
@@ -4203,11 +4475,55 @@ INDEX_HTML = """<!doctype html>
     }
 
     function renderLiquidityPanel(symbol) {
+      const periodData = activeTimeframeData(symbol);
       const depthLive = hasDepthData(symbol);
       const tradeLive = hasCoreTradeData(symbol);
       const totalDepth = Number(symbol.bid_depth_notional || 0) + Number(symbol.ask_depth_notional || 0);
       const bidPct = totalDepth > 0 ? (Number(symbol.bid_depth_notional || 0) / totalDepth) * 100 : 50;
       const askPct = 100 - bidPct;
+      if (periodData) {
+        const period = periodData.period_label || detailPeriod();
+        const amplitude = timeframeAmplitudePct(periodData);
+        return `
+          <div class="detail-panel">
+            <div class="detail-title">${esc(period)} 流动性节奏</div>
+            <div class="metric-grid compact">
+              <div class="metric"><div class="metric-label">${esc(period)} 成交额</div><div class="metric-value">${fmtNumber(periodData.quote_volume, 0)} USDT</div><div class="metric-copy">该周期最新一根 K 线成交额</div></div>
+              <div class="metric"><div class="metric-label">量能 / 均值</div><div class="metric-value ${Number(periodData.volume_multiplier || 0) >= 1.5 ? "up" : "muted"}">${fmtNumber(periodData.volume_multiplier, 2)}x</div><div class="metric-copy">相对近邻 K 线的放量程度</div></div>
+              <div class="metric"><div class="metric-label">高低振幅</div><div class="metric-value ${amplitude !== null && amplitude >= 2 ? "mixed" : "muted"}">${amplitude === null ? "--" : fmtPlainPct(amplitude, 2)}</div><div class="metric-copy">${esc(timeframeCandleStatus(periodData))}</div></div>
+              <div class="metric"><div class="metric-label">相对前收</div><div class="metric-value ${valueClass(periodData.prev_close_pct)}">${fmtPlainPct(periodData.prev_close_pct, 2)}</div><div class="metric-copy">看是否承接上一根方向</div></div>
+              <div class="metric"><div class="metric-label">标记价偏离</div><div class="metric-value ${valueClass(periodData.mark_premium_bps)}">${periodData.mark_premium_bps === null || periodData.mark_premium_bps === undefined ? "--" : `${fmtSignedNumber(periodData.mark_premium_bps, 1)} bps`}</div><div class="metric-copy">${esc(timeframeMarkLabel(periodData))}</div></div>
+              <div class="metric"><div class="metric-label">标记价涨跌</div><div class="metric-value ${valueClass(periodData.mark_move_pct)}">${periodData.mark_move_pct === null || periodData.mark_move_pct === undefined ? "--" : fmtPlainPct(periodData.mark_move_pct, 2)}</div><div class="metric-copy">观察标记价是否和成交价同步</div></div>
+            </div>
+            <div class="period-note">${esc(`${period} 周期里优先看成交额、量能倍数和标记价是否同步放大；这些更能说明这一档周期的推动质量。`)}</div>
+            <div class="detail-title" style="margin-top:14px">实时补充</div>
+            ${depthLive ? `
+              <div class="depth-card" style="margin-top:10px">
+                <div class="chart-head">
+                  <div class="chart-title">买卖盘深度对比</div>
+                  <div class="chart-meta">${fmtBps(symbol.spread_bps)} bps</div>
+                </div>
+                <div class="depth-split">
+                  <div class="depth-track">
+                    <span style="width:${bidPct.toFixed(1)}%"></span>
+                    <span style="width:${askPct.toFixed(1)}%"></span>
+                  </div>
+                  <div class="depth-meta">
+                    <span>买盘 ${fmtNumber(symbol.bid_depth_notional, 0)}</span>
+                    <span>卖盘 ${fmtNumber(symbol.ask_depth_notional, 0)}</span>
+                  </div>
+                </div>
+              </div>
+            ` : `<div class="detail-placeholder" style="margin-top:10px">当前数据源没有稳定盘口深度，实时补充先保持静默。</div>`}
+            <div class="metric-grid compact" style="margin-top:12px">
+              <div class="metric"><div class="metric-label">强平状态</div><div class="metric-value ${liquidationStatusClass(symbol)}">${esc(liquidationStatusText(symbol))}</div><div class="metric-copy">总额 ${liquidationTotalHtml(symbol)}</div></div>
+              <div class="metric"><div class="metric-label">强平事件 1m</div><div class="metric-value">${fmtNumber(symbol.liquidation_event_count_1m, 0)}</div><div class="metric-copy">近一分钟记录数</div></div>
+              <div class="metric"><div class="metric-label">主动买入</div><div class="metric-value">${tradeLive ? `${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%` : mutedValue()}</div><div class="metric-copy">实时成交主导方向</div></div>
+              <div class="metric"><div class="metric-label">盘口失衡</div><div class="metric-value">${depthLive ? `${fmtNumber(Number(symbol.depth_imbalance || 0) * 100, 1)}%` : mutedValue()}</div><div class="metric-copy">正值偏买盘，负值偏卖盘</div></div>
+            </div>
+          </div>
+        `;
+      }
       return `
         <div class="detail-panel">
           ${depthLive ? `
@@ -4238,6 +4554,51 @@ INDEX_HTML = """<!doctype html>
             <div class="metric"><div class="metric-label">盘口失衡</div><div class="metric-value">${depthLive ? `${fmtNumber(Number(symbol.depth_imbalance || 0) * 100, 1)}%` : mutedValue()}</div><div class="metric-copy">正值偏买盘，负值偏卖盘</div></div>
             <div class="metric"><div class="metric-label">主动买入</div><div class="metric-value">${tradeLive ? `${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%` : mutedValue()}</div><div class="metric-copy">成交主导方向</div></div>
           </div>
+        </div>
+      `;
+    }
+
+    function renderRealtimeSupplement(symbol) {
+      const tradeLive = hasCoreTradeData(symbol);
+      const depthLive = hasDepthData(symbol);
+      const oiLive = hasOiData(symbol);
+      const volumeChart = tradeLive
+        ? barChartSvg(symbol.volume_series_5m, rowClass(symbol))
+        : chartEmptyHtml("等待成交时序");
+      const oiTone = Number(symbol.oi_change_pct_5m || 0) > 0 ? "up" : Number(symbol.oi_change_pct_5m || 0) < 0 ? "down" : "mixed";
+      const oiChart = oiLive
+        ? lineChartSvg(symbol.oi_series_5m, oiTone)
+        : chartEmptyHtml("OI 尚未稳定");
+      const depthBalance = clamp((Number(symbol.depth_imbalance || 0) + 1) * 50, 0, 100);
+      const totalDepth = Number(symbol.bid_depth_notional || 0) + Number(symbol.ask_depth_notional || 0);
+      const bidPct = totalDepth > 0 ? (Number(symbol.bid_depth_notional || 0) / totalDepth) * 100 : 50;
+      const askPct = 100 - bidPct;
+      const depthBody = depthLive
+        ? `
+          <div class="depth-split" style="margin-top:14px">
+            <div class="depth-track">
+              <span style="width:${bidPct.toFixed(1)}%"></span>
+              <span style="width:${askPct.toFixed(1)}%"></span>
+            </div>
+            <div class="depth-meta">
+              <span>买盘 ${fmtNumber(symbol.bid_depth_notional, 0)}</span>
+              <span>卖盘 ${fmtNumber(symbol.ask_depth_notional, 0)}</span>
+            </div>
+          </div>
+        `
+        : chartEmptyHtml("盘口深度未稳定");
+      return `
+        <div class="detail-title" style="margin:16px 0 10px">实时补充</div>
+        <div class="visual-grid">
+          ${chartCard("1分钟量能", tradeLive ? `${fmtNumber(symbol.quote_volume_1m, 0)} USDT` : mutedValue(), volumeChart)}
+          ${chartCard("5分钟 OI", oiLive ? fmtPctMaybe(symbol.oi_change_pct_5m, true) : mutedValue(), oiChart)}
+          ${chartCard("买卖盘深度", depthLive ? `${fmtBps(symbol.spread_bps)} bps` : mutedValue(), depthBody)}
+        </div>
+        <div class="meter-grid">
+          ${meterHtml("主动买入", tradeLive ? Number(symbol.taker_buy_ratio_1m || 0) * 100 : 0, tradeLive ? `${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%` : "--", Number(symbol.taker_buy_ratio_1m || 0) >= 0.6 ? "up" : Number(symbol.taker_buy_ratio_1m || 0) <= 0.4 ? "down" : "mixed", "看主动成交方向是否持续。")}
+          ${meterHtml("盘口失衡", depthLive ? depthBalance : 0, depthLive ? `${fmtNumber(Number(symbol.depth_imbalance || 0) * 100, 1)}%` : "--", Number(symbol.depth_imbalance || 0) >= 0.1 ? "up" : Number(symbol.depth_imbalance || 0) <= -0.1 ? "down" : "mixed", "正值偏买盘，负值偏卖盘。")}
+          ${meterHtml("盘口点差", depthLive ? clamp((Number(symbol.spread_bps || 0) / 8) * 100, 0, 100) : 0, depthLive ? `${fmtNumber(symbol.spread_bps, 2)} bps` : "--", Number(symbol.spread_bps || 0) >= 4 ? "down" : Number(symbol.spread_bps || 0) >= 2 ? "mixed" : "blue", "越大越容易出现滑点。")}
+          ${meterHtml("深度下降", depthLive ? clamp((Number(symbol.depth_drop_pct_1m || 0) / 30) * 100, 0, 100) : 0, depthLive ? `${fmtNumber(symbol.depth_drop_pct_1m, 1)}%` : "--", Number(symbol.depth_drop_pct_1m || 0) >= 18 ? "down" : Number(symbol.depth_drop_pct_1m || 0) >= 10 ? "mixed" : "blue", "下降越快，越要防瞬时插针。")}
         </div>
       `;
     }
@@ -4326,19 +4687,37 @@ INDEX_HTML = """<!doctype html>
       const tradeLive = hasCoreTradeData(symbol);
       const oiLive = hasOiData(symbol);
       const depthLive = hasDepthData(symbol);
-      const structureLive = hasStructureData(symbol);
-      const items = [
-        ["风险", `<span class="${riskClass(symbol.risk_level)}">${esc(symbol.risk_level || "低风险")}</span>`],
-        ["置信度", tradeLive ? `${fmtNumber(symbol.confidence, 1)}%` : mutedValue()],
-        ["1m波动", fmtPctMaybe(symbol.price_move_pct_1m, tradeLive)],
-        ["1m成交额", fmtNumberMaybe(symbol.quote_volume_1m, 0, tradeLive)],
-        ["量能", tradeLive ? `<span class="${rowClass(symbol)}">${fmtNumber(symbol.volume_multiplier, 2)}x</span>` : mutedValue()],
-        ["OI 5m", fmtPctMaybe(symbol.oi_change_pct_5m, oiLive)],
-        ["主动买入", tradeLive ? `${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%` : mutedValue()],
-        ["结构", structureLive ? `<span class="${structureStateClass(structureState(symbol))}">${esc(structureState(symbol))}</span>` : mutedValue("等待结构")],
-        ["爆仓", `<span class="${liquidationStatusClass(symbol)}">${esc(liquidationStatusText(symbol))}</span>`],
-        ["点差", depthLive ? `${fmtBps(symbol.spread_bps)} bps` : mutedValue()]
-      ];
+      const periodData = activeTimeframeData(symbol);
+      const periodLabel = periodData && periodData.period_label ? periodData.period_label : detailPeriod();
+      const structureSource = periodData || symbol;
+      const structureLive = periodData
+        ? Number(periodData.support_price || 0) > 0 && Number(periodData.resistance_price || 0) > 0
+        : hasStructureData(symbol);
+      const items = periodData
+        ? [
+            ["风险", `<span class="${riskClass(symbol.risk_level)}">${esc(symbol.risk_level || "低风险")}</span>`],
+            ["置信度", tradeLive ? `${fmtNumber(symbol.confidence, 1)}%` : mutedValue()],
+            [`${periodLabel}波动`, fmtPctMaybe(periodData.price_move_pct, true)],
+            [`${periodLabel}成交额`, `${fmtNumber(periodData.quote_volume, 0)} USDT`],
+            [`${periodLabel}量能`, `<span class="${Number(periodData.volume_multiplier || 0) >= 1.5 ? "up" : "muted"}">${fmtNumber(periodData.volume_multiplier, 2)}x</span>`],
+            ["标记价", periodData.mark_move_pct === null || periodData.mark_move_pct === undefined ? mutedValue() : fmtPctMaybe(periodData.mark_move_pct, true)],
+            ["结构", structureLive ? `<span class="${structureStateClass(structureState(structureSource))}">${esc(structureState(structureSource))}</span>` : mutedValue("等待结构")],
+            ["标记偏离", periodData.mark_premium_bps === null || periodData.mark_premium_bps === undefined ? mutedValue() : `<span class="${valueClass(periodData.mark_premium_bps)}">${fmtSignedNumber(periodData.mark_premium_bps, 1)} bps</span>`],
+            [`${periodLabel}爆仓`, periodLiquidationHtml(periodData)],
+            ["点差", depthLive ? `${fmtBps(symbol.spread_bps)} bps` : mutedValue()]
+          ]
+        : [
+            ["风险", `<span class="${riskClass(symbol.risk_level)}">${esc(symbol.risk_level || "低风险")}</span>`],
+            ["置信度", tradeLive ? `${fmtNumber(symbol.confidence, 1)}%` : mutedValue()],
+            ["1m波动", fmtPctMaybe(symbol.price_move_pct_1m, tradeLive)],
+            ["1m成交额", fmtNumberMaybe(symbol.quote_volume_1m, 0, tradeLive)],
+            ["量能", tradeLive ? `<span class="${rowClass(symbol)}">${fmtNumber(symbol.volume_multiplier, 2)}x</span>` : mutedValue()],
+            ["OI 5m", fmtPctMaybe(symbol.oi_change_pct_5m, oiLive)],
+            ["主动买入", tradeLive ? `${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%` : mutedValue()],
+            ["结构", structureLive ? `<span class="${structureStateClass(structureState(structureSource))}">${esc(structureState(structureSource))}</span>` : mutedValue("等待结构")],
+            ["爆仓", `<span class="${liquidationStatusClass(symbol)}">${esc(liquidationStatusText(symbol))}</span>`],
+            ["点差", depthLive ? `${fmtBps(symbol.spread_bps)} bps` : mutedValue()]
+          ];
       return `
         <div class="metric-summary ${extraClass}">
           ${items.map(([label, value]) => `
@@ -4412,7 +4791,7 @@ INDEX_HTML = """<!doctype html>
         detailEl.innerHTML = `
           <div class="drawer-empty">
             <div class="drawer-empty-title">点击左侧合约展开详情</div>
-            <div class="drawer-empty-copy">这里会先看 5 分钟价格、量能、OI 图，再切到 AI、结构位和流动性视图。</div>
+            <div class="drawer-empty-copy">这里会先看周期分析，再切到 AI、结构位和流动性视图。</div>
           </div>
         `;
         return;
@@ -4421,21 +4800,9 @@ INDEX_HTML = """<!doctype html>
       selectedSymbol = symbol.symbol;
       const preservedScroll = captureDetailScroll(symbol.symbol);
       const tradeLive = hasCoreTradeData(symbol);
-      const depthLive = hasDepthData(symbol);
-      const oiLive = hasOiData(symbol);
       const activeTab = detailTab();
-      const priceChart = tradeLive
-        ? lineChartSvg(symbol.price_series_5m, valueClass(symbol.price_move_pct_5m))
-        : chartEmptyHtml("等待成交时序");
-      const volumeChart = tradeLive
-        ? barChartSvg(symbol.volume_series_5m, rowClass(symbol))
-        : chartEmptyHtml("等待成交时序");
-      const oiTone = Number(symbol.oi_change_pct_5m || 0) > 0 ? "up" : Number(symbol.oi_change_pct_5m || 0) < 0 ? "down" : "mixed";
-      const oiChart = oiLive
-        ? lineChartSvg(symbol.oi_series_5m, oiTone)
-        : chartEmptyHtml("OI 尚未稳定");
-      const depthBalance = clamp((Number(symbol.depth_imbalance || 0) + 1) * 50, 0, 100);
       maybeLoadAIAnalysis(symbol);
+      maybeLoadTimeframeAnalysis(symbol.symbol);
       detailEl.innerHTML = `
         <div class="detail-head">
           <div class="detail-meta">
@@ -4459,17 +4826,8 @@ INDEX_HTML = """<!doctype html>
         </div>
         ${dataBannerHtml(symbol)}
         ${renderMetricSummary(symbol, "always-visible")}
-        <div class="visual-grid">
-          ${chartCard("5分钟价格轨迹", tradeLive ? fmtPctMaybe(symbol.price_move_pct_5m, true) : mutedValue(), priceChart, "span-2")}
-          ${chartCard("1分钟量能", tradeLive ? `${fmtNumber(symbol.quote_volume_1m, 0)} USDT` : mutedValue(), volumeChart)}
-          ${chartCard("5分钟 OI", oiLive ? fmtPctMaybe(symbol.oi_change_pct_5m, true) : mutedValue(), oiChart)}
-        </div>
-        <div class="meter-grid">
-          ${meterHtml("主动买入", tradeLive ? Number(symbol.taker_buy_ratio_1m || 0) * 100 : 0, tradeLive ? `${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%` : "--", Number(symbol.taker_buy_ratio_1m || 0) >= 0.6 ? "up" : Number(symbol.taker_buy_ratio_1m || 0) <= 0.4 ? "down" : "mixed", "看主动成交方向是否持续。")}
-          ${meterHtml("区间位置", tradeLive ? Number(symbol.range_position_pct || 50) : 0, tradeLive ? fmtPlainPct(symbol.range_position_pct, 1) : "--", Number(symbol.range_position_pct || 50) >= 70 ? "down" : Number(symbol.range_position_pct || 50) <= 30 ? "up" : "mixed", "越靠上沿越接近抛压区。")}
-          ${meterHtml("盘口失衡", depthLive ? depthBalance : 0, depthLive ? `${fmtNumber(Number(symbol.depth_imbalance || 0) * 100, 1)}%` : "--", Number(symbol.depth_imbalance || 0) >= 0.1 ? "up" : Number(symbol.depth_imbalance || 0) <= -0.1 ? "down" : "mixed", "正值偏买盘，负值偏卖盘。")}
-          ${meterHtml("量能倍数", tradeLive ? clamp((Number(symbol.volume_multiplier || 0) / 5) * 100, 0, 100) : 0, tradeLive ? `${fmtNumber(symbol.volume_multiplier, 2)}x` : "--", Number(symbol.volume_multiplier || 0) >= 3 ? "up" : Number(symbol.volume_multiplier || 0) >= 1.5 ? "mixed" : "blue", "5x 以上视作极强放量。")}
-        </div>
+        ${renderPeriodFloatingSwitch()}
+        ${renderTimeframeSection(symbol)}
         <div class="detail-tabs">
           ${detailTabButton("overview", "总览")}
           ${detailTabButton("ai", "AI 分析")}
@@ -4479,7 +4837,7 @@ INDEX_HTML = """<!doctype html>
         ${activeTab === "ai" ? `
           <div class="detail-panel">
             <div class="ai-panel-head">
-              <div class="detail-title">AI 只在触发条件满足或手动刷新时更新</div>
+              <div class="detail-title">AI 会优先基于当前 ${esc(detailPeriodLabel())} 档位生成分析</div>
               <button class="inline-link" id="ai-refresh-btn" type="button">刷新</button>
             </div>
             <div class="detail-list ai-inline" id="ai-block">${renderAIBlock(symbol.symbol)}</div>
@@ -4502,10 +4860,36 @@ INDEX_HTML = """<!doctype html>
         eventsEl.innerHTML = `<div class="empty">暂无报警</div>`;
         return;
       }
+      function followupTone(item) {
+        if (!item || item.status !== "resolved") return "pending";
+        const closeBps = Number(item.close_bps || 0);
+        if (closeBps > 0) return "up";
+        if (closeBps < 0) return "down";
+        return "mixed";
+      }
+      function followupText(item) {
+        if (!item) return "";
+        const label = item.label || `${item.horizon_minutes || 0}m`;
+        if (item.status !== "resolved") return `${label} 待回写`;
+        return `${label} ${fmtSignedNumber(item.close_bps, 1)}bp · ↑${fmtSignedNumber(item.max_up_bps, 1)} · ↓${fmtSignedNumber(item.max_down_bps, 1)}`;
+      }
+      function followupRow(event) {
+        const items = event.followups || [];
+        if (!items.length) return "";
+        return `
+          <div class="event-row">
+            <span class="event-label">复盘</span>
+            <span class="followup-pills">${items.map((item) => `<span class="followup-pill ${followupTone(item)}">${esc(followupText(item))}</span>`).join("")}</span>
+          </div>
+        `;
+      }
       eventsEl.innerHTML = events.map((event) => {
         const reasons = (event.reasons || []).join("; ") || "暂无明确触发项";
         const suggestions = (event.suggestions || []).join("; ") || "继续观察盘口与量价变化";
         const aiSummary = (event.ai_summary || []).join("; ").trim();
+        const aiAnalysis = String(event.ai_analysis || "").trim();
+        const aiObservation = aiSummary || aiAnalysis;
+        const observation = aiObservation ? `${suggestions}; AI: ${aiObservation}` : suggestions;
         const directionClass = eventDirectionClass(event);
         const directionLabel = directionText[event.direction] || event.direction || "异常";
         return `
@@ -4523,8 +4907,8 @@ INDEX_HTML = """<!doctype html>
               <span class="event-badge ${directionClass}">${esc(directionLabel)}</span>
             </div>
             <div class="event-row"><span class="event-label">触发</span><span class="event-text">${esc(reasons)}</span></div>
-            <div class="event-row"><span class="event-label">观察</span><span class="event-text muted">${esc(suggestions)}</span></div>
-            ${aiSummary ? `<div class="event-row"><span class="event-label">AI</span><span class="event-text">${esc(aiSummary)}</span></div>` : ""}
+            <div class="event-row"><span class="event-label">观察</span><span class="event-text ${aiObservation ? "" : "muted"}">${esc(observation)}</span></div>
+            ${followupRow(event)}
           </div>
         `;
       }).join("");
@@ -4879,55 +5263,242 @@ INDEX_HTML = """<!doctype html>
       }
     });
 
-    async function fetchAIAnalysis(symbol, force = false) {
+    async function fetchAIAnalysis(symbol, force = false, period = detailPeriod()) {
+      const key = aiAnalysisKey(symbol, period);
+      const periodLabel = detailPeriodLabel(period);
       const aiBlock = document.getElementById("ai-block");
-      if (aiBlock) {
-        aiScrollBySymbol[symbol] = aiBlock.scrollTop;
-        aiMeta[symbol] = { status: "分析中", ts: Date.now() };
+      aiMeta[key] = { status: "分析中", ts: Date.now() };
+      if (aiBlock && selectedSymbol === symbol && detailPeriod() === period) {
+        aiScrollBySymbol[key] = aiBlock.scrollTop;
         refreshAIBlock(symbol);
       }
-      aiRequestedAt[symbol] = Date.now();
+      aiRequestedAt[key] = Date.now();
       try {
-        const url = `/api/ai/analysis?symbol=${encodeURIComponent(symbol)}${force ? "&force=1" : ""}`;
+        const url = `/api/ai/analysis?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}${force ? "&force=1" : ""}`;
         const response = await apiFetch(url, { cache: "no-store" });
         const data = await response.json();
         if (data.analysis) {
-          saveAIResult(symbol, data.analysis);
-          aiMeta[symbol] = {
+          saveAIResult(symbol, data.analysis, period);
+          aiMeta[key] = {
             status: data.cached ? "使用缓存" : "已更新",
             ts: Date.now()
           };
         } else {
           const reason = data.reason || "暂无分析";
           if (reason === "ai trigger not met") {
-            aiMeta[symbol] = { status: "触发条件未满足", ts: Date.now() };
-            if (aiBlock && selectedSymbol === symbol) refreshAIBlock(symbol);
-            updatedEl.textContent = "AI 触发条件未满足";
+            aiMeta[key] = { status: "触发条件未满足", ts: Date.now() };
+            if (selectedSymbol === symbol && detailPeriod() === period) refreshAIBlock(symbol);
+            updatedEl.textContent = `AI ${periodLabel} 触发条件未满足`;
             return;
           }
           if (reason === "retry cooldown") {
-            aiMeta[symbol] = { status: "冷却中", ts: Date.now() };
+            aiMeta[key] = { status: "冷却中", ts: Date.now() };
           } else {
-            aiMeta[symbol] = { status: reason, ts: Date.now() };
-            aiResults[symbol] = reason;
+            aiMeta[key] = { status: reason, ts: Date.now() };
+            aiResults[key] = reason;
           }
         }
-        if (aiBlock && selectedSymbol === symbol) refreshAIBlock(symbol);
-        updatedEl.textContent = data.cached ? "AI 分析使用缓存" : "AI 分析已更新";
+        if (selectedSymbol === symbol && detailPeriod() === period) refreshAIBlock(symbol);
+        updatedEl.textContent = data.cached ? `AI ${periodLabel} 分析使用缓存` : `AI ${periodLabel} 分析已更新`;
       } catch (error) {
-        if (aiBlock) {
-          aiMeta[symbol] = { status: "AI 请求失败", ts: Date.now() };
+        aiMeta[key] = { status: "AI 请求失败", ts: Date.now() };
+        if (selectedSymbol === symbol && detailPeriod() === period) {
           refreshAIBlock(symbol);
         }
-        updatedEl.textContent = "AI 请求失败";
+        updatedEl.textContent = `AI ${periodLabel} 请求失败`;
       }
     }
 
     function maybeLoadAIAnalysis(symbol) {
-      if (!symbol || aiResults[symbol.symbol]) return;
-      const lastRequested = aiRequestedAt[symbol.symbol] || 0;
+      if (!symbol) return;
+      const period = detailPeriod();
+      const key = aiAnalysisKey(symbol.symbol, period);
+      if (aiResults[key]) return;
+      const lastRequested = aiRequestedAt[key] || 0;
       if (Date.now() - lastRequested < 60000) return;
-      fetchAIAnalysis(symbol.symbol, false);
+      fetchAIAnalysis(symbol.symbol, false, period);
+    }
+
+    function timeframeKey(symbol, period = detailPeriod()) {
+      return `${String(symbol || "").toUpperCase()}::${period}`;
+    }
+
+    function cachedTimeframeAnalysis(symbol, period = detailPeriod()) {
+      return timeframeAnalysisCache[timeframeKey(symbol, period)] || null;
+    }
+
+    async function fetchTimeframeAnalysis(symbol, period = detailPeriod(), force = false) {
+      if (!symbol) return;
+      const key = timeframeKey(symbol, period);
+      if (!force && timeframeMeta[key] && timeframeMeta[key].loading) return;
+      timeframeMeta[key] = { loading: true, error: "", ts: Date.now() };
+      timeframeRequestedAt[key] = Date.now();
+      if (selectedSymbol === symbol && detailPeriod() === period) renderDetail(lastSymbols);
+      try {
+        const url = `/api/timeframe?symbol=${encodeURIComponent(symbol)}&period=${encodeURIComponent(period)}${force ? "&force=1" : ""}`;
+        const response = await apiFetch(url, { cache: "no-store" });
+        const data = await response.json();
+        if (!response.ok || !data.ok || !data.analysis) {
+          throw new Error(data.error || "周期分析失败");
+        }
+        timeframeAnalysisCache[key] = data.analysis;
+        timeframeMeta[key] = { loading: false, error: "", ts: Date.now() };
+      } catch (error) {
+        timeframeMeta[key] = {
+          loading: false,
+          error: error && error.message ? error.message : "周期分析失败",
+          ts: Date.now()
+        };
+      }
+      if (selectedSymbol === symbol && detailPeriod() === period) renderDetail(lastSymbols);
+    }
+
+    function maybeLoadTimeframeAnalysis(symbol, force = false) {
+      if (!symbol) return;
+      const period = detailPeriod();
+      if (period === "realtime") return;
+      const key = timeframeKey(symbol, period);
+      const cached = timeframeAnalysisCache[key];
+      const lastRequested = timeframeRequestedAt[key] || 0;
+      if (!force && cached && Date.now() - Number(cached.generated_at || 0) * 1000 < 30000) return;
+      if (!force && Date.now() - lastRequested < 4000) return;
+      fetchTimeframeAnalysis(symbol, period, force);
+    }
+
+    function periodButton(period) {
+      return `<button class="period-btn ${detailPeriod() === period ? "active" : ""}" data-detail-period="${esc(period)}" type="button">${esc(detailPeriodLabel(period))}</button>`;
+    }
+
+    function renderPeriodFloatingSwitch() {
+      return `
+        <div class="period-floating">
+          <div class="period-floating-title">周期</div>
+          <div class="period-switch">
+            ${DETAIL_PERIOD_OPTIONS.map((item) => periodButton(item)).join("")}
+          </div>
+        </div>
+      `;
+    }
+
+    function timeframeStatusText(meta, data) {
+      if (meta && meta.loading) return "正在拉取交易所原生 K 线...";
+      if (meta && meta.error) return meta.error;
+      if (!data) return "等待加载周期分析";
+      const source = String(data.exchange || "").startsWith("okx") ? "OKX" : "Binance";
+      const stamp = data.generated_at ? new Date(Number(data.generated_at) * 1000).toLocaleTimeString() : "";
+      const forming = data.candle_confirmed ? "已收线" : "进行中";
+      return `${source} ${data.period_label || detailPeriod()} K 线 · ${forming}${stamp ? ` · ${stamp}` : ""}`;
+    }
+
+    function timeframeNarrative(data) {
+      if (!data) return "选择周期后会基于交易所原生 K 线生成当前区间分析。";
+      const state = structureState(data);
+      const move = Number(data.price_move_pct || 0);
+      const volume = Number(data.volume_multiplier || 0);
+      const support = fmtPriceLevel(data.support_price);
+      const resistance = fmtPriceLevel(data.resistance_price);
+      if (move >= 1 && volume >= 1.5) {
+        return `${data.period_label} 周期里价格正向推动明显，且量能高于近邻均值；短线重点看 ${resistance} 一带能否被继续放量站上。`;
+      }
+      if (move <= -1 && volume >= 1.5) {
+        return `${data.period_label} 周期里下行动能偏强，且放量配合明显；除非快速收回 VWAP，否则更像压力主导。`;
+      }
+      if (state === "贴近支撑") {
+        return `当前更贴近 ${data.period_label} 支撑 ${support}，若后续继续缩量不破，反抽观察价值会更高。`;
+      }
+      if (state === "贴近压力") {
+        return `当前更贴近 ${data.period_label} 压力 ${resistance}，若无进一步放量，先防冲高回落。`;
+      }
+      return `${data.period_label} 周期暂时更像区间内波动，先观察价格是回归 VWAP，还是继续向 ${resistance} / ${support} 其中一侧扩张。`;
+    }
+
+    function renderTimeframeSection(symbol) {
+      const period = detailPeriod();
+      const header = `
+        <div class="period-head">
+          <div>
+            <div class="detail-title">周期视图</div>
+            <div class="period-meta">查看当前周期下的价格、量能、结构、标记价与实时补充。</div>
+          </div>
+        </div>
+      `;
+      if (period === "realtime") {
+        const updatedAt = Number(symbol.updated_at || 0);
+        const stamp = updatedAt > 0
+          ? new Date(updatedAt > 1e12 ? updatedAt : updatedAt * 1000).toLocaleTimeString()
+          : "";
+        const realtimeStatus = hasCoreTradeData(symbol)
+          ? `实时成交流 / OI / 盘口补充${stamp ? ` · ${stamp}` : ""}`
+          : "等待实时成交与盘口稳定";
+        return `
+          <section class="period-section">
+            ${header}
+            <div class="period-status">${esc(realtimeStatus)}</div>
+            ${renderRealtimeSupplement(symbol)}
+          </section>
+        `;
+      }
+      const key = timeframeKey(symbol.symbol, period);
+      const meta = timeframeMeta[key] || null;
+      const data = cachedTimeframeAnalysis(symbol.symbol, period);
+      maybeLoadTimeframeAnalysis(symbol.symbol, false);
+      const statusText = timeframeStatusText(meta, data);
+      const statusClass = meta && meta.error ? "period-status error" : "period-status";
+      if (!data) {
+        return `
+          <section class="period-section">
+            ${header}
+            <div class="${statusClass}">${esc(statusText)}</div>
+            <div class="detail-placeholder">当前还没有拿到 ${esc(period)} 周期分析，稍等片刻或点右上时间按钮重试。</div>
+          </section>
+        `;
+      }
+      const priceTone = valueClass(data.price_move_pct);
+      const markTone = valueClass(data.mark_move_pct);
+      const priceChart = lineChartSvg(data.price_series || [], priceTone);
+      const volumeChart = barChartSvg(data.volume_series || [], Number(data.volume_multiplier || 0) >= 1 ? "blue" : "mixed");
+      const markChart = (data.mark_price_series || []).length >= 2
+        ? lineChartSvg(data.mark_price_series, markTone)
+        : chartEmptyHtml("标记价序列不足");
+      return `
+        <section class="period-section">
+          ${header}
+          <div class="${statusClass}">
+            ${esc(statusText)}
+            <button class="inline-link" id="period-refresh-btn" type="button" style="margin-left:8px">刷新</button>
+          </div>
+          <div class="period-summary">
+            <div class="period-pill">
+              <div class="period-pill-label">${esc(data.period_label)} 涨跌</div>
+              <div class="period-pill-value ${priceTone}">${fmtPctMaybe(data.price_move_pct, true)}</div>
+            </div>
+            <div class="period-pill">
+              <div class="period-pill-label">相对前收</div>
+              <div class="period-pill-value ${valueClass(data.prev_close_pct)}">${fmtPctMaybe(data.prev_close_pct, true)}</div>
+            </div>
+            <div class="period-pill">
+              <div class="period-pill-label">量能 / 均值</div>
+              <div class="period-pill-value ${Number(data.volume_multiplier || 0) >= 1.5 ? "up" : "muted"}">${fmtNumber(data.volume_multiplier, 2)}x</div>
+            </div>
+            <div class="period-pill">
+              <div class="period-pill-label">标记价偏离</div>
+              <div class="period-pill-value ${valueClass(data.mark_premium_bps)}">${data.mark_premium_bps === null || data.mark_premium_bps === undefined ? "--" : `${fmtSignedNumber(data.mark_premium_bps, 1)} bps`}</div>
+            </div>
+          </div>
+          <div class="visual-grid">
+            ${chartCard(`${data.period_label} 价格轨迹`, fmtPctMaybe(data.price_move_pct, true), priceChart, "span-2")}
+            ${chartCard(`${data.period_label} 成交额`, `${fmtNumber(data.quote_volume, 0)} USDT`, volumeChart)}
+            ${chartCard(`${data.period_label} 标记价`, data.mark_move_pct === null || data.mark_move_pct === undefined ? mutedValue() : fmtPctMaybe(data.mark_move_pct, true), markChart)}
+          </div>
+          <div class="metric-grid compact" style="margin-top:12px">
+            <div class="metric"><div class="metric-label">支撑位</div><div class="metric-value up">${fmtPriceLevel(data.support_price)}</div><div class="metric-copy">距现价 ${fmtPlainPct(data.support_distance_pct, 2)}</div></div>
+            <div class="metric"><div class="metric-label">压力位</div><div class="metric-value down">${fmtPriceLevel(data.resistance_price)}</div><div class="metric-copy">距现价 ${fmtPlainPct(data.resistance_distance_pct, 2)}</div></div>
+            <div class="metric"><div class="metric-label">VWAP</div><div class="metric-value ${valueClass(data.vwap_deviation_pct)}">${fmtPriceLevel(data.window_vwap)}</div><div class="metric-copy">偏离 ${fmtPlainPct(data.vwap_deviation_pct, 3)}</div></div>
+            <div class="metric"><div class="metric-label">区间位置</div><div class="metric-value">${fmtPlainPct(data.range_position_pct, 1)}</div><div class="metric-copy">${esc(structureState(data))}</div></div>
+          </div>
+          <div class="period-note">${esc(timeframeNarrative(data))}</div>
+        </section>
+      `;
     }
 
     detailEl.addEventListener("click", (event) => {
@@ -4938,13 +5509,24 @@ INDEX_HTML = """<!doctype html>
         renderDetail(lastSymbols);
         return;
       }
+      const periodButton = event.target.closest("[data-detail-period]");
+      if (periodButton && selectedSymbol) {
+        setDetailPeriod(periodButton.dataset.detailPeriod);
+        maybeLoadTimeframeAnalysis(selectedSymbol, false);
+        renderDetail(lastSymbols);
+        return;
+      }
       if (event.target.id === "ai-refresh-btn" && selectedSymbol) {
         fetchAIAnalysis(selectedSymbol, true);
+        return;
+      }
+      if (event.target.id === "period-refresh-btn" && selectedSymbol) {
+        fetchTimeframeAnalysis(selectedSymbol, detailPeriod(), true);
       }
     });
     detailEl.addEventListener("scroll", (event) => {
       if (event.target && event.target.id === "ai-block" && selectedSymbol) {
-        aiScrollBySymbol[selectedSymbol] = event.target.scrollTop;
+        aiScrollBySymbol[aiAnalysisKey(selectedSymbol)] = event.target.scrollTop;
         noteAIInteraction();
       }
     }, true);

@@ -13,6 +13,7 @@ class MarketMicrostructureState:
         symbols: list[str],
         liquidations_enabled: bool = True,
         liquidation_feed_mode: str = "stream",
+        liquidation_retention_seconds: int = 86400,
     ) -> None:
         self._depth: dict[str, dict[str, float]] = {}
         self._depth_history: dict[str, deque[tuple[float, float]]] = {}
@@ -22,6 +23,7 @@ class MarketMicrostructureState:
         self._last_liquidation_feed_at: dict[str, float] = {}
         self.liquidations_enabled = liquidations_enabled
         self.liquidation_feed_mode = liquidation_feed_mode
+        self.liquidation_retention_seconds = max(int(liquidation_retention_seconds), 75)
         self.set_symbols(symbols)
 
     def set_symbols(self, symbols: list[str]) -> None:
@@ -126,7 +128,7 @@ class MarketMicrostructureState:
             self._last_liquidation_feed_at.get(symbol, 0.0),
             event_time,
         )
-        cutoff = event_time - 75
+        cutoff = event_time - self.liquidation_retention_seconds
         while queue and float(queue[0]["event_time"]) < cutoff:
             queue.popleft()
 
@@ -143,9 +145,10 @@ class MarketMicrostructureState:
         last_liquidation_feed_at = float(self._last_liquidation_feed_at.get(symbol, 0.0))
 
         cutoff = now - 60
+        retention_cutoff = now - self.liquidation_retention_seconds
         while depth_history and depth_history[0][0] < cutoff:
             depth_history.popleft()
-        while liquidations and float(liquidations[0]["event_time"]) < cutoff:
+        while liquidations and float(liquidations[0]["event_time"]) < retention_cutoff:
             liquidations.popleft()
 
         current_depth = float(depth.get("depth_total_notional", 0.0))
@@ -156,7 +159,11 @@ class MarketMicrostructureState:
 
         long_liquidation_quote_1m = 0.0
         short_liquidation_quote_1m = 0.0
+        liquidation_event_count_1m = 0
         for item in liquidations:
+            if float(item["event_time"]) < cutoff:
+                continue
+            liquidation_event_count_1m += 1
             quote_quantity = float(item["quote_quantity"])
             # SELL forced orders usually correspond to long liquidation unwinds.
             if str(item["side"]).upper() == "SELL":
@@ -178,7 +185,6 @@ class MarketMicrostructureState:
             if depth_age_seconds is not None and depth_age_seconds <= 20
             else "unavailable"
         )
-        liquidation_event_count_1m = len(liquidations)
         liquidation_feed_age_seconds = (
             now - last_liquidation_feed_at if last_liquidation_feed_at else None
         )
@@ -217,6 +223,65 @@ class MarketMicrostructureState:
             "microstructure_status": microstructure_status,
             "depth_data_age_seconds": depth_age_seconds,
             "last_liquidation_age_seconds": last_liquidation_age_seconds,
+        }
+
+    def liquidation_summary(self, symbol: str, seconds: int, now: float | None = None) -> dict[str, Any]:
+        symbol = symbol.upper()
+        now = float(now or 0) or max(
+            self._last_depth_at.get(symbol, 0.0),
+            self._last_liquidation_feed_at.get(symbol, 0.0),
+        )
+        if now <= 0:
+            return {
+                "period_liquidation_data_status": "unavailable",
+                "period_liquidation_event_count": 0,
+                "period_long_liquidation_quote": 0.0,
+                "period_short_liquidation_quote": 0.0,
+                "period_liquidation_total_quote": 0.0,
+                "period_liquidation_imbalance": 0.0,
+            }
+
+        seconds = max(int(seconds), 60)
+        cutoff = now - seconds
+        liquidations = self._liquidations.get(symbol, deque())
+        last_depth_at = float(self._last_depth_at.get(symbol, 0.0))
+        last_liquidation_feed_at = float(self._last_liquidation_feed_at.get(symbol, 0.0))
+
+        if self.liquidation_feed_mode == "poll":
+            feed_active = now - last_liquidation_feed_at <= 45 if last_liquidation_feed_at else False
+        else:
+            feed_active = now - last_depth_at <= 20 if last_depth_at else False
+
+        long_quote = 0.0
+        short_quote = 0.0
+        event_count = 0
+        for item in liquidations:
+            event_time = float(item["event_time"])
+            if event_time < cutoff or event_time > now:
+                continue
+            event_count += 1
+            quote_quantity = float(item["quote_quantity"])
+            if str(item["side"]).upper() == "SELL":
+                long_quote += quote_quantity
+            else:
+                short_quote += quote_quantity
+
+        total_quote = long_quote + short_quote
+        imbalance = (short_quote - long_quote) / total_quote if total_quote else 0.0
+        if not self.liquidations_enabled or not feed_active:
+            status = "unavailable"
+        elif event_count:
+            status = "recent_event"
+        else:
+            status = "no_recent_event"
+
+        return {
+            "period_liquidation_data_status": status,
+            "period_liquidation_event_count": event_count,
+            "period_long_liquidation_quote": round(long_quote, 2),
+            "period_short_liquidation_quote": round(short_quote, 2),
+            "period_liquidation_total_quote": round(total_quote, 2),
+            "period_liquidation_imbalance": round(imbalance, 4),
         }
 
 

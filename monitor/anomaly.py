@@ -30,6 +30,7 @@ class AnomalyEvent:
     confidence: float
     reasons: tuple[str, ...]
     suggestions: tuple[str, ...]
+    event_time: float = 0.0
     ai_analysis: str = ""
     ai_summary: tuple[str, ...] = ()
 
@@ -264,6 +265,7 @@ class AnomalyDetector:
             score=round(metrics["score"], 1),
             direction=metrics["direction"],
             price=metrics["latest_price"],
+            event_time=now,
             price_move_pct_1m=round(metrics["price_move_pct_1m"], 3),
             price_move_pct_5m=round(metrics["price_move_pct_5m"], 3),
             quote_volume_1m=round(metrics["quote_volume_1m"], 2),

@@ -63,6 +63,13 @@ class AIAnalyzer:
         self.retry_cooldown = int(config.get("retry_cooldown_seconds", 120))
         self.request_timeout = int(config.get("request_timeout_seconds", 30))
 
+    @staticmethod
+    def _cache_key(symbol: str, period: str | None = None) -> str:
+        normalized_symbol = str(symbol or "").upper()
+        if not period:
+            return normalized_symbol
+        return f"{normalized_symbol}::{period}"
+
     def _normalize_triggers(self, config: dict) -> dict:
         return normalize_trigger_rules(
             config.get("triggers"),
@@ -77,9 +84,9 @@ class AIAnalyzer:
             self._last_attempt.clear()
             self._last_error = None
 
-    def get_cached(self, symbol: str) -> str | None:
+    def get_cached(self, symbol: str, period: str | None = None) -> str | None:
         with self._lock:
-            entry = self._cache.get(symbol)
+            entry = self._cache.get(self._cache_key(symbol, period))
             if entry and time() - entry[0] < self.cache_ttl:
                 return entry[1]
             return None
@@ -91,7 +98,15 @@ class AIAnalyzer:
     def should_activate(self, snapshot_data: dict) -> bool:
         return evaluate_trigger_rules(self.triggers, snapshot_data)
 
-    async def analyze(self, symbol: str, snapshot_data: dict, force: bool = False) -> str | None:
+    async def analyze(
+        self,
+        symbol: str,
+        snapshot_data: dict,
+        *,
+        timeframe_data: dict | None = None,
+        period: str | None = None,
+        force: bool = False,
+    ) -> str | None:
         if not self.enabled:
             with self._lock:
                 self._last_error = "ai disabled"
@@ -106,24 +121,25 @@ class AIAnalyzer:
                 self._last_error = "ai trigger not met"
             return None
 
-        cached = self.get_cached(symbol)
+        cache_key = self._cache_key(symbol, period)
+        cached = self.get_cached(symbol, period)
         if cached and not force:
             return cached
 
         now = time()
         with self._lock:
-            last_attempt = self._last_attempt.get(symbol)
+            last_attempt = self._last_attempt.get(cache_key)
             if not force and last_attempt and now - last_attempt < self.retry_cooldown:
                 self._last_error = "retry cooldown"
                 return None
-            self._last_attempt[symbol] = now
+            self._last_attempt[cache_key] = now
 
         with self._lock:
             self._last_error = None
-        result = await asyncio.to_thread(self._call_api, snapshot_data)
+        result = await asyncio.to_thread(self._call_api, snapshot_data, timeframe_data, period)
         if result:
             with self._lock:
-                self._cache[symbol] = (time(), result)
+                self._cache[cache_key] = (time(), result)
         return result
 
     async def answer_question(
@@ -150,9 +166,9 @@ class AIAnalyzer:
             available_symbols or [],
         )
 
-    def _call_api(self, data: dict) -> str | None:
+    def _call_api(self, data: dict, timeframe_data: dict | None = None, period: str | None = None) -> str | None:
         try:
-            prompt = self._build_prompt(data)
+            prompt = self._build_prompt(data, timeframe_data, period)
             return self._call_prompt(prompt)
         except Exception as exc:
             with self._lock:
@@ -202,7 +218,7 @@ class AIAnalyzer:
         base = self._resolve_base_url() or "https://api.openai.com/v1"
         return f"{base}/chat/completions"
 
-    def _build_prompt(self, data: dict) -> str:
+    def _build_prompt(self, data: dict, timeframe_data: dict | None = None, period: str | None = None) -> str:
         liquidation_status = {
             "recent_event": "近1分钟有强平事件",
             "no_recent_event": "数据流活跃，近1分钟无强平事件",
@@ -212,6 +228,56 @@ class AIAnalyzer:
             "active": "盘口/强平流活跃",
             "unavailable": "盘口/强平流不可用",
         }.get(str(data.get("microstructure_status") or "unavailable"), "未知")
+        timeframe_section = ""
+        period_focus = ""
+        if timeframe_data:
+            selected_period = str(timeframe_data.get("period_label") or period or "当前周期")
+            candle_state = "已收线" if timeframe_data.get("candle_confirmed") else "进行中"
+            mark_move = timeframe_data.get("mark_move_pct")
+            mark_premium = timeframe_data.get("mark_premium_bps")
+            mark_move_text = "--" if mark_move is None else f"{float(mark_move):+.3f}%"
+            mark_premium_text = "--" if mark_premium is None else f"{float(mark_premium):+.2f} bps"
+            period_liquidation_status = {
+                "recent_event": "周期内有强平",
+                "no_recent_event": "周期内无强平记录",
+                "unavailable": "强平流不可用",
+            }.get(
+                str(timeframe_data.get("period_liquidation_data_status") or "unavailable"),
+                "未知",
+            )
+            timeframe_section = (
+                "\n当前选中周期数据（请作为主视角）：\n"
+                f"- 分析周期: {selected_period}\n"
+                f"- K线状态: {candle_state}\n"
+                f"- 周期开盘: {timeframe_data.get('open_price')}\n"
+                f"- 周期最高: {timeframe_data.get('high_price')}\n"
+                f"- 周期最低: {timeframe_data.get('low_price')}\n"
+                f"- 周期收盘/最新价: {timeframe_data.get('price')}\n"
+                f"- 周期涨跌: {float(timeframe_data.get('price_move_pct', 0)):+.3f}%\n"
+                f"- 相对前收: {float(timeframe_data.get('prev_close_pct', 0)):+.3f}%\n"
+                f"- 周期成交额: {float(timeframe_data.get('quote_volume', 0)):,.0f} USDT\n"
+                f"- 周期量能倍数: {float(timeframe_data.get('volume_multiplier', 0)):.2f}x\n"
+                f"- 周期支撑: {timeframe_data.get('support_price')}\n"
+                f"- 周期压力: {timeframe_data.get('resistance_price')}\n"
+                f"- 周期VWAP: {timeframe_data.get('window_vwap')}\n"
+                f"- 偏离VWAP: {float(timeframe_data.get('vwap_deviation_pct', 0)):+.3f}%\n"
+                f"- 距支撑: {float(timeframe_data.get('support_distance_pct', 0)):.3f}%\n"
+                f"- 距压力: {float(timeframe_data.get('resistance_distance_pct', 0)):.3f}%\n"
+                f"- 区间位置: {float(timeframe_data.get('range_position_pct', 0)):.2f}%\n"
+                f"- 标记价涨跌: {mark_move_text}\n"
+                f"- 标记价偏离: {mark_premium_text}\n"
+                f"- 周期强平状态: {period_liquidation_status}\n"
+                f"- 周期多头爆仓: {float(timeframe_data.get('period_long_liquidation_quote', 0)):,.0f} USDT\n"
+                f"- 周期空头爆仓: {float(timeframe_data.get('period_short_liquidation_quote', 0)):,.0f} USDT\n"
+                f"- 周期强平事件数: {int(timeframe_data.get('period_liquidation_event_count') or 0)}\n"
+            )
+            period_focus = (
+                f"本次分析请优先围绕 {selected_period} 周期组织判断，"
+                "实时 1m / 盘口 / 强平数据只作为验证和补充，不要喧宾夺主。"
+            )
+        elif period:
+            period_label = "实时" if period == "realtime" else period
+            period_focus = f"用户当前更关心 {period_label} 档位，请尽量围绕这一档位的驱动、延续性和关键结构组织建议。"
         return (
             f"以下是 {data['symbol']} USDT永续合约的实时监控数据：\n"
             f"- 异常分: {data.get('score', 0)}/100\n"
@@ -237,12 +303,14 @@ class AIAnalyzer:
             f"- 偏离VWAP: {float(data.get('vwap_deviation_pct', 0)):+.3f}%\n"
             f"- 买盘墙: {data.get('bid_wall_price')} / {float(data.get('bid_wall_notional', 0)):,.0f}\n"
             f"- 卖盘墙: {data.get('ask_wall_price')} / {float(data.get('ask_wall_notional', 0)):,.0f}\n"
-            f"- 触发原因: {'; '.join(data.get('reasons', []))}\n\n"
+            f"- 触发原因: {'; '.join(data.get('reasons', []))}\n"
+            f"{timeframe_section}\n"
             "请给出简洁、专业、可操作的建议（3-5条），重点关注：\n"
             "1. 当前行情的核心驱动力\n"
             "2. 短期可能的走势和风险\n"
             "3. 结合支撑/压力、VWAP、盘口墙给出具体观察位\n"
             "4. 对于杠杆交易者的具体操作建议\n"
+            f"{period_focus}"
             "如果爆仓数据状态不可用，不要把爆仓金额为0解读为没有强平压力。"
             "直接给出建议，不要重复数据。每条建议控制在一句话。"
         )
@@ -321,42 +389,52 @@ class AIAnalyzer:
         )
         with urlopen(req, timeout=self.request_timeout) as resp:
             data = json.loads(resp.read())
-            return data["choices"][0]["message"]["content"]
+            text = self._extract_text(data)
+            if not text:
+                raise ValueError(f"missing text in AI response keys: {sorted(data.keys())}")
+            return text
 
     @staticmethod
     def _extract_text(data: dict) -> str | None:
-        if not isinstance(data, dict):
-            return None
-
-        choices = data.get("choices")
-        if isinstance(choices, list) and choices:
-            message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
-            content = message.get("content")
-            if isinstance(content, str):
-                return content
-
-        content = data.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = []
-            for item in content:
-                if isinstance(item, str):
-                    parts.append(item)
-                elif isinstance(item, dict):
-                    for key in ("text", "content", "message"):
-                        value = item.get(key)
-                        if isinstance(value, str) and value.strip():
-                            parts.append(value)
-                            break
-            if parts:
-                return "\n".join(parts)
-
-        for key in ("text", "message", "output"):
-            value = data.get(key)
+        def collect(value, parts: list[str]) -> None:
             if isinstance(value, str):
-                return value
-        return None
+                text = value.strip()
+                if text:
+                    parts.append(text)
+                return
+            if isinstance(value, list):
+                for item in value:
+                    collect(item, parts)
+                return
+            if not isinstance(value, dict):
+                return
+
+            choices = value.get("choices")
+            if isinstance(choices, list):
+                collect(choices, parts)
+            message = value.get("message")
+            if isinstance(message, (dict, list, str)):
+                collect(message, parts)
+            content = value.get("content")
+            if isinstance(content, (dict, list, str)):
+                collect(content, parts)
+            for key in ("text", "output_text", "message", "output"):
+                item = value.get(key)
+                if isinstance(item, (dict, list, str)):
+                    collect(item, parts)
+
+        parts: list[str] = []
+        collect(data, parts)
+        if not parts:
+            return None
+        deduped = []
+        seen = set()
+        for part in parts:
+            if part in seen:
+                continue
+            deduped.append(part)
+            seen.add(part)
+        return "\n".join(deduped)
 
     def _call_anthropic(self, prompt: str) -> str | None:
         payload = json.dumps({
