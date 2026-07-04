@@ -138,12 +138,47 @@ class TimeframeAnalysisTests(unittest.TestCase):
         self.assertEqual(result["high_series"], [102.0, 106.0, 108.0])
         self.assertIn(result["support_price"], result["low_series"])
         self.assertIn(result["resistance_price"], result["high_series"])
-        self.assertEqual(result["support_source"], "low")
-        self.assertEqual(result["resistance_source"], "high")
+        self.assertEqual(result["period_low_price"], 99.0)
+        self.assertEqual(result["period_high_price"], 108.0)
+        self.assertEqual(result["support_source"], "range_low")
+        self.assertEqual(result["resistance_source"], "range_high")
         self.assertAlmostEqual(result["mark_price"], 106.6)
         self.assertAlmostEqual(result["mark_premium_bps"], -37.383, places=3)
         self.assertEqual(len(result["price_series"]), 3)
         self.assertEqual(len(result["mark_price_series"]), 3)
+
+    def test_timeframe_analysis_prefers_confirmed_structure_over_far_wick(self) -> None:
+        lows = [104, 102, 103, 80, 102, 101.8, 102.2, 103, 102.1, 104, 103.8, 105]
+        highs = [112, 114, 113, 111, 115, 114.8, 115.2, 114.9, 116, 115.1, 115.3, 113]
+        price_candles = []
+        for index, (low, high) in enumerate(zip(lows, highs)):
+            close = 110 + (index % 3) * 0.4
+            price_candles.append(
+                {
+                    "open_time": 1000 + index * 300,
+                    "open": close - 0.3,
+                    "high": high,
+                    "low": low,
+                    "close": 112.0 if index == len(lows) - 1 else close,
+                    "base_volume": 10.0 + index,
+                    "quote_volume": (10.0 + index) * close,
+                    "confirmed": index < len(lows) - 1,
+                }
+            )
+
+        result = build_timeframe_analysis(
+            symbol="BNBUSDT",
+            period="5m",
+            exchange="okx_swap",
+            price_candles=price_candles,
+            mark_candles=[],
+        )
+
+        self.assertEqual(result["period_low_price"], 80.0)
+        self.assertGreater(result["support_price"], 100.0)
+        self.assertIn(result["support_source"], {"touch_cluster", "swing_cluster"})
+        self.assertGreater(result["support_touch_count"], 1)
+        self.assertGreater(result["resistance_touch_count"], 1)
 
     def test_build_followup_result_from_native_candles(self) -> None:
         result = build_followup_result(

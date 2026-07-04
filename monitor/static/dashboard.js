@@ -1030,6 +1030,32 @@
       return `距撑 ${supportDistance} / 距压 ${resistanceDistance}`;
     }
 
+    function levelSourceText(source) {
+      const labels = {
+        swing_cluster: "摆动点聚类",
+        touch_cluster: "触碰聚类",
+        range_low: "阶段低点",
+        range_high: "阶段高点",
+        low: "K线低点",
+        high: "K线高点"
+      };
+      return labels[source] || "结构聚类";
+    }
+
+    function levelEvidenceText(data, side) {
+      const source = levelSourceText(data[`${side}_source`]);
+      const touches = Number(data[`${side}_touch_count`] || 0);
+      const pivots = Number(data[`${side}_pivot_count`] || 0);
+      const strength = Number(data[`${side}_strength`] || 0);
+      const sampleCount = Number(data.structure_sample_count || 0);
+      const parts = [source];
+      if (touches > 0) parts.push(`${touches} 次触碰`);
+      if (pivots > 0) parts.push(`${pivots} 个摆动点`);
+      if (strength > 0) parts.push(`强度 ${fmtNumber(strength, 1)}`);
+      if (sampleCount > 0) parts.push(`${sampleCount} 根K线`);
+      return parts.join(" · ");
+    }
+
     function structureNarrative(symbol) {
       const state = structureState(symbol);
       const support = fmtPriceLevel(symbol.support_price);
@@ -1358,7 +1384,7 @@
               </div>
               <div class="range-rail-footer">
                 <div class="rail-stat">
-                  <div class="rail-stat-label">K线最低</div>
+                  <div class="rail-stat-label">结构支撑</div>
                   <div class="rail-stat-value">${fmtPriceLevel(support)}</div>
                 </div>
                 <div class="rail-stat">
@@ -1370,7 +1396,7 @@
                   <div class="rail-stat-value">${fmtPriceLevel(vwap)}</div>
                 </div>
                 <div class="rail-stat">
-                  <div class="rail-stat-label">K线最高</div>
+                  <div class="rail-stat-label">结构压力</div>
                   <div class="rail-stat-value">${fmtPriceLevel(resistance)}</div>
                 </div>
               </div>
@@ -1379,12 +1405,12 @@
               <div class="metric">
                 <div class="metric-label">距支撑</div>
                 <div class="metric-value up">${fmtPlainPct(periodData.support_distance_pct, 2)}</div>
-                <div class="metric-copy">最近 24 根 ${esc(period)} low 的最低值</div>
+                <div class="metric-copy">${esc(levelEvidenceText(periodData, "support"))}</div>
               </div>
               <div class="metric">
                 <div class="metric-label">距压力</div>
                 <div class="metric-value down">${fmtPlainPct(periodData.resistance_distance_pct, 2)}</div>
-                <div class="metric-copy">最近 24 根 ${esc(period)} high 的最高值</div>
+                <div class="metric-copy">${esc(levelEvidenceText(periodData, "resistance"))}</div>
               </div>
               <div class="metric">
                 <div class="metric-label">区间位置</div>
@@ -1397,9 +1423,9 @@
                 <div class="metric-copy">${esc(period)} 均价偏离度</div>
               </div>
               <div class="metric">
-                <div class="metric-label">高低振幅</div>
+                <div class="metric-label">阶段高低</div>
                 <div class="metric-value ${amplitude !== null && amplitude >= 2 ? "mixed" : "muted"}">${amplitude === null ? "--" : fmtPlainPct(amplitude, 2)}</div>
-                <div class="metric-copy">${esc(timeframeCandleStatus(periodData))}</div>
+                <div class="metric-copy">${fmtPriceLevel(periodData.period_low_price)} / ${fmtPriceLevel(periodData.period_high_price)}</div>
               </div>
               <div class="metric">
                 <div class="metric-label">相对前收</div>
@@ -2605,10 +2631,10 @@
             ${chartCard(`${data.period_label} 标记价`, data.mark_move_pct === null || data.mark_move_pct === undefined ? mutedValue() : fmtPctMaybe(data.mark_move_pct, true), markChart)}
           </div>
           <div class="metric-grid compact" style="margin-top:12px">
-            <div class="metric"><div class="metric-label">K线最低</div><div class="metric-value up">${fmtPriceLevel(data.support_price)}</div><div class="metric-copy">距现价 ${fmtPlainPct(data.support_distance_pct, 2)}</div></div>
-            <div class="metric"><div class="metric-label">K线最高</div><div class="metric-value down">${fmtPriceLevel(data.resistance_price)}</div><div class="metric-copy">距现价 ${fmtPlainPct(data.resistance_distance_pct, 2)}</div></div>
+            <div class="metric"><div class="metric-label">结构支撑</div><div class="metric-value up">${fmtPriceLevel(data.support_price)}</div><div class="metric-copy">${esc(levelEvidenceText(data, "support"))}</div></div>
+            <div class="metric"><div class="metric-label">结构压力</div><div class="metric-value down">${fmtPriceLevel(data.resistance_price)}</div><div class="metric-copy">${esc(levelEvidenceText(data, "resistance"))}</div></div>
             <div class="metric"><div class="metric-label">VWAP</div><div class="metric-value ${valueClass(data.vwap_deviation_pct)}">${fmtPriceLevel(data.window_vwap)}</div><div class="metric-copy">偏离 ${fmtPlainPct(data.vwap_deviation_pct, 3)}</div></div>
-            <div class="metric"><div class="metric-label">区间位置</div><div class="metric-value">${fmtPlainPct(data.range_position_pct, 1)}</div><div class="metric-copy">${esc(structureState(data))}</div></div>
+            <div class="metric"><div class="metric-label">阶段高低</div><div class="metric-value">${fmtPriceLevel(data.period_low_price)} / ${fmtPriceLevel(data.period_high_price)}</div><div class="metric-copy">${esc(structureState(data))}</div></div>
           </div>
           <div class="period-note">${esc(timeframeNarrative(data))}</div>
         </section>

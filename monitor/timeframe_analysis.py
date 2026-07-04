@@ -14,6 +14,8 @@ TIMEFRAME_CONFIG = {
     "1d": {"binance": "1d", "okx": "1Dutc", "seconds": 86400},
 }
 
+STRUCTURE_LOOKBACK_LIMIT = 96
+
 FOLLOWUP_INTERVALS = (
     (60, "1m", "1m", 60),
     (240, "5m", "5m", 300),
@@ -49,6 +51,166 @@ def _range_position_pct(price: float, support: float, resistance: float) -> floa
     if price <= 0 or support <= 0 or resistance <= support:
         return 50.0
     return min(100.0, max(0.0, ((price - support) / (resistance - support)) * 100))
+
+
+def _level_distance_pct(price: float, level: float) -> float:
+    if price <= 0 or level <= 0:
+        return 0.0
+    return abs(price / level - 1) * 100
+
+
+def _average_range_pct(candles: list[dict]) -> float:
+    samples = []
+    for candle in candles:
+        high = float(candle["high"])
+        low = float(candle["low"])
+        close = float(candle["close"])
+        if close > 0 and high >= low:
+            samples.append((high - low) / close * 100)
+    return mean(samples) if samples else 0.0
+
+
+def _is_pivot(candles: list[dict], index: int, key: str, low: bool) -> bool:
+    left = candles[max(0, index - 2):index]
+    right = candles[index + 1:index + 3]
+    if not left or not right:
+        return False
+    value = float(candles[index][key])
+    neighbors = [float(item[key]) for item in [*left, *right]]
+    return value <= min(neighbors) if low else value >= max(neighbors)
+
+
+def _cluster_levels(candidates: list[dict], tolerance_pct: float) -> list[dict]:
+    if not candidates:
+        return []
+
+    clusters = []
+    for candidate in sorted(candidates, key=lambda item: item["level"]):
+        level = float(candidate["level"])
+        matched = None
+        for cluster in clusters:
+            if _level_distance_pct(float(cluster["anchor_level"]), level) <= tolerance_pct:
+                matched = cluster
+                break
+        if matched is None:
+            matched = {
+                "anchor_level": level,
+                "levels": [],
+                "weights": [],
+                "pivot_count": 0,
+                "touch_count": 0,
+                "quote_volume": 0.0,
+                "latest_index": 0,
+                "open_time": candidate["open_time"],
+            }
+            clusters.append(matched)
+        weight = max(float(candidate.get("quote_volume") or 0), 1.0)
+        matched["levels"].append(level)
+        matched["weights"].append(weight)
+        weight_sum = sum(matched["weights"]) or 1.0
+        matched["anchor_level"] = sum(
+            item_level * item_weight
+            for item_level, item_weight in zip(matched["levels"], matched["weights"])
+        ) / weight_sum
+        matched["touch_count"] += 1
+        matched["pivot_count"] += 1 if candidate.get("pivot") else 0
+        matched["quote_volume"] += float(candidate.get("quote_volume") or 0)
+        if int(candidate["index"]) >= int(matched["latest_index"]):
+            matched["latest_index"] = int(candidate["index"])
+            matched["open_time"] = candidate["open_time"]
+
+    output = []
+    for cluster in clusters:
+        weight_sum = sum(cluster["weights"]) or 1.0
+        output.append(
+            {
+                "level": sum(level * weight for level, weight in zip(cluster["levels"], cluster["weights"])) / weight_sum,
+                "pivot_count": int(cluster["pivot_count"]),
+                "touch_count": int(cluster["touch_count"]),
+                "quote_volume": float(cluster["quote_volume"]),
+                "latest_index": int(cluster["latest_index"]),
+                "open_time": float(cluster["open_time"]),
+            }
+        )
+    return output
+
+
+def _select_structure_level(candles: list[dict], price: float, support: bool) -> dict:
+    key = "low" if support else "high"
+    fallback = (
+        min(candles, key=lambda item: float(item["low"]))
+        if support
+        else max(candles, key=lambda item: float(item["high"]))
+    )
+    fallback_source = "range_low" if support else "range_high"
+    if len(candles) < 6 or price <= 0:
+        return {
+            "price": float(fallback[key]),
+            "open_time": float(fallback["open_time"]),
+            "source": fallback_source,
+            "touch_count": 1,
+            "pivot_count": 0,
+            "strength": 0.0,
+            "tolerance_pct": 0.0,
+        }
+
+    candidates = []
+    for index, candle in enumerate(candles):
+        candidates.append(
+            {
+                "level": float(candle[key]),
+                "quote_volume": float(candle.get("quote_volume") or 0),
+                "open_time": float(candle["open_time"]),
+                "index": index,
+                "pivot": _is_pivot(candles, index, key, low=support),
+            }
+        )
+
+    tolerance_pct = min(max(_average_range_pct(candles) * 0.45, 0.12), 0.9)
+    clusters = _cluster_levels(candidates, tolerance_pct)
+    if support:
+        directional = [cluster for cluster in clusters if float(cluster["level"]) <= price]
+    else:
+        directional = [cluster for cluster in clusters if float(cluster["level"]) >= price]
+
+    if not directional:
+        return {
+            "price": float(fallback[key]),
+            "open_time": float(fallback["open_time"]),
+            "source": fallback_source,
+            "touch_count": 1,
+            "pivot_count": 0,
+            "strength": 0.0,
+            "tolerance_pct": round(tolerance_pct, 3),
+        }
+
+    max_volume = max((float(cluster["quote_volume"]) for cluster in directional), default=1.0) or 1.0
+    last_index = max(len(candles) - 1, 1)
+
+    def score(cluster: dict) -> float:
+        distance = _level_distance_pct(price, float(cluster["level"]))
+        recency = float(cluster["latest_index"]) / last_index
+        volume_score = float(cluster["quote_volume"]) / max_volume
+        distance_score = max(0.0, 3.0 - distance * 0.35)
+        return (
+            float(cluster["touch_count"]) * 1.7
+            + float(cluster["pivot_count"]) * 2.2
+            + volume_score * 1.4
+            + recency * 1.1
+            + distance_score
+        )
+
+    selected = max(directional, key=score)
+    source = "swing_cluster" if int(selected["pivot_count"]) > 0 else "touch_cluster"
+    return {
+        "price": float(selected["level"]),
+        "open_time": float(selected["open_time"]),
+        "source": source,
+        "touch_count": int(selected["touch_count"]),
+        "pivot_count": int(selected["pivot_count"]),
+        "strength": round(score(selected), 2),
+        "tolerance_pct": round(tolerance_pct, 3),
+    }
 
 
 def _normalized_exchange(exchange: str) -> str:
@@ -179,7 +341,7 @@ def build_timeframe_analysis(
     if not price_candles:
         raise ValueError("no price candles")
 
-    candles = price_candles[-24:]
+    candles = price_candles[-STRUCTURE_LOOKBACK_LIMIT:]
     current = candles[-1]
     previous = next((item for item in reversed(candles[:-1]) if item.get("confirmed")), None)
     if previous is None and len(candles) >= 2:
@@ -188,8 +350,13 @@ def build_timeframe_analysis(
 
     support_candle = min(candles, key=lambda item: float(item["low"]))
     resistance_candle = max(candles, key=lambda item: float(item["high"]))
-    support_price = float(support_candle["low"])
-    resistance_price = float(resistance_candle["high"])
+    period_low_price = float(support_candle["low"])
+    period_high_price = float(resistance_candle["high"])
+    close_price = float(current["close"])
+    support_level = _select_structure_level(candles, close_price, support=True)
+    resistance_level = _select_structure_level(candles, close_price, support=False)
+    support_price = float(support_level["price"])
+    resistance_price = float(resistance_level["price"])
     base_volume_window = sum(float(item.get("base_volume") or 0) for item in candles)
     quote_volume_window = sum(float(item.get("quote_volume") or 0) for item in candles)
     if base_volume_window > 0 and quote_volume_window > 0:
@@ -206,7 +373,6 @@ def build_timeframe_analysis(
     quote_volume = float(current.get("quote_volume") or 0)
     volume_multiplier = (quote_volume / avg_quote_volume) if avg_quote_volume > 0 else 1.0
 
-    close_price = float(current["close"])
     open_price = float(current["open"])
     high_price = float(current["high"])
     low_price = float(current["low"])
@@ -263,6 +429,8 @@ def build_timeframe_analysis(
         "volume_multiplier": round(volume_multiplier, 2),
         "support_price": round(support_price, 8),
         "resistance_price": round(resistance_price, 8),
+        "period_low_price": round(period_low_price, 8),
+        "period_high_price": round(period_high_price, 8),
         "window_vwap": round(window_vwap, 8),
         "vwap_deviation_pct": round(vwap_deviation_pct, 3),
         "support_distance_pct": round(support_distance_pct, 3),
@@ -272,16 +440,26 @@ def build_timeframe_analysis(
         "low_series": [round(float(item["low"]), 8) for item in candles],
         "high_series": [round(float(item["high"]), 8) for item in candles],
         "volume_series": [round(float(item.get("quote_volume") or 0), 2) for item in candles],
-        "support_open_time": float(support_candle["open_time"]),
-        "resistance_open_time": float(resistance_candle["open_time"]),
-        "support_source": "low",
-        "resistance_source": "high",
+        "support_open_time": float(support_level["open_time"]),
+        "resistance_open_time": float(resistance_level["open_time"]),
+        "period_low_open_time": float(support_candle["open_time"]),
+        "period_high_open_time": float(resistance_candle["open_time"]),
+        "support_source": support_level["source"],
+        "resistance_source": resistance_level["source"],
+        "support_touch_count": support_level["touch_count"],
+        "resistance_touch_count": resistance_level["touch_count"],
+        "support_pivot_count": support_level["pivot_count"],
+        "resistance_pivot_count": resistance_level["pivot_count"],
+        "support_strength": support_level["strength"],
+        "resistance_strength": resistance_level["strength"],
+        "structure_tolerance_pct": max(support_level["tolerance_pct"], resistance_level["tolerance_pct"]),
+        "structure_sample_count": len(candles),
         "mark_price": round(mark_price, 8) if mark_price is not None else None,
         "mark_move_pct": round(mark_move_pct, 3) if mark_move_pct is not None else None,
         "mark_prev_close_pct": round(mark_prev_close_pct, 3) if mark_prev_close_pct is not None else None,
         "mark_premium_bps": round(mark_premium_bps, 3) if mark_premium_bps is not None else None,
         "mark_price_series": (
-            [round(float(item["close"]), 8) for item in mark_candles[-24:]]
+            [round(float(item["close"]), 8) for item in mark_candles[-STRUCTURE_LOOKBACK_LIMIT:]]
             if mark_candles
             else []
         ),
@@ -396,7 +574,7 @@ class TimeframeAnalysisService:
 
     def _fetch_binance_candles(self, symbol: str, interval: str, mark: bool) -> list[dict]:
         endpoint = "markPriceKlines" if mark else "klines"
-        query = urlencode({"symbol": symbol.upper(), "interval": interval, "limit": "24"})
+        query = urlencode({"symbol": symbol.upper(), "interval": interval, "limit": str(STRUCTURE_LOOKBACK_LIMIT)})
         request = Request(
             f"https://fapi.binance.com/fapi/v1/{endpoint}?{query}",
             headers={"User-Agent": "crypto-futures-monitor/0.1"},
@@ -481,7 +659,7 @@ class TimeframeAnalysisService:
             if mark
             else "/api/v5/market/candles"
         )
-        query = urlencode({"instId": _okx_inst_id(symbol), "bar": interval, "limit": "24"})
+        query = urlencode({"instId": _okx_inst_id(symbol), "bar": interval, "limit": str(STRUCTURE_LOOKBACK_LIMIT)})
         request = Request(
             f"https://www.okx.com{path}?{query}",
             headers={
