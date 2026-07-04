@@ -164,6 +164,9 @@ class AnomalyDetector:
     def remove_symbol_threshold(self, symbol: str) -> None:
         self.symbol_thresholds.pop(symbol.upper(), None)
 
+    def update_thresholds(self, thresholds: dict) -> None:
+        self.thresholds = thresholds
+
     def update(self, trade: dict) -> AnomalyEvent | None:
         symbol = trade["symbol"].upper()
         if symbol not in self.windows:
@@ -342,6 +345,11 @@ class AnomalyDetector:
         taker_buy_ratio = buy_volume_1m / quote_volume_1m if quote_volume_1m else 0.5
         price_series_5m, volume_series_5m, oi_series_5m = self._series(window, now)
 
+        liquidation_scoring_enabled = self._threshold_enabled("liquidation_enabled", True)
+        spread_scoring_enabled = self._threshold_enabled("spread_enabled", True)
+        depth_imbalance_scoring_enabled = self._threshold_enabled("depth_imbalance_enabled", True)
+        depth_drop_scoring_enabled = self._threshold_enabled("depth_drop_enabled", True)
+
         score, reasons = self._score(
             price_move_pct_1m=price_move_pct_1m,
             price_move_pct_5m=price_move_pct_5m,
@@ -362,10 +370,10 @@ class AnomalyDetector:
             price_move_pct_5m,
             oi_change_pct_5m,
             funding_rate,
-            long_liquidation_quote_1m,
-            short_liquidation_quote_1m,
-            spread_bps,
-            depth_drop_pct_1m,
+            long_liquidation_quote_1m if liquidation_scoring_enabled else 0,
+            short_liquidation_quote_1m if liquidation_scoring_enabled else 0,
+            spread_bps if spread_scoring_enabled else 0,
+            depth_drop_pct_1m if depth_drop_scoring_enabled else 0,
         )
         risk_level = self._risk_level(score)
         confidence = self._confidence(
@@ -373,8 +381,8 @@ class AnomalyDetector:
             open_interest,
             funding_rate,
             reasons,
-            liquidation_total_quote_1m,
-            spread_bps,
+            liquidation_total_quote_1m if liquidation_scoring_enabled else 0,
+            spread_bps if spread_scoring_enabled else 0,
         )
         suggestions = self._suggestions(
             bias=bias,
@@ -384,10 +392,10 @@ class AnomalyDetector:
             volume_multiplier=volume_multiplier,
             oi_change_pct_5m=oi_change_pct_5m,
             funding_rate=funding_rate,
-            depth_drop_pct_1m=depth_drop_pct_1m,
-            long_liquidation_quote_1m=long_liquidation_quote_1m,
-            short_liquidation_quote_1m=short_liquidation_quote_1m,
-            spread_bps=spread_bps,
+            depth_drop_pct_1m=depth_drop_pct_1m if depth_drop_scoring_enabled else 0,
+            long_liquidation_quote_1m=long_liquidation_quote_1m if liquidation_scoring_enabled else 0,
+            short_liquidation_quote_1m=short_liquidation_quote_1m if liquidation_scoring_enabled else 0,
+            spread_bps=spread_bps if spread_scoring_enabled else 0,
         )
 
         return {
@@ -522,6 +530,10 @@ class AnomalyDetector:
         spread_threshold = float(self.thresholds.get("spread_bps", 4.0))
         depth_imbalance_threshold = float(self.thresholds.get("depth_imbalance_abs", 0.18))
         depth_drop_threshold = float(self.thresholds.get("depth_drop_pct_1m", 18.0))
+        liquidation_enabled = self._threshold_enabled("liquidation_enabled", True)
+        spread_enabled = self._threshold_enabled("spread_enabled", True)
+        depth_imbalance_enabled = self._threshold_enabled("depth_imbalance_enabled", True)
+        depth_drop_enabled = self._threshold_enabled("depth_drop_enabled", True)
 
         if abs(price_move_pct_1m) >= price_1m_threshold:
             score += min(abs(price_move_pct_1m) / price_1m_threshold * 24, 24) * liquidity_factor
@@ -552,7 +564,7 @@ class AnomalyDetector:
             reasons.append(f"资金费率{side} {funding_rate:.4%}")
 
         liquidation_total_quote_1m = long_liquidation_quote_1m + short_liquidation_quote_1m
-        if liquidation_total_quote_1m >= liquidation_threshold:
+        if liquidation_enabled and liquidation_total_quote_1m >= liquidation_threshold:
             score += min(liquidation_total_quote_1m / liquidation_threshold * 16, 16)
             if long_liquidation_quote_1m > short_liquidation_quote_1m * 1.2:
                 reasons.append(f"多头爆仓放大 {long_liquidation_quote_1m:,.0f} USDT")
@@ -561,18 +573,18 @@ class AnomalyDetector:
             else:
                 reasons.append(f"双向爆仓放大 {liquidation_total_quote_1m:,.0f} USDT")
 
-        if spread_bps >= spread_threshold:
+        if spread_enabled and spread_bps >= spread_threshold:
             score += min(spread_bps / spread_threshold * 8, 8)
             reasons.append(f"盘口点差扩大 {spread_bps:.2f} bps")
 
-        if abs(depth_imbalance) >= depth_imbalance_threshold:
+        if depth_imbalance_enabled and abs(depth_imbalance) >= depth_imbalance_threshold:
             score += min(abs(depth_imbalance) / depth_imbalance_threshold * 6, 6)
             if depth_imbalance > 0:
                 reasons.append(f"买盘深度占优 {depth_imbalance:+.2f}")
             else:
                 reasons.append(f"卖盘深度占优 {depth_imbalance:+.2f}")
 
-        if depth_drop_pct_1m >= depth_drop_threshold:
+        if depth_drop_enabled and depth_drop_pct_1m >= depth_drop_threshold:
             score += min(depth_drop_pct_1m / depth_drop_threshold * 12, 12)
             reasons.append(f"盘口深度下降 {depth_drop_pct_1m:.1f}%")
 
@@ -580,6 +592,12 @@ class AnomalyDetector:
             reasons.append("1分钟成交额偏低，信号降权")
 
         return min(score, 100), reasons
+
+    def _threshold_enabled(self, key: str, default: bool = True) -> bool:
+        value = self.thresholds.get(key, default)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
 
     @staticmethod
     def _pct_change(old_price: float | None, new_price: float) -> float:

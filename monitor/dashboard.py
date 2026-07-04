@@ -60,6 +60,66 @@ def merge_telegram_users(existing_users: list[dict], incoming_users: list[dict])
     return merged
 
 
+SIGNAL_SETTING_FIELDS = {
+    "liquidation": {
+        "enabled_key": "liquidation_enabled",
+        "threshold_key": "liquidation_quote_1m",
+        "default_threshold": 250000,
+    },
+    "spread": {
+        "enabled_key": "spread_enabled",
+        "threshold_key": "spread_bps",
+        "default_threshold": 4.0,
+    },
+    "depth_imbalance": {
+        "enabled_key": "depth_imbalance_enabled",
+        "threshold_key": "depth_imbalance_abs",
+        "default_threshold": 0.18,
+    },
+    "depth_drop": {
+        "enabled_key": "depth_drop_enabled",
+        "threshold_key": "depth_drop_pct_1m",
+        "default_threshold": 18.0,
+    },
+}
+
+
+def _coerce_bool(value, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def signal_settings_response(thresholds: dict) -> dict:
+    settings = {}
+    for key, spec in SIGNAL_SETTING_FIELDS.items():
+        settings[key] = {
+            "enabled": _coerce_bool(thresholds.get(spec["enabled_key"]), True),
+            "threshold": float(
+                thresholds.get(spec["threshold_key"], spec["default_threshold"])
+            ),
+        }
+    return settings
+
+
+def apply_signal_settings(thresholds: dict, payload: dict) -> dict:
+    updated = dict(thresholds)
+    for key, spec in SIGNAL_SETTING_FIELDS.items():
+        raw = payload.get(key, {})
+        if not isinstance(raw, dict):
+            continue
+        if "enabled" in raw:
+            updated[spec["enabled_key"]] = _coerce_bool(raw["enabled"], True)
+        if "threshold" in raw:
+            threshold = float(raw["threshold"])
+            if threshold < 0:
+                raise ValueError(f"{key} threshold must be >= 0")
+            updated[spec["threshold_key"]] = threshold
+    return updated
+
+
 class DashboardServer:
     def __init__(
         self,
@@ -220,6 +280,11 @@ class DashboardServer:
                     )
                     return
 
+                if path == "/api/signal_settings":
+                    thresholds = server_ref.config.get("thresholds", {})
+                    self._send_json(signal_settings_response(thresholds))
+                    return
+
                 if path == "/api/ai/config":
                     ai_cfg = dict(server_ref._get_user_config(self._user_id()).get("ai", {}))
                     if ai_cfg.get("api_key"):
@@ -269,6 +334,10 @@ class DashboardServer:
 
                 if path == "/api/symbol_thresholds":
                     self._handle_symbol_thresholds_post()
+                    return
+
+                if path == "/api/signal_settings":
+                    self._handle_signal_settings_post()
                     return
 
                 if path == "/api/ai/config":
@@ -455,6 +524,22 @@ class DashboardServer:
                             server_ref.config["symbol_thresholds"] = st
                             server_ref._save_config()
                     self._send_json({"ok": True})
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=400)
+
+            def _handle_signal_settings_post(self) -> None:
+                try:
+                    payload = self._read_json()
+                    with server_ref._config_lock:
+                        thresholds = apply_signal_settings(
+                            server_ref.config.get("thresholds", {}),
+                            payload,
+                        )
+                        server_ref.config["thresholds"] = thresholds
+                        if server_ref.detector:
+                            server_ref.detector.update_thresholds(thresholds)
+                        server_ref._save_config()
+                    self._send_json({"ok": True, "settings": signal_settings_response(thresholds)})
                 except Exception as exc:
                     self._send_json({"ok": False, "error": str(exc)}, status=400)
 

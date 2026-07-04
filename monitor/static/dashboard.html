@@ -14,6 +14,7 @@
       <button id="save-symbols" class="save-btn primary">保存监控</button>
       <button id="btn-telegram" class="save-btn" title="推送设置">推送</button>
       <button id="btn-ai" class="save-btn ai" title="AI 设置">AI</button>
+      <button id="btn-signals" class="save-btn" title="信号设置">信号</button>
       <button id="btn-theme" class="save-btn ghost" title="切换主题">白天</button>
       <button id="btn-logout" class="save-btn danger" title="退出登录">退出</button>
     </div>
@@ -134,6 +135,59 @@
         <div class="modal-actions">
           <button class="small-btn secondary" id="close-ai-btn" type="button">关闭</button>
           <button class="small-btn primary" id="ai-save-btn" type="button">保存设置</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="signals-modal">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div class="modal-title">信号评分设置</div>
+        <button id="close-signals-modal" class="modal-close" type="button">x</button>
+      </div>
+      <div class="modal-body">
+        <div class="setting-group">
+          <label>微结构评分链路</label>
+          <div class="signal-grid">
+            <div class="signal-row">
+              <div>
+                <div class="signal-title">爆仓放大</div>
+                <div class="setting-help">控制强平金额是否参与异常分和观察建议。</div>
+              </div>
+              <div class="toggle-wrap"><div class="toggle" id="signal-liquidation-toggle"></div><span class="muted" id="signal-liquidation-label">开启</span></div>
+              <input id="signal-liquidation-threshold" type="number" min="0" value="250000">
+            </div>
+            <div class="signal-row">
+              <div>
+                <div class="signal-title">盘口点差</div>
+                <div class="setting-help">点差扩大通常代表流动性变差或插针风险。</div>
+              </div>
+              <div class="toggle-wrap"><div class="toggle" id="signal-spread-toggle"></div><span class="muted" id="signal-spread-label">开启</span></div>
+              <input id="signal-spread-threshold" type="number" min="0" step="0.1" value="4">
+            </div>
+            <div class="signal-row">
+              <div>
+                <div class="signal-title">盘口失衡</div>
+                <div class="setting-help">买卖盘深度明显偏向一侧时给异常分加权。</div>
+              </div>
+              <div class="toggle-wrap"><div class="toggle" id="signal-depth-imbalance-toggle"></div><span class="muted" id="signal-depth-imbalance-label">开启</span></div>
+              <input id="signal-depth-imbalance-threshold" type="number" min="0" step="0.01" value="0.18">
+            </div>
+            <div class="signal-row">
+              <div>
+                <div class="signal-title">深度下降</div>
+                <div class="setting-help">挂单深度快速变薄时提高插针/滑点风险权重。</div>
+              </div>
+              <div class="toggle-wrap"><div class="toggle" id="signal-depth-drop-toggle"></div><span class="muted" id="signal-depth-drop-label">开启</span></div>
+              <input id="signal-depth-drop-threshold" type="number" min="0" step="0.1" value="18">
+            </div>
+          </div>
+          <div class="setting-help">关闭后仍会展示原始数据，但不会把该信号纳入异常分、报警原因和观察建议。</div>
+        </div>
+        <div class="modal-actions">
+          <button class="small-btn secondary" id="close-signals-btn" type="button">关闭</button>
+          <button class="small-btn primary" id="signals-save-btn" type="button">保存设置</button>
         </div>
       </div>
     </div>

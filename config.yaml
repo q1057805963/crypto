@@ -103,7 +103,11 @@ thresholds:
   anomaly_score: 70
   oi_change_pct_5m: 1.5
   funding_rate_abs: 0.0005
+  liquidation_enabled: true
   liquidation_quote_1m: 250000
+  spread_enabled: true
   spread_bps: 4.0
+  depth_imbalance_enabled: true
   depth_imbalance_abs: 0.18
+  depth_drop_enabled: true
   depth_drop_pct_1m: 18.0

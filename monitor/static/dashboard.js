@@ -18,6 +18,7 @@
     const sourceLabelEl = document.getElementById("source-label");
     const telegramModal = document.getElementById("telegram-modal");
     const aiModal = document.getElementById("ai-modal");
+    const signalsModal = document.getElementById("signals-modal");
     const thresholdModal = document.getElementById("threshold-modal");
     const profileModal = document.getElementById("profile-modal");
     const thresholdSymbolEl = document.getElementById("threshold-symbol");
@@ -1966,6 +1967,7 @@
 
     const btnTelegram = document.getElementById("btn-telegram");
     const btnAI = document.getElementById("btn-ai");
+    const btnSignals = document.getElementById("btn-signals");
     const tgToggle = document.getElementById("tg-toggle");
     const tgToggleLabel = document.getElementById("tg-toggle-label");
     const tgUsersEl = document.getElementById("tg-users");
@@ -1979,6 +1981,98 @@
       toggle.classList.toggle("active", enabled);
       label.textContent = enabled ? "开启" : "关闭";
     }
+
+    const signalFields = {
+      liquidation: {
+        toggle: document.getElementById("signal-liquidation-toggle"),
+        label: document.getElementById("signal-liquidation-label"),
+        input: document.getElementById("signal-liquidation-threshold")
+      },
+      spread: {
+        toggle: document.getElementById("signal-spread-toggle"),
+        label: document.getElementById("signal-spread-label"),
+        input: document.getElementById("signal-spread-threshold")
+      },
+      depth_imbalance: {
+        toggle: document.getElementById("signal-depth-imbalance-toggle"),
+        label: document.getElementById("signal-depth-imbalance-label"),
+        input: document.getElementById("signal-depth-imbalance-threshold")
+      },
+      depth_drop: {
+        toggle: document.getElementById("signal-depth-drop-toggle"),
+        label: document.getElementById("signal-depth-drop-label"),
+        input: document.getElementById("signal-depth-drop-threshold")
+      }
+    };
+    const signalSaveBtn = document.getElementById("signals-save-btn");
+    let signalSettings = {};
+
+    function applySignalSettings(settings) {
+      signalSettings = settings || {};
+      Object.entries(signalFields).forEach(([key, field]) => {
+        const item = signalSettings[key] || {};
+        const enabled = Boolean(item.enabled ?? true);
+        setToggle(field.toggle, field.label, enabled);
+        field.input.value = item.threshold ?? field.input.value;
+      });
+    }
+
+    function collectSignalSettings() {
+      const payload = {};
+      Object.entries(signalFields).forEach(([key, field]) => {
+        payload[key] = {
+          enabled: field.toggle.classList.contains("active"),
+          threshold: Number(field.input.value) || 0
+        };
+      });
+      return payload;
+    }
+
+    async function loadSignalSettings() {
+      try {
+        const response = await apiFetch("/api/signal_settings", { cache: "no-store" });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || "读取失败");
+        applySignalSettings(data);
+      } catch (error) {
+        updatedEl.textContent = error.message || "信号设置读取失败";
+      }
+    }
+
+    async function saveSignalSettings() {
+      signalSaveBtn.disabled = true;
+      signalSaveBtn.textContent = "保存中";
+      try {
+        const response = await apiFetch("/api/signal_settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(collectSignalSettings())
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "保存失败");
+        applySignalSettings(data.settings || {});
+        updatedEl.textContent = "信号评分设置已保存";
+        closeModal(signalsModal);
+        await refresh();
+      } catch (error) {
+        updatedEl.textContent = error.message || "信号设置保存失败";
+      } finally {
+        signalSaveBtn.disabled = false;
+        signalSaveBtn.textContent = "保存设置";
+      }
+    }
+
+    btnSignals.addEventListener("click", async () => {
+      await loadSignalSettings();
+      openModal(signalsModal);
+    });
+    Object.values(signalFields).forEach((field) => {
+      field.toggle.addEventListener("click", () => {
+        const enabled = !field.toggle.classList.contains("active");
+        setToggle(field.toggle, field.label, enabled);
+      });
+    });
+    signalSaveBtn.addEventListener("click", saveSignalSettings);
 
     function renderTgUsers() {
       tgUsersEl.innerHTML = tgUsers.map((user, index) => `
@@ -2575,12 +2669,14 @@
       ["close-telegram-btn", telegramModal],
       ["close-ai-modal", aiModal],
       ["close-ai-btn", aiModal],
+      ["close-signals-modal", signalsModal],
+      ["close-signals-btn", signalsModal],
       ["close-threshold-modal", thresholdModal],
       ["close-threshold-btn", thresholdModal]
     ].forEach(([id, modal]) => {
       document.getElementById(id).addEventListener("click", () => closeModal(modal));
     });
-    [profileModal, telegramModal, aiModal, thresholdModal].forEach((modal) => {
+    [profileModal, telegramModal, aiModal, signalsModal, thresholdModal].forEach((modal) => {
       modal.addEventListener("click", (event) => {
         if (event.target === modal) closeModal(modal);
       });
@@ -2590,6 +2686,7 @@
         closeModal(profileModal);
         closeModal(telegramModal);
         closeModal(aiModal);
+        closeModal(signalsModal);
         closeModal(thresholdModal);
         closeDetailDrawer(true);
       }

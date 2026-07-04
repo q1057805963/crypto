@@ -438,7 +438,8 @@
     }
 
     .condition-grid,
-    .telegram-users {
+    .telegram-users,
+    .signal-grid {
       display: grid;
       gap: 8px;
     }
@@ -465,6 +466,30 @@
     .condition-row input[type="number"] {
       min-width: 0;
       width: 100%;
+    }
+
+    .signal-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto minmax(88px, 118px);
+      align-items: center;
+      gap: 10px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: rgba(255, 255, 255, .02);
+    }
+
+    .signal-title {
+      margin-bottom: 3px;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 750;
+      line-height: 1.25;
+    }
+
+    .signal-row input {
+      width: 100%;
+      min-width: 0;
     }
 
     .telegram-user {
@@ -2043,6 +2068,10 @@
       section { border-radius: 6px; }
       table { min-width: 1080px; }
       .profile-grid { grid-template-columns: 1fr; }
+      .signal-row {
+        grid-template-columns: 1fr;
+        align-items: stretch;
+      }
       .events {
         width: calc(100vw - 20px);
       }
