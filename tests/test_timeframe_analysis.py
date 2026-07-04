@@ -1,9 +1,54 @@
+import json
 import unittest
+from unittest.mock import patch
 
-from monitor.timeframe_analysis import build_followup_result, build_timeframe_analysis
+from monitor.timeframe_analysis import TimeframeAnalysisService, build_followup_result, build_timeframe_analysis
 
 
 class TimeframeAnalysisTests(unittest.TestCase):
+    def test_okx_current_timeframe_uses_latest_candle_endpoints(self) -> None:
+        requested_urls = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "code": "0",
+                        "data": [
+                            [
+                                "1710000000000",
+                                "620",
+                                "650",
+                                "610",
+                                "640",
+                                "1",
+                                "10",
+                                "6400",
+                                "0",
+                            ]
+                        ],
+                    }
+                ).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            requested_urls.append(request.full_url)
+            return FakeResponse()
+
+        service = TimeframeAnalysisService()
+        with patch("monitor.timeframe_analysis.urlopen", fake_urlopen):
+            price_candles = service._fetch_okx_candles("BNBUSDT", "4H", mark=False)
+            service._fetch_okx_candles("BNBUSDT", "4H", mark=True)
+
+        self.assertIn("/api/v5/market/candles?", requested_urls[0])
+        self.assertIn("/api/v5/market/mark-price-candles?", requested_urls[1])
+        self.assertAlmostEqual(price_candles[0]["close_time"] - price_candles[0]["open_time"], 14400)
+
     def test_build_timeframe_analysis_from_exchange_candles(self) -> None:
         price_candles = [
             {

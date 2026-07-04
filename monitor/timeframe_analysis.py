@@ -64,6 +64,13 @@ def _okx_inst_id(symbol: str) -> str:
     return f"{base}-USDT-SWAP"
 
 
+def _okx_interval_seconds(interval: str) -> int:
+    for config in TIMEFRAME_CONFIG.values():
+        if config["okx"] == interval:
+            return int(config["seconds"])
+    return 0
+
+
 def _label_for_period(period: str) -> str:
     return period
 
@@ -462,9 +469,9 @@ class TimeframeAnalysisService:
 
     def _fetch_okx_candles(self, symbol: str, interval: str, mark: bool) -> list[dict]:
         path = (
-            "/api/v5/market/history-mark-price-candles"
+            "/api/v5/market/mark-price-candles"
             if mark
-            else "/api/v5/market/history-candles"
+            else "/api/v5/market/candles"
         )
         query = urlencode({"instId": _okx_inst_id(symbol), "bar": interval, "limit": "24"})
         request = Request(
@@ -482,13 +489,15 @@ class TimeframeAnalysisService:
         data = list(payload.get("data") or [])
         data.reverse()
         candles = []
+        interval_seconds = _okx_interval_seconds(interval)
         for item in data:
             if len(item) < 5:
                 continue
+            open_time = float(item[0]) / 1000
             candles.append(
                 {
-                    "open_time": float(item[0]) / 1000,
-                    "close_time": (float(item[0]) / 1000),
+                    "open_time": open_time,
+                    "close_time": open_time + interval_seconds,
                     "open": float(item[1]),
                     "high": float(item[2]),
                     "low": float(item[3]),
