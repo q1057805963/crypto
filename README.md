@@ -1,6 +1,6 @@
 # Crypto Futures Monitor
 
-USDT 永续合约异常波动监控 MVP，支持 Binance U 本位合约和 OKX USDT Swap 数据源。
+USDT 永续合约异常波动监控 MVP，默认使用 OKX USDT Swap 数据源；Binance 适配代码保留但默认不启用。
 
 Deployment and Telegram guide:
 
@@ -47,8 +47,8 @@ BTC, ETH, SOL
 编辑 `config.yaml`：
 
 - `symbols`: 要监控的合约，例如 `BTCUSDT`、`SOLUSDT`
-- `exchange`: 交易所数据源，`binance_usdm` 或 `okx_swap`
-- `data_source`: 数据传输方式，`rest` 为 REST 轮询，`websocket` 目前只支持 Binance 推送流
+- `exchange`: 交易所数据源，默认 `okx_swap`
+- `data_source`: 数据传输方式，`websocket` 为 OKX 实时主行情，`rest` 为 OKX REST 轮询兜底
 - `rest_poll_interval_seconds`: REST 轮询间隔
 - `rest_per_symbol_delay_ms`: REST 模式下，每个合约请求之间的间隔
 - `oi_poll_interval_seconds`: OI 拉取间隔
@@ -78,23 +78,20 @@ BTC, ETH, SOL
 - 买卖盘深度失衡
 - 最低 1 分钟成交额过滤，避免小额噪音
 
-当前默认使用 REST 轮询源，适合本机网络对 WebSocket 推送不稳定的情况。切换到 `data_source: websocket` 后，主动买卖比例会更接近真实逐笔成交；该模式目前仅适用于 Binance。若 VPS 访问 Binance Futures 返回 HTTP 451，可设置 `exchange: okx_swap` 或环境变量 `CFM_EXCHANGE=okx_swap`，改用 OKX 合约公开行情源。
+当前默认使用 OKX WebSocket 主行情，实时订阅成交、ticker、盘口、标记价、资金费率和持仓量。OKX REST 继续用于强平补偿、历史 K 线复盘和 WebSocket 异常时的兜底。
 
-## Binance 451 处理
+## 数据源策略
 
-Binance Futures 如果返回 HTTP 451，通常是交易所按服务条款对该服务器线路或地区拒绝服务。程序不会绕过该限制，推荐切换到可正常访问的数据源：
+本项目当前采用 OKX-first：
 
-```bash
-CFM_EXCHANGE=okx_swap
-CFM_DATA_SOURCE=rest
-```
-
-OKX 源支持主行情、1 分钟成交额估算、持仓量、资金费率、REST 盘口深度和公共强平订单统计。OKX 强平数据是 REST 低频补充，默认每 15 秒拉取一次并做去重；页面中的“近1m无”表示最近 1 分钟窗口内未捕获强平订单，不代表市场绝对没有强平。
+- OKX WebSocket：主成交、主动买卖、ticker、盘口深度、标记价、资金费率和持仓量
+- OKX REST：强平订单低频补偿、交易所 K 线复盘、合约规格换算和 WebSocket 兜底
+- Binance：代码保留，默认配置不启用，后续有稳定线路时再切回
 
 ## 页面字段说明
 
 - `采样数`: REST 模式下，表示过去 1 分钟采集到的行情快照数量。它不是交易所真实成交笔数，所以多个合约可能相同。
-- `成交数`: WebSocket 模式下，表示过去 1 分钟收到的聚合成交事件数量，更接近真实交易活跃度。
+- `成交数`: WebSocket 模式下，表示过去 1 分钟收到的成交事件数量，更接近真实交易活跃度。
 - `1分钟成交额`: REST 模式下用 `quoteVolume` 差值估算；WebSocket 模式下由逐笔聚合成交累加。
 - `主动买入`: REST 模式下只能根据价格变化近似判断，WebSocket 模式下会使用成交方向字段。
 - `OI 5分钟`: 持仓量在窗口内的变化。价格和 OI 同向增加时，更像新增资金推动；价格波动但 OI 下降时，更像平仓或短线脉冲。
@@ -273,7 +270,7 @@ journalctl -u crypto-futures-monitor -f
 
 - 先把 `dashboard.host` 设成 `127.0.0.1`，只通过 Nginx 或 SSH 隧道访问
 - Telegram token 不要直接写进 Git 或公开仓库
-- 先用 `rest` 模式跑稳定，再逐步切到 `websocket`
+- 默认用 OKX WebSocket；如果 VPS 对 WebSocket 不稳定，再临时切到 `rest`
 - 保留 `data/monitor.db`，后面复盘会很有用
 
 ## REST 风控建议
@@ -286,7 +283,7 @@ REST 模式只适合监控少量自选合约，不建议高频全市场扫描。
 - 默认 5 秒一轮
 - 每个合约请求之间默认间隔 150ms
 - 用 `quoteVolume` 差值估算窗口成交额
-- 爆仓流和盘口深度走独立 WebSocket 辅助流
+- OKX WebSocket 提供成交和盘口；强平流可由 REST 低频补偿
 
 推荐：
 
@@ -300,4 +297,4 @@ REST 模式只适合监控少量自选合约，不建议高频全市场扫描。
 
 ## 下一步
 
-- 把 REST 主行情逐步切换为更完整的 WebSocket 实时流
+- 观察 OKX WebSocket 长时间运行稳定性，再决定是否彻底移除 Binance 默认链路

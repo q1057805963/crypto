@@ -8,10 +8,11 @@ from monitor.binance_rest import BinanceFuturesTickerPoller
 from monitor.binance_ws import BinanceFuturesAggTradeStream
 from monitor.microstructure import BinanceFuturesMicrostructureStream, MarketMicrostructureState
 from monitor.okx_rest import OkxSwapTickerPoller
+from monitor.okx_ws import OkxSwapWebSocketStream
 
 
 def normalized_exchange(config: dict) -> str:
-    return str(config.get("exchange", "binance_usdm")).strip().lower()
+    return str(config.get("exchange", "okx_swap")).strip().lower()
 
 
 def is_okx_exchange(exchange: str) -> bool:
@@ -21,12 +22,15 @@ def is_okx_exchange(exchange: str) -> bool:
 def normalized_data_source(exchange: str, data_source: str) -> str:
     source = str(data_source or "").strip().lower()
     if is_okx_exchange(exchange):
-        if source not in {"", "auto", "rest"}:
+        if source in {"", "auto"}:
+            return "websocket"
+        if source not in {"rest", "websocket"}:
             logging.warning(
-                "OKX exchange currently uses REST polling; ignoring data_source=%s",
+                "Unsupported OKX data_source=%s, fallback to websocket",
                 data_source,
             )
-        return "rest"
+            return "websocket"
+        return source
     if source in {"", "auto"}:
         return "websocket"
     if source not in {"rest", "websocket"}:
@@ -100,7 +104,11 @@ def build_source_context(config: dict, symbols: list[str], spec: SourceSpec) -> 
             if is_okx_exchange(spec.exchange)
             else True
         ),
-        liquidation_feed_mode="poll" if is_okx_exchange(spec.exchange) else "stream",
+        liquidation_feed_mode=(
+            "poll"
+            if is_okx_exchange(spec.exchange) and spec.data_source == "rest"
+            else "stream"
+        ),
         liquidation_retention_seconds=int(
             microstructure_config.get("liquidation_retention_seconds", 86400)
         ),
@@ -113,7 +121,19 @@ def build_source_context(config: dict, symbols: list[str], spec: SourceSpec) -> 
             depth_interval=str(microstructure_config.get("depth_interval", "500ms")),
         )
 
-    if is_okx_exchange(spec.exchange):
+    if is_okx_exchange(spec.exchange) and spec.data_source == "websocket":
+        stream = OkxSwapWebSocketStream(
+            symbols,
+            liquidation_poll_interval_seconds=float(
+                microstructure_config.get("rest_liquidation_poll_interval_seconds", 15)
+            ),
+            microstructure_state=(
+                microstructure_state
+                if microstructure_config.get("enabled", True)
+                else None
+            ),
+        )
+    elif is_okx_exchange(spec.exchange):
         stream = OkxSwapTickerPoller(
             symbols,
             poll_interval_seconds=float(config.get("rest_poll_interval_seconds", 2)),

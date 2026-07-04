@@ -1,11 +1,11 @@
-exchange: binance_usdm
+exchange: okx_swap
 data_source: websocket
 failover:
   enabled: true
   stale_after_seconds: 20
   switch_cooldown_seconds: 45
   candidates:
-  - exchange: binance_usdm
+  - exchange: okx_swap
     data_source: websocket
   - exchange: okx_swap
     data_source: rest
