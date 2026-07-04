@@ -230,6 +230,23 @@ class SourceFailoverManager:
             now=time.time(),
         )
 
+    def source_health(self) -> dict:
+        if not self._active_context:
+            return {}
+        stream = self._active_context.stream
+        health = stream.health_summary() if hasattr(stream, "health_summary") else {}
+        if not isinstance(health, dict):
+            health = {}
+        return {
+            "exchange": self._active_context.exchange,
+            "data_source": self._active_context.data_source,
+            "label": source_label(
+                self._active_context.exchange,
+                self._active_context.data_source,
+            ),
+            **health,
+        }
+
     def set_symbols(self, symbols: list[str]) -> None:
         self.symbols = list(symbols)
         if not self._active_context:

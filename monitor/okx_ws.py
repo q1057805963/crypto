@@ -10,6 +10,28 @@ import websockets
 from monitor.okx_rest import OkxSwapTickerPoller
 
 
+CHANNEL_LABELS = {
+    "trades": "成交",
+    "tickers": "Ticker",
+    "books5": "盘口",
+    "mark-price": "标记价",
+    "funding-rate": "资金费率",
+    "open-interest": "持仓量",
+    "liquidations": "强平补偿",
+}
+
+
+CHANNEL_STALE_SECONDS = {
+    "trades": 20,
+    "tickers": 20,
+    "books5": 20,
+    "mark-price": 60,
+    "funding-rate": 180,
+    "open-interest": 60,
+    "liquidations": 45,
+}
+
+
 class OkxSwapWebSocketStream:
     def __init__(
         self,
@@ -22,6 +44,7 @@ class OkxSwapWebSocketStream:
         self.url = "wss://ws.okx.com:8443/ws/v5/public"
         self.symbols: set[str] = set()
         self._state: dict[str, dict] = {}
+        self._last_channel_at: dict[str, dict[str, float]] = {}
         self._last_liquidation_poll_at: dict[str, float] = {}
         self.liquidation_poll_interval_seconds = liquidation_poll_interval_seconds
         self._rest_helper = OkxSwapTickerPoller(
@@ -41,6 +64,7 @@ class OkxSwapWebSocketStream:
             self.symbols = {symbol.upper() for symbol in symbols}
             for symbol in self.symbols:
                 self._state.setdefault(symbol, {})
+                self._last_channel_at.setdefault(symbol, {})
         self._rest_helper.set_symbols(symbols)
 
     def get_symbols(self) -> list[str]:
@@ -106,6 +130,8 @@ class OkxSwapWebSocketStream:
             return None
 
         data = payload.get("data") or []
+        if data and channel:
+            self._record_channel(symbol, channel)
         if channel == "trades":
             return await self._handle_trades(symbol, data)
         if channel == "tickers":
@@ -203,9 +229,56 @@ class OkxSwapWebSocketStream:
             liquidations = await asyncio.to_thread(self._rest_helper._fetch_liquidations, symbol, now)
             self.microstructure_state.mark_liquidation_feed(symbol, now)
             self._rest_helper._record_liquidations(symbol, liquidations, now)
+            self._record_channel(symbol, "liquidations", now)
             self._last_liquidation_poll_at[symbol] = now
         except Exception as exc:
             logging.warning("OKX liquidation poll failed for %s: %s", symbol, exc)
+
+    def health_summary(self, now: float | None = None) -> dict:
+        now = float(now or time.time())
+        symbols = self.get_symbols()
+        with self._lock:
+            last_channel_at = {
+                symbol: dict(self._last_channel_at.get(symbol, {}))
+                for symbol in symbols
+            }
+        channels = []
+        for key, label in CHANNEL_LABELS.items():
+            latest_at = max(
+                (
+                    last_channel_at.get(symbol, {}).get(key, 0.0)
+                    for symbol in symbols
+                ),
+                default=0.0,
+            )
+            age_seconds = now - latest_at if latest_at else None
+            stale_after = CHANNEL_STALE_SECONDS.get(key, 60)
+            if age_seconds is None:
+                status = "unavailable"
+            elif age_seconds <= stale_after:
+                status = "active"
+            else:
+                status = "stale"
+            channels.append(
+                {
+                    "key": key,
+                    "label": label,
+                    "status": status,
+                    "age_seconds": round(age_seconds, 1) if age_seconds is not None else None,
+                    "stale_after_seconds": stale_after,
+                }
+            )
+        active_count = sum(1 for item in channels if item["status"] == "active")
+        return {
+            "status": "active" if active_count >= 3 else "degraded",
+            "active_count": active_count,
+            "total_count": len(channels),
+            "channels": channels,
+        }
+
+    def _record_channel(self, symbol: str, channel: str, event_time: float | None = None) -> None:
+        with self._lock:
+            self._last_channel_at.setdefault(symbol.upper(), {})[channel] = float(event_time or time.time())
 
     def _convert_depth_levels(self, symbol: str, levels: list[list[str]]) -> list[list[float]]:
         converted = []

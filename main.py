@@ -512,6 +512,7 @@ async def run(config: dict) -> None:
             on_user_config_change=apply_user_runtime_config,
             auth_manager=auth_manager,
             period_liquidation_provider=source_manager.liquidation_summary,
+            source_health_provider=source_manager.source_health,
         )
         dashboard.start()
         dashboard.set_event_loop(asyncio.get_running_loop())
@@ -551,6 +552,7 @@ async def run(config: dict) -> None:
 
     try:
         async for trade in source_manager.listen():
+            dashboard_state.set_source_health(source_manager.source_health())
             event = detector.update(trade)
             snapshot = detector.snapshot(trade["symbol"])
             snapshot_payload = None

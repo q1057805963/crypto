@@ -15,6 +15,7 @@
     const userScopeEl = document.getElementById("user-scope");
     const detailEl = document.getElementById("detail");
     const sourceLabelEl = document.getElementById("source-label");
+    const sourceHealthEl = document.getElementById("source-health");
     const telegramModal = document.getElementById("telegram-modal");
     const aiModal = document.getElementById("ai-modal");
     const signalsModal = document.getElementById("signals-modal");
@@ -391,6 +392,36 @@
         maximumFractionDigits: digits,
         minimumFractionDigits: 0
       });
+    }
+
+    function formatAge(seconds) {
+      const value = Number(seconds);
+      if (!Number.isFinite(value)) return "暂无";
+      if (value < 1) return "<1s";
+      if (value < 60) return `${Math.round(value)}s`;
+      const minutes = value / 60;
+      if (minutes < 60) return `${Math.round(minutes)}m`;
+      return `${Math.round(minutes / 60)}h`;
+    }
+
+    function renderSourceHealth(health) {
+      if (!sourceHealthEl) return;
+      const channels = Array.isArray(health.channels) ? health.channels : [];
+      const total = Number(health.total_count || channels.length || 0);
+      const active = Number(health.active_count || 0);
+      const status = health.status || (total ? "degraded" : "unavailable");
+      sourceHealthEl.className = `source-health ${status}`;
+      sourceHealthEl.textContent = total ? `数据 ${active}/${total}` : "数据 --";
+      if (!channels.length) {
+        sourceHealthEl.title = "暂无数据源健康明细";
+        return;
+      }
+      sourceHealthEl.title = channels.map((channel) => {
+        const label = channel.label || channel.key || "数据";
+        if (channel.status === "active") return `${label} ${formatAge(channel.age_seconds)} 前`;
+        if (channel.status === "stale") return `${label} ${formatAge(channel.age_seconds)} 未更新`;
+        return `${label} 暂无`;
+      }).join("\n");
     }
 
     function fmtSignedNumber(value, digits = 2) {
@@ -1911,6 +1942,7 @@
         const transportLabel = data.data_source === "websocket" ? "WebSocket" : "REST";
         const symbols = data.symbols || [];
         sourceLabelEl.textContent = `${exchangeLabel} ${transportLabel}`;
+        renderSourceHealth(data.source_health || {});
         renderSymbols(symbols);
         if (shouldDeferDetailRender(symbols)) {
           pendingDetailRefresh = true;

@@ -1025,6 +1025,39 @@
       min-width: 0;
     }
 
+    .source-health {
+      display: inline-flex;
+      align-items: center;
+      height: 22px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 0 8px;
+      background: var(--panel-2);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1;
+      white-space: nowrap;
+    }
+
+    .source-health.active {
+      border-color: rgba(43, 213, 118, .35);
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .source-health.degraded,
+    .source-health.stale {
+      border-color: rgba(242, 184, 75, .36);
+      background: rgba(242, 184, 75, .12);
+      color: var(--amber);
+    }
+
+    .source-health.unavailable {
+      border-color: rgba(255, 90, 102, .32);
+      background: var(--red-soft);
+      color: var(--red);
+    }
+
     .drawer-close {
       width: 30px;
       height: 30px;

@@ -136,6 +136,7 @@ class DashboardServer:
         on_user_config_change=None,
         auth_manager: AuthManager | None = None,
         period_liquidation_provider=None,
+        source_health_provider=None,
     ) -> None:
         self.state = state
         self.host = host
@@ -150,6 +151,7 @@ class DashboardServer:
         self.on_user_config_change = on_user_config_change
         self.auth_manager = auth_manager
         self.period_liquidation_provider = period_liquidation_provider
+        self.source_health_provider = source_health_provider
         self._ai_analyzers: dict[str, AIAnalyzer] = {}
         self._event_loop = None
         self._server: ThreadingHTTPServer | None = None
@@ -257,6 +259,8 @@ class DashboardServer:
 
                 if path == "/api/state":
                     user_config = server_ref._get_user_config(self._user_id())
+                    if server_ref.source_health_provider:
+                        state.set_source_health(server_ref.source_health_provider())
                     self._send_json(state.as_payload(user_config.get("symbols", [])))
                     return
 

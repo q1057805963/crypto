@@ -78,6 +78,7 @@ class DashboardState:
         self._data_source = data_source
         self._exchange = exchange
         self._source_note = ""
+        self._source_health: dict = {}
         self._symbols = {
             symbol: _empty_symbol_snapshot(symbol)
             for symbol in normalize_symbols(symbols)
@@ -123,6 +124,10 @@ class DashboardState:
             self._data_source = data_source
             self._source_note = note
 
+    def set_source_health(self, health: dict) -> None:
+        with self._lock:
+            self._source_health = dict(health or {})
+
     def clear_source_note(self) -> None:
         with self._lock:
             self._source_note = ""
@@ -143,6 +148,7 @@ class DashboardState:
                 "data_source": self._data_source,
                 "exchange": self._exchange,
                 "source_note": self._source_note,
+                "source_health": dict(self._source_health),
                 "symbols": symbols,
                 "events": events,
             }
