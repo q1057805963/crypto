@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>合约异动监控</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+  <header>
+    <h1>合约异动监控</h1>
+    <div class="toolbar">
+      <input id="symbol-input" class="symbol-input" autocomplete="off" spellcheck="false" placeholder="BTCUSDT, ETHUSDT, SOLUSDT">
+      <button id="save-symbols" class="save-btn primary">保存监控</button>
+      <button id="btn-telegram" class="save-btn" title="推送设置">推送</button>
+      <button id="btn-ai" class="save-btn ai" title="AI 设置">AI</button>
+      <button id="btn-theme" class="save-btn ghost" title="切换主题">白天</button>
+      <button id="btn-logout" class="save-btn danger" title="退出登录">退出</button>
+    </div>
+    <div class="status"><span class="dot"></span><span id="updated">等待数据</span><button id="user-scope" class="scope-btn" type="button">个人配置</button></div>
+  </header>
+
+  <div class="auth-screen" id="auth-screen">
+    <div class="auth-card">
+      <h2 class="auth-title" id="auth-title">登录</h2>
+      <div class="auth-hint" id="auth-hint">登录后加载你的监控列表、AI、Telegram 和阈值配置。</div>
+      <div class="auth-form">
+        <input id="auth-username" autocomplete="username" placeholder="用户名">
+        <input id="auth-password" autocomplete="current-password" type="password" placeholder="密码">
+        <div class="auth-error" id="auth-error"></div>
+        <button class="small-btn primary" id="auth-submit" type="button">登录</button>
+        <button class="small-btn secondary" id="auth-switch" type="button">创建账号</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="telegram-modal">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div class="modal-title">Telegram 推送设置</div>
+        <button id="close-telegram-modal" class="modal-close" type="button">x</button>
+      </div>
+      <div class="modal-body">
+        <div class="setting-group">
+          <label>启用推送</label>
+          <div class="toggle-wrap">
+            <div class="toggle" id="tg-toggle"></div>
+            <span class="muted" id="tg-toggle-label">关闭</span>
+          </div>
+        </div>
+        <div class="setting-group">
+          <label>用户推送通道</label>
+          <div class="telegram-users" id="tg-users"></div>
+          <button class="small-btn secondary" id="tg-add-user-btn" type="button">添加通道</button>
+          <div class="setting-help">每个用户可以使用自己的 Bot Token 和 Chat ID；Chat ID 多个时用逗号分隔。</div>
+        </div>
+        <div class="modal-actions">
+          <button class="small-btn secondary" id="close-telegram-btn" type="button">关闭</button>
+          <button class="small-btn secondary" id="tg-test-btn" type="button">发送测试</button>
+          <button class="small-btn primary" id="tg-save-btn" type="button">保存设置</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="ai-modal">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div class="modal-title">AI 分析设置</div>
+        <button id="close-ai-modal" class="modal-close" type="button">x</button>
+      </div>
+      <div class="modal-body">
+        <div class="setting-group">
+          <label>启用 AI</label>
+          <div class="toggle-wrap">
+            <div class="toggle" id="ai-toggle"></div>
+            <span class="muted" id="ai-toggle-label">关闭</span>
+          </div>
+        </div>
+        <div class="setting-group">
+          <label>Provider</label>
+          <select id="ai-provider">
+            <option value="openai">OpenAI</option>
+            <option value="anthropic">Anthropic</option>
+            <option value="openrouter">OpenRouter</option>
+            <option value="deepseek">DeepSeek</option>
+            <option value="siliconflow">SiliconFlow</option>
+            <option value="moonshot">Moonshot</option>
+            <option value="dashscope">DashScope</option>
+            <option value="custom">自定义 OpenAI 兼容</option>
+          </select>
+        </div>
+        <div class="setting-group">
+          <label>Base URL</label>
+          <input id="ai-base-url" placeholder="留空则使用该 Provider 默认地址">
+          <div class="setting-help">除 Anthropic 外，其它 Provider 按 OpenAI 兼容接口调用；你也可以手动改成代理地址。</div>
+        </div>
+        <div class="setting-group">
+          <label>API Key</label>
+          <input id="ai-key" type="password" placeholder="输入 API Key">
+          <div class="setting-help">页面输入的 Key 仅用于当前运行进程；长期部署建议写入环境变量。</div>
+        </div>
+        <div class="setting-group">
+          <label>模型</label>
+          <input id="ai-model" placeholder="gpt-4o-mini">
+        </div>
+        <div class="setting-group">
+          <label>触发阈值</label>
+          <input id="ai-threshold" type="number" value="60" min="0" max="100" style="width:90px">
+        </div>
+        <div class="setting-group">
+          <label>触发条件</label>
+          <select id="ai-trigger-mode" style="width:140px">
+            <option value="any">任一条件满足</option>
+            <option value="all">全部条件满足</option>
+          </select>
+          <div class="condition-grid">
+            <label class="condition-row"><input id="ai-trigger-score" type="checkbox"><span>异常分 >=</span><input id="ai-trigger-score-value" type="number" min="0" max="100" value="60"></label>
+            <label class="condition-row"><input id="ai-trigger-volume" type="checkbox"><span>1分钟成交额 >=</span><input id="ai-trigger-volume-value" type="number" min="0" value="500000"></label>
+            <label class="condition-row"><input id="ai-trigger-multiplier" type="checkbox"><span>量能倍数 >=</span><input id="ai-trigger-multiplier-value" type="number" min="0" step="0.1" value="3"></label>
+            <label class="condition-row"><input id="ai-trigger-price" type="checkbox"><span>1分钟波动绝对值 >=</span><input id="ai-trigger-price-value" type="number" min="0" step="0.1" value="0.8"></label>
+            <label class="condition-row"><input id="ai-trigger-oi" type="checkbox"><span>OI 5分钟绝对值 >=</span><input id="ai-trigger-oi-value" type="number" min="0" step="0.1" value="1.5"></label>
+            <label class="condition-row"><input id="ai-trigger-liquidation" type="checkbox"><span>1分钟爆仓额 >=</span><input id="ai-trigger-liquidation-value" type="number" min="0" value="250000"></label>
+          </div>
+        </div>
+        <div class="setting-group">
+          <label>失败冷却秒数</label>
+          <input id="ai-retry-cooldown" type="number" value="120" min="10" max="3600" style="width:110px">
+        </div>
+        <div class="setting-group">
+          <label>请求超时秒数</label>
+          <input id="ai-timeout" type="number" value="30" min="5" max="30" style="width:110px">
+        </div>
+        <div class="modal-actions">
+          <button class="small-btn secondary" id="close-ai-btn" type="button">关闭</button>
+          <button class="small-btn primary" id="ai-save-btn" type="button">保存设置</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="threshold-modal">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div class="modal-title">推送规则设置</div>
+        <button id="close-threshold-modal" class="modal-close" type="button">x</button>
+      </div>
+      <div class="modal-body">
+        <div class="setting-group">
+          <label>监测对象</label>
+          <input id="threshold-symbol" disabled>
+        </div>
+        <div class="setting-group">
+          <label>异常分阈值</label>
+          <input id="threshold-input" type="number" min="0" max="100" placeholder="70">
+          <div class="setting-help" id="threshold-hint">留空时回退到全局默认；如果同时配置附加条件，则按组合规则推送。</div>
+        </div>
+        <div class="setting-group">
+          <label>组合模式</label>
+          <select id="threshold-trigger-mode" style="width:140px">
+            <option value="any">任一条件满足</option>
+            <option value="all">全部条件满足</option>
+          </select>
+        </div>
+        <div class="setting-group">
+          <label>附加条件</label>
+          <div class="condition-grid">
+            <label class="condition-row"><input id="threshold-trigger-score" type="checkbox"><span>异常分 >=</span><input id="threshold-trigger-score-value" type="number" min="0" max="100" value="70"></label>
+            <label class="condition-row"><input id="threshold-trigger-volume" type="checkbox"><span>1分钟成交额 >=</span><input id="threshold-trigger-volume-value" type="number" min="0" value="500000"></label>
+            <label class="condition-row"><input id="threshold-trigger-multiplier" type="checkbox"><span>量能倍数 >=</span><input id="threshold-trigger-multiplier-value" type="number" min="0" step="0.1" value="3"></label>
+            <label class="condition-row"><input id="threshold-trigger-price" type="checkbox"><span>1分钟波动绝对值 >=</span><input id="threshold-trigger-price-value" type="number" min="0" step="0.1" value="0.8"></label>
+            <label class="condition-row"><input id="threshold-trigger-oi" type="checkbox"><span>OI 5分钟绝对值 >=</span><input id="threshold-trigger-oi-value" type="number" min="0" step="0.1" value="1.5"></label>
+            <label class="condition-row"><input id="threshold-trigger-liquidation" type="checkbox"><span>1分钟爆仓额 >=</span><input id="threshold-trigger-liquidation-value" type="number" min="0" value="250000"></label>
+            <label class="condition-row"><input id="threshold-trigger-imbalance" type="checkbox"><span>盘口失衡绝对值 >=</span><input id="threshold-trigger-imbalance-value" type="number" min="0" step="0.1" value="18"></label>
+            <label class="condition-row"><input id="threshold-trigger-depth-drop" type="checkbox"><span>盘口深度下降 >=</span><input id="threshold-trigger-depth-drop-value" type="number" min="0" step="0.1" value="18"></label>
+            <label class="condition-row"><input id="threshold-trigger-spread" type="checkbox"><span>盘口点差 >=</span><input id="threshold-trigger-spread-value" type="number" min="0" step="0.1" value="4"></label>
+          </div>
+          <div class="setting-help">适合做急拉前兆、插针风险、爆仓连锁这类更灵活的推送过滤。</div>
+        </div>
+        <div class="modal-actions">
+          <button class="small-btn danger" id="threshold-reset-btn" type="button">恢复默认</button>
+          <button class="small-btn secondary" id="close-threshold-btn" type="button">关闭</button>
+          <button class="small-btn primary" id="threshold-save-btn" type="button">保存</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="profile-modal">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div class="modal-title">个人配置</div>
+        <button id="close-profile-modal" class="modal-close" type="button">x</button>
+      </div>
+      <div class="modal-body">
+        <div class="profile-grid">
+          <div class="profile-item">
+            <div class="profile-label">账号</div>
+            <div class="profile-value" id="profile-name">--</div>
+          </div>
+          <div class="profile-item">
+            <div class="profile-label">角色</div>
+            <div class="profile-value" id="profile-role">--</div>
+          </div>
+          <div class="profile-item">
+            <div class="profile-label">用户 ID</div>
+            <div class="profile-value" id="profile-user-id">--</div>
+          </div>
+          <div class="profile-item">
+            <div class="profile-label">认证</div>
+            <div class="profile-value" id="profile-auth">--</div>
+          </div>
+          <div class="profile-item">
+            <div class="profile-label">监控数量</div>
+            <div class="profile-value" id="profile-symbol-count">0 个合约</div>
+          </div>
+          <div class="profile-item">
+            <div class="profile-label">主题</div>
+            <div class="profile-value" id="profile-theme">夜间</div>
+          </div>
+        </div>
+        <div class="setting-group">
+          <label>当前监控</label>
+          <div class="chip-list" id="profile-symbols"></div>
+        </div>
+        <div class="modal-actions">
+          <button class="small-btn secondary" id="profile-open-telegram" type="button">推送设置</button>
+          <button class="small-btn secondary" id="profile-open-ai" type="button">AI 设置</button>
+          <button class="small-btn danger" id="profile-logout" type="button">退出登录</button>
+          <button class="small-btn primary" id="close-profile-btn" type="button">关闭</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <main id="dashboard-main">
+    <div class="detail-drawer-backdrop" id="detail-drawer-backdrop"></div>
+    <section class="market">
+      <div class="section-title">
+        <span>我的 USDT 永续合约</span>
+        <span id="count">0 个合约</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>异常分</th>
+              <th>风险</th>
+              <th>倾向</th>
+              <th>价格</th>
+              <th>1分钟</th>
+              <th>5分钟</th>
+              <th>1分钟成交额</th>
+              <th>放大倍数</th>
+              <th>OI 5分钟</th>
+              <th>爆仓1m</th>
+              <th>点差</th>
+            </tr>
+          </thead>
+          <tbody id="symbols"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="events" id="detail-drawer">
+      <div class="section-title">
+        <div class="drawer-head">
+          <span>合约详情</span>
+          <div class="drawer-meta">
+            <span id="source-label">REST</span>
+            <button class="drawer-close" id="detail-close-btn" type="button">x</button>
+          </div>
+        </div>
+      </div>
+      <div class="side-scroll" id="side-scroll">
+        <div class="detail" id="detail"></div>
+        <div class="section-title collapsible-title">
+          <button class="collapse-head section-collapse" id="events-collapse-btn" data-collapse="events" type="button" aria-expanded="true">
+            <span class="collapse-main">
+              <span class="collapse-title">最近报警</span>
+            </span>
+            <span class="collapse-side">
+              <span id="alert-count">0</span>
+              <span class="collapse-icon">-</span>
+            </span>
+          </button>
+        </div>
+        <div class="event-list" id="events"></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>
