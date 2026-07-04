@@ -30,6 +30,7 @@ class TelegramBotResponder:
         self._offsets: dict[str, int] = {}
         self._initialized_tokens: set[str] = set()
         self._last_question_at: dict[str, float] = {}
+        self._started_at = time()
 
     async def run(self) -> None:
         if not self.enabled:
@@ -59,7 +60,13 @@ class TelegramBotResponder:
 
             if bot_token not in self._initialized_tokens:
                 self._initialized_tokens.add(bot_token)
-                continue
+                updates = [
+                    update
+                    for update in updates
+                    if float((update.get("message") or {}).get("date") or 0) >= self._started_at - 2
+                ]
+                if not updates:
+                    continue
 
             for update in updates:
                 await self._handle_update(bot_token, users, update)
