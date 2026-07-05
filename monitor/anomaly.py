@@ -17,6 +17,8 @@ class AnomalyEvent:
     open_interest: float
     oi_change_pct_5m: float
     funding_rate: float
+    mark_price: float
+    mark_premium_bps: float
     spread_bps: float
     depth_imbalance: float
     bid_depth_notional: float
@@ -51,6 +53,8 @@ class SymbolSnapshot:
     open_interest: float
     oi_change_pct_5m: float
     funding_rate: float
+    mark_price: float
+    mark_premium_bps: float
     spread_bps: float
     depth_imbalance: float
     bid_depth_notional: float
@@ -116,6 +120,12 @@ class SymbolWindow:
             if value:
                 return float(value)
         return None
+
+    def observed_seconds(self, now: float) -> float:
+        if not self.trades:
+            return 0.0
+        first_time = float(self.trades[0].get("event_time") or now)
+        return max(0.0, min(float(self.max_age_seconds), now - first_time))
 
 
 class AnomalyDetector:
@@ -215,6 +225,8 @@ class AnomalyDetector:
             open_interest=round(metrics["open_interest"], 4),
             oi_change_pct_5m=round(metrics["oi_change_pct_5m"], 3),
             funding_rate=round(metrics["funding_rate"], 8),
+            mark_price=round(metrics["mark_price"], 8),
+            mark_premium_bps=round(metrics["mark_premium_bps"], 3),
             spread_bps=round(metrics["spread_bps"], 3),
             depth_imbalance=round(metrics["depth_imbalance"], 3),
             bid_depth_notional=round(metrics["bid_depth_notional"], 2),
@@ -257,7 +269,7 @@ class AnomalyDetector:
         threshold = float(
             self.symbol_thresholds.get(symbol, {}).get(
                 "anomaly_score",
-                self.thresholds.get("anomaly_score", 70),
+                self.thresholds.get("anomaly_score", 60),
             )
         )
         if metrics["score"] < threshold:
@@ -277,6 +289,8 @@ class AnomalyDetector:
             open_interest=round(metrics["open_interest"], 4),
             oi_change_pct_5m=round(metrics["oi_change_pct_5m"], 3),
             funding_rate=round(metrics["funding_rate"], 8),
+            mark_price=round(metrics["mark_price"], 8),
+            mark_premium_bps=round(metrics["mark_premium_bps"], 3),
             spread_bps=round(metrics["spread_bps"], 3),
             depth_imbalance=round(metrics["depth_imbalance"], 3),
             bid_depth_notional=round(metrics["bid_depth_notional"], 2),
@@ -306,6 +320,8 @@ class AnomalyDetector:
         open_interest_5m_ago = window.first_value_since(now, self.window_seconds, "open_interest")
         oi_change_pct_5m = self._pct_change(open_interest_5m_ago, open_interest)
         funding_rate = float(trades_1m[-1].get("funding_rate") or 0)
+        mark_price = float(trades_1m[-1].get("mark_price") or 0)
+        mark_premium_bps = self._bps_change(latest_price, mark_price) if mark_price > 0 else 0.0
         spread_bps = float(trades_1m[-1].get("spread_bps") or 0)
         depth_imbalance = float(trades_1m[-1].get("depth_imbalance") or 0)
         bid_depth_notional = float(trades_1m[-1].get("bid_depth_notional") or 0)
@@ -327,7 +343,8 @@ class AnomalyDetector:
         quote_volume_1m = sum(trade["quote_quantity"] for trade in trades_1m)
         quote_volume_window = sum(trade["quote_quantity"] for trade in window.trades)
         base_volume_window = sum(float(trade.get("quantity") or 0) for trade in window.trades)
-        window_minutes = max(self.window_seconds / 60, 1)
+        observed_window_minutes = max(window.observed_seconds(now) / 60, 1)
+        window_minutes = min(max(self.window_seconds / 60, 1), observed_window_minutes)
         baseline_per_minute = max(quote_volume_window / window_minutes, 1)
         volume_multiplier = quote_volume_1m / baseline_per_minute
         window_vwap = (quote_volume_window / base_volume_window) if base_volume_window > 0 else latest_price
@@ -356,6 +373,7 @@ class AnomalyDetector:
             quote_volume_1m=quote_volume_1m,
             volume_multiplier=volume_multiplier,
             taker_buy_ratio=taker_buy_ratio,
+            trade_count_1m=len(trades_1m),
             oi_change_pct_5m=oi_change_pct_5m,
             funding_rate=funding_rate,
             spread_bps=spread_bps,
@@ -413,6 +431,8 @@ class AnomalyDetector:
             "open_interest": open_interest,
             "oi_change_pct_5m": oi_change_pct_5m,
             "funding_rate": funding_rate,
+            "mark_price": mark_price,
+            "mark_premium_bps": mark_premium_bps,
             "spread_bps": spread_bps,
             "depth_imbalance": depth_imbalance,
             "bid_depth_notional": bid_depth_notional,
@@ -512,6 +532,7 @@ class AnomalyDetector:
         depth_drop_pct_1m: float,
         long_liquidation_quote_1m: float,
         short_liquidation_quote_1m: float,
+        trade_count_1m: int | None = None,
     ) -> tuple[float, list[str]]:
         reasons = []
         score = 0.0
@@ -519,53 +540,103 @@ class AnomalyDetector:
         min_quote_volume_1m = float(self.thresholds.get("min_quote_volume_1m", 0))
         liquidity_factor = 1.0 if quote_volume_1m >= min_quote_volume_1m else 0.45
 
-        price_1m_threshold = float(self.thresholds.get("price_move_pct_1m", 0.8))
-        price_5m_threshold = float(self.thresholds.get("price_move_pct_5m", 1.8))
-        volume_threshold = float(self.thresholds.get("volume_multiplier", 3.0))
-        buy_ratio_high = float(self.thresholds.get("taker_buy_ratio_high", 0.7))
-        buy_ratio_low = float(self.thresholds.get("taker_buy_ratio_low", 0.3))
-        oi_threshold = float(self.thresholds.get("oi_change_pct_5m", 1.5))
-        funding_threshold = float(self.thresholds.get("funding_rate_abs", 0.0005))
-        liquidation_threshold = float(self.thresholds.get("liquidation_quote_1m", 250000))
-        spread_threshold = float(self.thresholds.get("spread_bps", 4.0))
-        depth_imbalance_threshold = float(self.thresholds.get("depth_imbalance_abs", 0.18))
-        depth_drop_threshold = float(self.thresholds.get("depth_drop_pct_1m", 18.0))
+        price_1m_threshold = float(self.thresholds.get("price_move_pct_1m", 0.6))
+        price_5m_threshold = float(self.thresholds.get("price_move_pct_5m", 1.2))
+        volume_threshold = float(self.thresholds.get("volume_multiplier", 2.2))
+        buy_ratio_high = float(self.thresholds.get("taker_buy_ratio_high", 0.68))
+        buy_ratio_low = float(self.thresholds.get("taker_buy_ratio_low", 0.32))
+        min_taker_trade_count_1m = int(self.thresholds.get("min_taker_trade_count_1m", 12))
+        oi_threshold = float(self.thresholds.get("oi_change_pct_5m", 0.8))
+        funding_threshold = float(self.thresholds.get("funding_rate_abs", 0.0003))
+        liquidation_threshold = float(self.thresholds.get("liquidation_quote_1m", 75000))
+        spread_threshold = float(self.thresholds.get("spread_bps", 3.0))
+        depth_imbalance_threshold = float(self.thresholds.get("depth_imbalance_abs", 0.22))
+        depth_drop_threshold = float(self.thresholds.get("depth_drop_pct_1m", 15.0))
         liquidation_enabled = self._threshold_enabled("liquidation_enabled", True)
         spread_enabled = self._threshold_enabled("spread_enabled", True)
         depth_imbalance_enabled = self._threshold_enabled("depth_imbalance_enabled", True)
         depth_drop_enabled = self._threshold_enabled("depth_drop_enabled", True)
 
+        price_1m_score = self._component_score(
+            abs(price_move_pct_1m),
+            price_1m_threshold,
+            price_1m_threshold * 2.5,
+            20,
+        )
         if abs(price_move_pct_1m) >= price_1m_threshold:
-            score += min(abs(price_move_pct_1m) / price_1m_threshold * 24, 24) * liquidity_factor
+            score += price_1m_score * liquidity_factor
             reasons.append(f"1分钟价格波动 {price_move_pct_1m:+.2f}%")
 
+        price_5m_score = self._component_score(
+            abs(price_move_pct_5m),
+            price_5m_threshold,
+            price_5m_threshold * 2,
+            12,
+        )
         if abs(price_move_pct_5m) >= price_5m_threshold:
-            score += min(abs(price_move_pct_5m) / price_5m_threshold * 18, 18) * liquidity_factor
+            score += price_5m_score * liquidity_factor
             reasons.append(f"5分钟价格波动 {price_move_pct_5m:+.2f}%")
 
+        volume_score = self._component_score(
+            volume_multiplier,
+            volume_threshold,
+            volume_threshold * 2.5,
+            18,
+        )
         if volume_multiplier >= volume_threshold:
-            score += min(volume_multiplier / volume_threshold * 22, 22)
+            score += volume_score
             reasons.append(f"成交额放大 {volume_multiplier:.1f}x")
 
-        if taker_buy_ratio >= buy_ratio_high:
-            score += min((taker_buy_ratio - buy_ratio_high) / (1 - buy_ratio_high) * 14, 14)
+        taker_score = 0.0
+        taker_extreme = taker_buy_ratio >= buy_ratio_high or taker_buy_ratio <= buy_ratio_low
+        taker_sample_ready = (
+            quote_volume_1m >= min_quote_volume_1m
+            and (
+                trade_count_1m is None
+                or int(trade_count_1m) >= min_taker_trade_count_1m
+            )
+        )
+        if taker_sample_ready and taker_buy_ratio >= buy_ratio_high:
+            taker_score = self._component_score(taker_buy_ratio, buy_ratio_high, 0.86, 15)
+            score += taker_score
             reasons.append(f"主动买入占比 {taker_buy_ratio:.0%}")
-        elif taker_buy_ratio <= buy_ratio_low:
-            score += min((buy_ratio_low - taker_buy_ratio) / buy_ratio_low * 14, 14)
+        elif taker_sample_ready and taker_buy_ratio <= buy_ratio_low:
+            taker_score = self._component_score(1 - taker_buy_ratio, 1 - buy_ratio_low, 0.86, 15)
+            score += taker_score
             reasons.append(f"主动卖出占比 {1 - taker_buy_ratio:.0%}")
+        elif taker_extreme and trade_count_1m is not None and int(trade_count_1m) < min_taker_trade_count_1m:
+            reasons.append("主动成交样本不足，方向占比降权")
 
+        oi_score = self._component_score(
+            abs(oi_change_pct_5m),
+            oi_threshold,
+            oi_threshold * 3.5,
+            14,
+        )
         if abs(oi_change_pct_5m) >= oi_threshold:
-            score += min(abs(oi_change_pct_5m) / oi_threshold * 16, 16)
+            score += oi_score
             reasons.append(f"持仓量变化 {oi_change_pct_5m:+.2f}%")
 
+        funding_score = self._component_score(
+            abs(funding_rate),
+            funding_threshold,
+            funding_threshold * 3.5,
+            5,
+        )
         if abs(funding_rate) >= funding_threshold:
-            score += min(abs(funding_rate) / funding_threshold * 6, 6)
+            score += funding_score
             side = "偏多拥挤" if funding_rate > 0 else "偏空拥挤"
             reasons.append(f"资金费率{side} {funding_rate:.4%}")
 
         liquidation_total_quote_1m = long_liquidation_quote_1m + short_liquidation_quote_1m
+        liquidation_score = self._component_score(
+            liquidation_total_quote_1m,
+            liquidation_threshold,
+            liquidation_threshold * 5,
+            12,
+        )
         if liquidation_enabled and liquidation_total_quote_1m >= liquidation_threshold:
-            score += min(liquidation_total_quote_1m / liquidation_threshold * 16, 16)
+            score += liquidation_score
             if long_liquidation_quote_1m > short_liquidation_quote_1m * 1.2:
                 reasons.append(f"多头爆仓放大 {long_liquidation_quote_1m:,.0f} USDT")
             elif short_liquidation_quote_1m > long_liquidation_quote_1m * 1.2:
@@ -573,25 +644,86 @@ class AnomalyDetector:
             else:
                 reasons.append(f"双向爆仓放大 {liquidation_total_quote_1m:,.0f} USDT")
 
+        spread_score = self._component_score(spread_bps, spread_threshold, spread_threshold * 2.6, 5)
         if spread_enabled and spread_bps >= spread_threshold:
-            score += min(spread_bps / spread_threshold * 8, 8)
+            score += spread_score
             reasons.append(f"盘口点差扩大 {spread_bps:.2f} bps")
 
+        depth_imbalance_score = self._component_score(
+            abs(depth_imbalance),
+            depth_imbalance_threshold,
+            max(depth_imbalance_threshold * 2.1, 0.45),
+            5,
+        )
         if depth_imbalance_enabled and abs(depth_imbalance) >= depth_imbalance_threshold:
-            score += min(abs(depth_imbalance) / depth_imbalance_threshold * 6, 6)
+            score += depth_imbalance_score
             if depth_imbalance > 0:
                 reasons.append(f"买盘深度占优 {depth_imbalance:+.2f}")
             else:
                 reasons.append(f"卖盘深度占优 {depth_imbalance:+.2f}")
 
+        depth_drop_score = self._component_score(
+            depth_drop_pct_1m,
+            depth_drop_threshold,
+            depth_drop_threshold * 2.8,
+            8,
+        )
         if depth_drop_enabled and depth_drop_pct_1m >= depth_drop_threshold:
-            score += min(depth_drop_pct_1m / depth_drop_threshold * 12, 12)
+            score += depth_drop_score
             reasons.append(f"盘口深度下降 {depth_drop_pct_1m:.1f}%")
+
+        price_score = price_1m_score + price_5m_score
+        liquidity_score = (
+            (spread_score if spread_enabled else 0)
+            + (depth_imbalance_score if depth_imbalance_enabled else 0)
+            + (depth_drop_score if depth_drop_enabled else 0)
+        )
+        direction = "up" if price_move_pct_1m > 0 else "down" if price_move_pct_1m < 0 else "mixed"
+        taker_aligned = (
+            (direction == "up" and taker_buy_ratio >= max(0.56, buy_ratio_high - 0.08))
+            or (direction == "down" and taker_buy_ratio <= min(0.44, buy_ratio_low + 0.08))
+        )
+        oi_aligned = direction in {"up", "down"} and oi_change_pct_5m >= oi_threshold
+        liquidation_aligned = (
+            liquidation_enabled
+            and direction == "up"
+            and short_liquidation_quote_1m > max(long_liquidation_quote_1m * 1.2, 0)
+            and liquidation_total_quote_1m >= liquidation_threshold
+        ) or (
+            liquidation_enabled
+            and direction == "down"
+            and long_liquidation_quote_1m > max(short_liquidation_quote_1m * 1.2, 0)
+            and liquidation_total_quote_1m >= liquidation_threshold
+        )
+
+        if price_score > 0 and volume_score > 0:
+            score += 6
+            reasons.append("价格与放量共振")
+        if price_score > 0 and taker_score > 0 and taker_aligned:
+            score += 5
+            reasons.append("主动成交与价格方向一致")
+        if price_score > 0 and oi_score > 0 and oi_aligned:
+            score += 4
+            reasons.append("价格与持仓同向增加")
+        if price_score > 0 and liquidation_score > 0 and liquidation_aligned:
+            score += 5
+            reasons.append("爆仓方向与价格推动一致")
+        if liquidity_score > 0 and (price_score > 0 or liquidation_score > 0):
+            score += 3
+            reasons.append("流动性变薄放大波动风险")
 
         if quote_volume_1m < min_quote_volume_1m:
             reasons.append("1分钟成交额偏低，信号降权")
 
         return min(score, 100), reasons
+
+    @staticmethod
+    def _component_score(value: float, trigger: float, full: float, cap: float) -> float:
+        if cap <= 0 or trigger <= 0 or value < trigger:
+            return 0.0
+        if full <= trigger:
+            return cap
+        return min((value - trigger) / (full - trigger) * cap, cap)
 
     def _threshold_enabled(self, key: str, default: bool = True) -> bool:
         value = self.thresholds.get(key, default)
@@ -604,6 +736,12 @@ class AnomalyDetector:
         if old_price is None or old_price <= 0:
             return 0.0
         return (new_price - old_price) / old_price * 100
+
+    @staticmethod
+    def _bps_change(old_price: float | None, new_price: float) -> float:
+        if old_price is None or old_price <= 0 or new_price <= 0:
+            return 0.0
+        return (new_price / old_price - 1) * 10000
 
     @staticmethod
     def _distance_below_pct(price: float, lower: float | None) -> float:
@@ -652,21 +790,21 @@ class AnomalyDetector:
         spread_bps: float,
         depth_drop_pct_1m: float,
     ) -> str:
-        if depth_drop_pct_1m >= 20 and spread_bps >= 4:
+        if depth_drop_pct_1m >= 15 and spread_bps >= 3:
             return "插针风险：盘口明显变薄"
         if direction == "up" and short_liquidation_quote_1m > max(long_liquidation_quote_1m * 1.2, 0):
             return "偏多：疑似空头回补/逼空"
         if direction == "down" and long_liquidation_quote_1m > max(short_liquidation_quote_1m * 1.2, 0):
             return "偏空：疑似多头踩踏"
-        if direction == "up" and oi_change_pct_5m >= 0.3:
+        if direction == "up" and oi_change_pct_5m >= 0.8:
             return "偏多：疑似新增资金推动"
-        if direction == "down" and oi_change_pct_5m >= 0.3:
+        if direction == "down" and oi_change_pct_5m >= 0.8:
             return "偏空：疑似新增空头或连锁止损"
         if direction == "up":
             return "偏多：价格主动上行"
         if direction == "down":
             return "偏空：价格主动下行"
-        if abs(funding_rate) >= 0.0005:
+        if abs(funding_rate) >= 0.0003:
             return "拥挤：注意反向波动"
         if abs(price_move_pct_5m) >= 1:
             return "波动：方向待确认"
@@ -715,15 +853,15 @@ class AnomalyDetector:
         else:
             suggestions.append("方向暂不清晰，先看下一轮价格是否脱离当前区间")
 
-        if oi_change_pct_5m >= 0.3:
+        if oi_change_pct_5m >= 0.8:
             suggestions.append("持仓增加代表有新仓进入，重点看价格是否跟随持仓同向延续")
-        elif oi_change_pct_5m <= -0.3:
+        elif oi_change_pct_5m <= -0.8:
             suggestions.append("持仓下降更像平仓推动，持续性通常弱于新增持仓行情")
 
-        if volume_multiplier >= 3:
+        if volume_multiplier >= 2.2:
             suggestions.append("成交额明显放大，等待第二次放量确认，避免追在第一根脉冲顶部")
 
-        if abs(funding_rate) >= 0.0005:
+        if abs(funding_rate) >= 0.0003:
             suggestions.append("资金费率偏离，说明多空拥挤，注意反向清算或插针")
 
         if long_liquidation_quote_1m > short_liquidation_quote_1m * 1.2 and long_liquidation_quote_1m > 0:
@@ -731,7 +869,7 @@ class AnomalyDetector:
         elif short_liquidation_quote_1m > long_liquidation_quote_1m * 1.2 and short_liquidation_quote_1m > 0:
             suggestions.append("空头爆仓占优，若价格仍能站稳，逼空延续概率会更高")
 
-        if depth_drop_pct_1m >= 18 or spread_bps >= 4:
+        if depth_drop_pct_1m >= 15 or spread_bps >= 3:
             suggestions.append("盘口正在变薄，追单前先确认点差和挂单深度是否恢复")
 
         if abs(price_move_pct_1m) >= 1 and abs(price_move_pct_5m) >= 2:

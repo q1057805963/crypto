@@ -33,7 +33,7 @@ CFM_TELEGRAM_BOT_RESPONDER_ENABLED=true
 CFM_TELEGRAM_BOT_REQUEST_TIMEOUT_SECONDS=20
 CFM_TELEGRAM_BOT_AI_COOLDOWN_SECONDS=20
 CFM_EXCHANGE=okx_swap
-CFM_DATA_SOURCE=rest
+CFM_DATA_SOURCE=websocket
 CFM_REST_POLL_INTERVAL_SECONDS=5
 CFM_REST_DEPTH_POLL_INTERVAL_SECONDS=5
 CFM_REST_LIQUIDATION_POLL_INTERVAL_SECONDS=15
@@ -164,6 +164,7 @@ JWT login is enabled by default.
 - Registration is closed after the first user unless `CFM_AUTH_ALLOW_REGISTRATION=true`.
 - User passwords and JWT signing keys are stored under `data/`, which is ignored by Git.
 - Each user's symbols, Telegram, AI and push threshold settings are stored separately by JWT user id.
+- Admin users can open the profile modal to view safe system user summaries: username, role, symbol count, Telegram/AI status and per-symbol rule count. Password hashes, Bot Tokens and AI keys are never returned by this endpoint.
 
 For VPS deployment, set a stable secret:
 
@@ -212,7 +213,7 @@ CFM_TELEGRAM_BOT_RESPONDER_ENABLED=true
 CFM_TELEGRAM_BOT_REQUEST_TIMEOUT_SECONDS=20
 CFM_TELEGRAM_BOT_AI_COOLDOWN_SECONDS=20
 CFM_EXCHANGE=okx_swap
-CFM_DATA_SOURCE=rest
+CFM_DATA_SOURCE=websocket
 CFM_REST_POLL_INTERVAL_SECONDS=5
 CFM_REST_DEPTH_POLL_INTERVAL_SECONDS=5
 CFM_REST_LIQUIDATION_POLL_INTERVAL_SECONDS=15
@@ -258,7 +259,7 @@ For a stable first deployment:
 
 ```yaml
 exchange: okx_swap
-data_source: rest
+data_source: websocket
 rest_poll_interval_seconds: 5
 rest_per_symbol_delay_ms: 150
 oi_poll_interval_seconds: 30
@@ -268,7 +269,7 @@ microstructure:
   rest_liquidation_poll_interval_seconds: 15
 ```
 
-After the VPS is stable, you can evaluate moving from REST mode to WebSocket mode.
+REST remains available as a fallback when the VPS network has WebSocket issues.
 
 ## 8. Binance HTTP 451
 
@@ -276,10 +277,10 @@ If Binance Futures returns HTTP 451 on the VPS, that is a server-side availabili
 
 ```bash
 CFM_EXCHANGE=okx_swap
-CFM_DATA_SOURCE=rest
+CFM_DATA_SOURCE=websocket
 ```
 
-The OKX source supports ticker price, estimated 1-minute quote volume, open interest, funding rate, REST order-book depth and public liquidation-order polling. OKX liquidation data is lower frequency than Binance's force-order stream. The dashboard deduplicates returned orders and treats "no recent event" as a 1-minute window result, not proof that the whole market has zero liquidations.
+The OKX source supports WebSocket trades, ticker, order-book depth, mark price, funding rate and open interest. REST remains used for historical K-line review, public liquidation-order compensation and fallback. OKX liquidation data is lower frequency than Binance's force-order stream. The dashboard deduplicates returned orders and treats "no recent event" as a 1-minute window result, not proof that the whole market has zero liquidations.
 
 ## 9. What Not to Commit
 

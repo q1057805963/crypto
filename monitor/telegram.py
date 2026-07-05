@@ -5,7 +5,12 @@ from time import time
 from urllib.request import Request, urlopen
 
 from monitor.anomaly import AnomalyEvent
-from monitor.rules import enabled_trigger_count, evaluate_trigger_rules
+from monitor.rules import (
+    enabled_trigger_count,
+    evaluate_trigger_rules,
+    metric_value,
+    normalize_trigger_rules,
+)
 
 
 def normalize_telegram_users(
@@ -29,7 +34,7 @@ def normalize_telegram_users(
                 "owner_id": str(user.get("owner_id", "")),
                 "symbols": [str(symbol).upper() for symbol in user.get("symbols", [])],
                 "symbol_thresholds": user.get("symbol_thresholds", {}),
-                "default_score": float(user.get("default_score", 70)),
+                "default_score": float(user.get("default_score", 60)),
             }
         )
 
@@ -47,7 +52,7 @@ def normalize_telegram_users(
                 "owner_id": "",
                 "symbols": [],
                 "symbol_thresholds": {},
-                "default_score": 70.0,
+                "default_score": 60.0,
             }
         )
     return normalized
@@ -144,12 +149,12 @@ class TelegramAlert:
         if not symbol:
             return
         event_time = float(snapshot.get("updated_at") or time())
-        text = self._format_snapshot(snapshot)
         for user in self.users:
             if not self._user_ready(user):
                 continue
             if not self._user_wants_snapshot(user, snapshot):
                 continue
+            text = self._format_snapshot(snapshot, user)
             for chat_id in user["chat_ids"]:
                 if not self._can_send(user["bot_token"], chat_id, symbol, event_time):
                     continue
@@ -199,7 +204,7 @@ class TelegramAlert:
             return evaluate_trigger_rules(push_rules, snapshot)
         threshold = symbol_config.get("anomaly_score") if isinstance(symbol_config, dict) else None
         if threshold is None:
-            threshold = user.get("default_score", 70)
+            threshold = user.get("default_score", 60)
         return float(snapshot.get("score", 0) or 0) >= float(threshold)
 
     def _can_send(self, bot_token: str, chat_id: str, symbol: str, event_time: float) -> bool:
@@ -221,9 +226,10 @@ class TelegramAlert:
         return True
 
     @staticmethod
-    def _format_snapshot(snapshot: dict) -> str:
+    def _format_snapshot(snapshot: dict, user: dict | None = None) -> str:
         reasons = "\n".join(f"- {reason}" for reason in snapshot.get("reasons", [])) or "- 暂无"
         suggestions = "\n".join(f"- {item}" for item in snapshot.get("suggestions", [])) or "- 继续观察"
+        trigger_context = TelegramAlert._trigger_context(snapshot, user)
         ai_summary = [
             str(item).strip()
             for item in snapshot.get("ai_summary", [])
@@ -254,5 +260,78 @@ class TelegramAlert:
             f"买盘墙: {bid_wall_text} | 卖盘墙: {ask_wall_text}\n"
             f"多头爆仓1m: {float(snapshot.get('long_liquidation_quote_1m', 0) or 0):,.0f} | 空头爆仓1m: {float(snapshot.get('short_liquidation_quote_1m', 0) or 0):,.0f}\n"
             f"点差: {float(snapshot.get('spread_bps', 0) or 0):.2f} bps | 深度下降: {float(snapshot.get('depth_drop_pct_1m', 0) or 0):.1f}%\n"
-            f"\n触发原因:\n{reasons}\n\n观察建议:\n{suggestions}{ai_block}"
+            f"\n推送条件:\n{trigger_context}\n\n触发原因:\n{reasons}\n\n观察建议:\n{suggestions}{ai_block}"
         )
+
+    @staticmethod
+    def _trigger_context(snapshot: dict, user: dict | None = None) -> str:
+        user = user or {}
+        symbol = str(snapshot.get("symbol", "")).upper()
+        symbol_thresholds = user.get("symbol_thresholds") or {}
+        symbol_config = (
+            symbol_thresholds.get(symbol, {})
+            if isinstance(symbol_thresholds, dict)
+            else {}
+        )
+        default_score = float(user.get("default_score", 60) or 60)
+        threshold = (
+            float(symbol_config.get("anomaly_score"))
+            if isinstance(symbol_config, dict) and symbol_config.get("anomaly_score") is not None
+            else default_score
+        )
+        push_rules = symbol_config.get("push_rules") if isinstance(symbol_config, dict) else None
+        if enabled_trigger_count(push_rules) <= 0:
+            source = "单币阈值" if isinstance(symbol_config, dict) and symbol_config.get("anomaly_score") is not None else "默认阈值"
+            return f"- {source}: 异常分 {float(snapshot.get('score', 0) or 0):.1f} >= {threshold:.1f}"
+
+        normalized = normalize_trigger_rules(
+            push_rules,
+            default_score=threshold,
+            score_enabled=False,
+        )
+        mode_text = "全部附加条件满足" if normalized.get("mode") == "all" else "任一附加条件满足"
+        passed = []
+        missed = []
+        for key, cfg in normalized.get("conditions", {}).items():
+            if not cfg.get("enabled"):
+                continue
+            value = metric_value(key, snapshot)
+            if value is None:
+                continue
+            threshold_value = float(cfg.get("threshold", 0) or 0)
+            text = TelegramAlert._condition_text(key, value, threshold_value)
+            if value >= threshold_value:
+                passed.append(text)
+            else:
+                missed.append(text)
+
+        lines = [f"- 推送规则: {mode_text}"]
+        if passed:
+            lines.append("- 命中: " + "；".join(passed[:5]))
+        if normalized.get("mode") == "all" and missed:
+            lines.append("- 未满足: " + "；".join(missed[:3]))
+        if not passed and missed:
+            lines.append("- 条件: " + "；".join(missed[:5]))
+        return "\n".join(lines)
+
+    @staticmethod
+    def _condition_text(key: str, value: float, threshold: float) -> str:
+        labels = {
+            "score": ("异常分", "", 1),
+            "quote_volume_1m": ("1分钟成交额", " USDT", 0),
+            "volume_multiplier": ("量能倍数", "x", 2),
+            "price_move_pct_1m_abs": ("1分钟波动", "%", 2),
+            "oi_change_pct_5m_abs": ("OI 5分钟", "%", 2),
+            "liquidation_total_quote_1m": ("1分钟爆仓额", " USDT", 0),
+            "depth_imbalance_abs": ("盘口失衡", "%", 1),
+            "depth_drop_pct_1m": ("深度下降", "%", 1),
+            "spread_bps": ("盘口点差", " bps", 2),
+        }
+        label, unit, digits = labels.get(key, (key, "", 2))
+        if unit == " USDT":
+            value_text = f"{value:,.0f}{unit}"
+            threshold_text = f"{threshold:,.0f}{unit}"
+        else:
+            value_text = f"{value:.{digits}f}{unit}"
+            threshold_text = f"{threshold:.{digits}f}{unit}"
+        return f"{label} {value_text} >= {threshold_text}"

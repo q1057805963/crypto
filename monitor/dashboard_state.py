@@ -37,6 +37,8 @@ def _empty_symbol_snapshot(symbol: str) -> dict:
         "open_interest": 0,
         "oi_change_pct_5m": 0,
         "funding_rate": 0,
+        "mark_price": 0,
+        "mark_premium_bps": 0,
         "spread_bps": 0,
         "depth_imbalance": 0,
         "bid_depth_notional": 0,
@@ -136,12 +138,19 @@ class DashboardState:
         with self._lock:
             symbols = list(self._symbols.values())
             if symbols_filter is not None:
-                wanted = {symbol.upper() for symbol in symbols_filter}
+                filtered_symbols = normalize_symbols(symbols_filter)
+                wanted = set(filtered_symbols)
+                order = {symbol: index for index, symbol in enumerate(filtered_symbols)}
                 symbols = [symbol for symbol in symbols if symbol["symbol"].upper() in wanted]
-            symbols.sort(key=lambda item: (-float(item.get("score") or 0), item["symbol"]))
+                symbols.sort(
+                    key=lambda item: order.get(
+                        item["symbol"].upper(),
+                        len(order),
+                    )
+                )
             events = list(self._events)
             if symbols_filter is not None:
-                wanted = {symbol.upper() for symbol in symbols_filter}
+                wanted = set(filtered_symbols)
                 events = [event for event in events if str(event.get("symbol", "")).upper() in wanted]
             return {
                 "generated_at": time(),

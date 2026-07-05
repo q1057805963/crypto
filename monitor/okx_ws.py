@@ -160,6 +160,7 @@ class OkxSwapWebSocketStream:
             side = str(item.get("side") or "buy").lower()
             trade_id = item.get("tradeId") or item.get("seqId") or int(event_time * 1000)
             self._state.setdefault(symbol, {})["price"] = price
+            mark_price = float(self._state.get(symbol, {}).get("mark_price") or 0)
             latest_trade = {
                 "symbol": symbol,
                 "event_time": event_time,
@@ -170,6 +171,7 @@ class OkxSwapWebSocketStream:
                 "trade_id": self._trade_id(trade_id),
                 "open_interest": self._state.get(symbol, {}).get("open_interest", 0.0),
                 "funding_rate": self._state.get(symbol, {}).get("funding_rate", 0.0),
+                "mark_price": mark_price,
             }
             await self._refresh_liquidations(symbol, event_time)
             if self.microstructure_state:

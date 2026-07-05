@@ -9,12 +9,151 @@ from monitor.anomaly import AnomalyEvent, SymbolSnapshot
 
 
 FOLLOWUP_HORIZONS_MINUTES = (5, 15, 60, 240, 1440)
+STATS_HORIZON_MINUTES = 15
+
+TRIGGER_COMPONENT_LABELS = {
+    "price_1m": "1m价格冲击",
+    "price_5m": "5m趋势冲击",
+    "volume": "放量",
+    "taker_buy": "主动买入",
+    "taker_sell": "主动卖出",
+    "oi_up": "持仓增加",
+    "oi_down": "持仓下降",
+    "funding_positive": "多头拥挤",
+    "funding_negative": "空头拥挤",
+    "long_liquidation": "多头爆仓",
+    "short_liquidation": "空头爆仓",
+    "spread": "点差扩大",
+    "bid_depth": "买盘深度占优",
+    "ask_depth": "卖盘深度占优",
+    "depth_drop": "深度下降",
+    "price_volume": "价量共振",
+    "taker_aligned": "主动成交同向",
+    "oi_aligned": "价仓同向",
+    "liquidation_aligned": "爆仓同向",
+    "liquidity_risk": "流动性变薄",
+    "unclassified": "未分类触发",
+}
+
+
+def _has_reason(data: dict, text: str) -> bool:
+    return any(text in str(reason) for reason in data.get("reasons", []) or [])
+
+
+def trigger_combo(data: dict) -> dict:
+    direction = str(data.get("direction") or "")
+    components: list[str] = []
+
+    def add(component: str) -> None:
+        if component not in components:
+            components.append(component)
+
+    if _has_reason(data, "1分钟价格波动") or abs(float(data.get("price_move_pct_1m") or 0)) >= 0.6:
+        add("price_1m")
+    if _has_reason(data, "5分钟价格波动") or abs(float(data.get("price_move_pct_5m") or 0)) >= 1.2:
+        add("price_5m")
+    if _has_reason(data, "成交额放大") or float(data.get("volume_multiplier") or 0) >= 2.2:
+        add("volume")
+
+    taker_buy_ratio = float(data.get("taker_buy_ratio_1m") or data.get("taker_buy_ratio") or 0.5)
+    if _has_reason(data, "主动买入") or taker_buy_ratio >= 0.68:
+        add("taker_buy")
+    if _has_reason(data, "主动卖出") or taker_buy_ratio <= 0.32:
+        add("taker_sell")
+
+    oi_change = float(data.get("oi_change_pct_5m") or 0)
+    if _has_reason(data, "持仓量变化") or abs(oi_change) >= 0.8:
+        add("oi_up" if oi_change >= 0 else "oi_down")
+
+    funding_rate = float(data.get("funding_rate") or 0)
+    if _has_reason(data, "资金费率") or abs(funding_rate) >= 0.0003:
+        add("funding_positive" if funding_rate >= 0 else "funding_negative")
+
+    long_liq = float(data.get("long_liquidation_quote_1m") or 0)
+    short_liq = float(data.get("short_liquidation_quote_1m") or 0)
+    liq_total = float(data.get("liquidation_total_quote_1m") or (long_liq + short_liq))
+    if _has_reason(data, "多头爆仓") or (liq_total >= 75000 and long_liq >= short_liq):
+        add("long_liquidation")
+    if _has_reason(data, "空头爆仓") or (liq_total >= 75000 and short_liq > long_liq):
+        add("short_liquidation")
+
+    if _has_reason(data, "盘口点差") or float(data.get("spread_bps") or 0) >= 3.0:
+        add("spread")
+
+    depth_imbalance = float(data.get("depth_imbalance") or 0)
+    if _has_reason(data, "买盘深度") or depth_imbalance >= 0.22:
+        add("bid_depth")
+    if _has_reason(data, "卖盘深度") or depth_imbalance <= -0.22:
+        add("ask_depth")
+    if _has_reason(data, "盘口深度下降") or float(data.get("depth_drop_pct_1m") or 0) >= 15:
+        add("depth_drop")
+
+    if _has_reason(data, "价格与放量共振"):
+        add("price_volume")
+    if _has_reason(data, "主动成交与价格方向一致"):
+        add("taker_aligned")
+    if _has_reason(data, "价格与持仓同向增加"):
+        add("oi_aligned")
+    if _has_reason(data, "爆仓方向与价格推动一致"):
+        add("liquidation_aligned")
+    if _has_reason(data, "流动性变薄"):
+        add("liquidity_risk")
+
+    if not components:
+        add("unclassified")
+
+    labels = [TRIGGER_COMPONENT_LABELS.get(component, component) for component in components]
+    return {
+        "key": "+".join(components),
+        "direction": direction,
+        "components": components,
+        "labels": labels,
+        "label": " + ".join(labels),
+    }
 
 
 def _bps_change(anchor_price: float, target_price: float) -> float:
     if anchor_price <= 0 or target_price <= 0:
         return 0.0
     return (target_price / anchor_price - 1) * 10000
+
+
+def _directional_bps(direction: str, bps: float | None) -> float:
+    value = float(bps or 0)
+    if direction == "down":
+        return -value
+    if direction == "up":
+        return value
+    return 0.0
+
+
+def _directional_followup(direction: str, item: dict) -> dict:
+    if direction not in {"up", "down"} or item.get("status") != "resolved":
+        return {}
+
+    close_directional_bps = _directional_bps(direction, item.get("close_bps"))
+    if direction == "up":
+        max_favorable_bps = max(float(item.get("max_up_bps") or 0), 0.0)
+        max_adverse_bps = max(abs(float(item.get("max_down_bps") or 0)), 0.0)
+    else:
+        max_favorable_bps = max(abs(float(item.get("max_down_bps") or 0)), 0.0)
+        max_adverse_bps = max(float(item.get("max_up_bps") or 0), 0.0)
+
+    if close_directional_bps >= 20 and max_favorable_bps >= max_adverse_bps * 0.8:
+        verdict = "validated"
+    elif close_directional_bps <= -20 and max_adverse_bps > max_favorable_bps:
+        verdict = "failed"
+    elif max_favorable_bps >= 40 and close_directional_bps < 0:
+        verdict = "faded"
+    else:
+        verdict = "neutral"
+
+    return {
+        "directional_close_bps": round(close_directional_bps, 3),
+        "max_favorable_bps": round(max_favorable_bps, 3),
+        "max_adverse_bps": round(max_adverse_bps, 3),
+        "verdict": verdict,
+    }
 
 
 def _followup_label(horizon_minutes: int) -> str:
@@ -26,6 +165,206 @@ def _followup_label(horizon_minutes: int) -> str:
         1440: "1d",
     }
     return mapping.get(int(horizon_minutes), f"{int(horizon_minutes)}m")
+
+
+def _snapshot_value(snapshot_data: dict | None, key: str, default: float = 0.0) -> float:
+    if not snapshot_data:
+        return default
+    try:
+        return float(snapshot_data.get(key) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _snapshot_series(snapshot_data: dict | None, key: str) -> list[float]:
+    if not snapshot_data:
+        return []
+    raw = snapshot_data.get(key) or []
+    if not isinstance(raw, (list, tuple)):
+        return []
+    values = []
+    for item in raw:
+        try:
+            value = float(item or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            values.append(value)
+    return values
+
+
+def _local_volatility_bps(snapshot_data: dict | None) -> float:
+    prices = _snapshot_series(snapshot_data, "price_series_5m")
+    if len(prices) < 2:
+        return 0.0
+    step_changes = [
+        abs(_bps_change(prices[index - 1], prices[index]))
+        for index in range(1, len(prices))
+        if prices[index - 1] > 0 and prices[index] > 0
+    ]
+    range_bps = abs(_bps_change(min(prices), max(prices))) if min(prices) > 0 else 0.0
+    avg_step_bps = sum(step_changes) / len(step_changes) if step_changes else 0.0
+    return max(avg_step_bps * 2.0, range_bps * 0.25)
+
+
+def _estimated_tick_bps(price: float) -> float:
+    if price <= 0:
+        return 0.0
+    if price >= 100000:
+        tick = 1.0
+    elif price >= 10000:
+        tick = 0.1
+    elif price >= 1000:
+        tick = 0.01
+    elif price >= 100:
+        tick = 0.001
+    elif price >= 1:
+        tick = 0.0001
+    else:
+        tick = max(price * 0.0001, 0.00000001)
+    return max((tick / price) * 10000 * 4, 0.8)
+
+
+def _level_candidates(snapshot_data: dict | None, specs: list[tuple[str, str]]) -> list[dict]:
+    candidates = []
+    for key, label in specs:
+        value = _snapshot_value(snapshot_data, key)
+        if value > 0:
+            candidates.append({"price": value, "label": label, "key": key})
+    return candidates
+
+
+def _choose_level(candidates: list[dict], price: float, *, above: bool) -> dict | None:
+    if above:
+        valid = [item for item in candidates if float(item["price"]) > price]
+        return min(valid, key=lambda item: float(item["price"]) - price) if valid else None
+    valid = [item for item in candidates if 0 < float(item["price"]) < price]
+    return max(valid, key=lambda item: float(item["price"])) if valid else None
+
+
+def _decision_metrics(event: AnomalyEvent, snapshot_data: dict | None = None) -> dict:
+    direction = str(event.direction or "")
+    price = float(event.price or 0)
+    if direction not in {"up", "down"} or price <= 0:
+        return {
+            "directional": False,
+            "reason": "方向未确认，暂不生成失效价。",
+        }
+
+    support = _snapshot_value(snapshot_data, "support_price")
+    resistance = _snapshot_value(snapshot_data, "resistance_price")
+    spread_bps = max(float(event.spread_bps or 0), _snapshot_value(snapshot_data, "spread_bps"))
+    depth_drop_pct = max(float(event.depth_drop_pct_1m or 0), _snapshot_value(snapshot_data, "depth_drop_pct_1m"))
+    depth_imbalance = max(abs(float(event.depth_imbalance or 0)), abs(_snapshot_value(snapshot_data, "depth_imbalance")))
+    bid_depth = _snapshot_value(snapshot_data, "bid_depth_notional", float(event.bid_depth_notional or 0))
+    ask_depth = _snapshot_value(snapshot_data, "ask_depth_notional", float(event.ask_depth_notional or 0))
+    depth_total = bid_depth + ask_depth
+    quote_volume = max(float(event.quote_volume_1m or 0), _snapshot_value(snapshot_data, "quote_volume_1m"))
+    mark_premium_bps = max(
+        abs(float(getattr(event, "mark_premium_bps", 0) or 0)),
+        abs(_snapshot_value(snapshot_data, "mark_premium_bps")),
+    )
+    range_bps = abs(_bps_change(support, resistance)) if support > 0 and resistance > 0 else 0.0
+    impulse_bps = abs(float(event.price_move_pct_1m or 0)) * 100
+    local_volatility_bps = _local_volatility_bps(snapshot_data)
+    tick_bps = _estimated_tick_bps(price)
+    depth_ratio = (depth_total / quote_volume) if depth_total > 0 and quote_volume > 0 else 0.0
+    depth_ratio_bps = 0.0
+    if 0 < depth_ratio < 0.25:
+        depth_ratio_bps = 28.0
+    elif 0 < depth_ratio < 0.5:
+        depth_ratio_bps = 18.0
+    elif 0 < depth_ratio < 1.0:
+        depth_ratio_bps = 9.0
+    liquidity_buffer_bps = min(
+        spread_bps * 1.8
+        + depth_drop_pct * 0.32
+        + depth_imbalance * 10.0
+        + depth_ratio_bps * 0.45,
+        45.0,
+    )
+    buffer_bps = min(
+        max(14.0, tick_bps, spread_bps * 2.5, range_bps * 0.06, impulse_bps * 0.12, local_volatility_bps * 0.85, mark_premium_bps * 0.75)
+        + liquidity_buffer_bps,
+        160.0,
+    )
+    buffer_components = {
+        "tick_bps": round(tick_bps, 3),
+        "spread_bps": round(spread_bps, 3),
+        "range_bps": round(range_bps, 3),
+        "impulse_bps": round(impulse_bps, 3),
+        "local_volatility_bps": round(local_volatility_bps, 3),
+        "mark_premium_bps": round(mark_premium_bps, 3),
+        "liquidity_buffer_bps": round(liquidity_buffer_bps, 3),
+    }
+
+    support_candidates = _level_candidates(
+        snapshot_data,
+        [
+            ("support_price", "结构支撑"),
+            ("value_area_low", "价值区下沿"),
+            ("support_profile_price", "成交密集支撑"),
+            ("window_vwap", "VWAP"),
+            ("bid_wall_price", "买盘墙"),
+        ],
+    )
+    resistance_candidates = _level_candidates(
+        snapshot_data,
+        [
+            ("resistance_price", "结构压力"),
+            ("value_area_high", "价值区上沿"),
+            ("resistance_profile_price", "成交密集压力"),
+            ("window_vwap", "VWAP"),
+            ("ask_wall_price", "卖盘墙"),
+        ],
+    )
+
+    if direction == "up":
+        invalidation_level = _choose_level(support_candidates, price, above=False) or {"price": price, "label": "现价保护"}
+        target_level = _choose_level(resistance_candidates, price, above=True)
+        base_invalidation = float(invalidation_level["price"])
+        invalidation_price = base_invalidation * (1 - buffer_bps / 10000)
+        target_price = float(target_level["price"]) if target_level else 0.0
+        invalidation_text = f"跌破{invalidation_level['label']}并无法快速收回，偏多判断失效。"
+        target_text = (
+            f"先看上方{target_level['label']}，站上后再看延续。"
+            if target_level
+            else "上方目标等待新结构确认。"
+        )
+        risk_bps = max(abs(_bps_change(price, invalidation_price)), 0.0)
+        reward_bps = max(_bps_change(price, target_price), 0.0) if target_price > 0 else 0.0
+    else:
+        invalidation_level = _choose_level(resistance_candidates, price, above=True) or {"price": price, "label": "现价保护"}
+        target_level = _choose_level(support_candidates, price, above=False)
+        base_invalidation = float(invalidation_level["price"])
+        invalidation_price = base_invalidation * (1 + buffer_bps / 10000)
+        target_price = float(target_level["price"]) if target_level else 0.0
+        invalidation_text = f"站上{invalidation_level['label']}并无法跌回，偏空判断失效。"
+        target_text = (
+            f"先看下方{target_level['label']}，跌破后再看延续。"
+            if target_level
+            else "下方目标等待新结构确认。"
+        )
+        risk_bps = max(abs(_bps_change(price, invalidation_price)), 0.0)
+        reward_bps = max(-_bps_change(price, target_price), 0.0) if target_price > 0 else 0.0
+
+    reward_risk = (reward_bps / risk_bps) if risk_bps > 0 and reward_bps > 0 else 0.0
+    boundary_quality = "high" if invalidation_level["label"] != "现价保护" and target_price > 0 and local_volatility_bps > 0 else "medium" if invalidation_level["label"] != "现价保护" else "low"
+    return {
+        "directional": True,
+        "invalidation_price": round(invalidation_price, 8),
+        "target_price": round(target_price, 8) if target_price > 0 else None,
+        "invalidation_bps": round(risk_bps, 3),
+        "target_bps": round(reward_bps, 3) if reward_bps > 0 else None,
+        "reward_risk": round(reward_risk, 2) if reward_risk > 0 else None,
+        "buffer_bps": round(buffer_bps, 3),
+        "buffer_components": buffer_components,
+        "invalidation_basis": invalidation_level["label"],
+        "target_basis": target_level["label"] if target_level else "",
+        "boundary_quality": boundary_quality,
+        "invalidation_text": invalidation_text,
+        "target_text": target_text,
+    }
 
 
 class AlertStore:
@@ -135,11 +474,13 @@ class AlertStore:
         if column not in columns:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
-    def record_event(self, event: AnomalyEvent) -> int:
+    def record_event(self, event: AnomalyEvent, snapshot_data: dict | None = None) -> int:
         payload = asdict(event)
         payload["reasons"] = list(payload["reasons"])
         payload["suggestions"] = list(payload["suggestions"])
         payload["ai_summary"] = list(payload.get("ai_summary", ()))
+        payload["trigger_combo"] = trigger_combo(payload)
+        payload["decision"] = _decision_metrics(event, snapshot_data)
         event_time = float(event.event_time or time())
         with sqlite3.connect(self.path) as conn:
             cursor = conn.execute(
@@ -211,14 +552,177 @@ class AlertStore:
                 conn,
                 [int(row[0]) for row in rows],
             )
+            stats_by_signal = self._load_signal_stats(conn)
+            stats_by_combo = self._load_combo_stats(conn)
 
         events = []
         for alert_id, created_at, payload in rows:
             data = json.loads(payload)
             data["created_at"] = created_at
-            data["followups"] = followups_by_alert.get(int(alert_id), [])
+            data["followups"] = [
+                self._annotate_followup(data, item)
+                for item in followups_by_alert.get(int(alert_id), [])
+            ]
+            stats_key = (
+                str(data.get("symbol") or "").upper(),
+                str(data.get("direction") or ""),
+            )
+            if stats_key in stats_by_signal:
+                data["signal_stats"] = stats_by_signal[stats_key]
+            combo = data.get("trigger_combo")
+            if not isinstance(combo, dict):
+                combo = trigger_combo(data)
+                data["trigger_combo"] = combo
+            combo_key = (
+                str(data.get("direction") or ""),
+                str(combo.get("key") or ""),
+            )
+            if combo_key in stats_by_combo:
+                data["combo_stats"] = stats_by_combo[combo_key]
             events.append(data)
         return events
+
+    def signal_context(self, data: dict | None) -> dict:
+        payload = dict(data or {})
+        combo = trigger_combo(payload)
+        with sqlite3.connect(self.path) as conn:
+            stats_by_signal = self._load_signal_stats(conn)
+            stats_by_combo = self._load_combo_stats(conn)
+        context = {"trigger_combo": combo}
+        stats_key = (
+            str(payload.get("symbol") or "").upper(),
+            str(payload.get("direction") or ""),
+        )
+        combo_key = (
+            str(payload.get("direction") or ""),
+            str(combo.get("key") or ""),
+        )
+        if stats_key in stats_by_signal:
+            context["signal_stats"] = stats_by_signal[stats_key]
+        if combo_key in stats_by_combo:
+            context["combo_stats"] = stats_by_combo[combo_key]
+        return context
+
+    @staticmethod
+    def _annotate_followup(event: dict, item: dict) -> dict:
+        direction = str(event.get("direction") or "")
+        annotation = _directional_followup(direction, item)
+        if annotation:
+            return {**item, **annotation}
+        return item
+
+    def _load_signal_stats(self, conn: sqlite3.Connection) -> dict[tuple[str, str], dict]:
+        rows = conn.execute(
+            """
+            SELECT
+                a.symbol,
+                a.direction,
+                f.close_bps,
+                f.max_up_bps,
+                f.max_down_bps
+            FROM alert_followups f
+            JOIN alerts a ON a.id = f.alert_id
+            WHERE f.status = 'resolved'
+              AND f.horizon_minutes = ?
+              AND a.direction IN ('up', 'down')
+            ORDER BY f.resolved_at DESC
+            LIMIT 800
+            """,
+            (STATS_HORIZON_MINUTES,),
+        ).fetchall()
+        grouped: dict[tuple[str, str], list[dict]] = {}
+        for symbol, direction, close_bps, max_up_bps, max_down_bps in rows:
+            item = {
+                "status": "resolved",
+                "close_bps": close_bps,
+                "max_up_bps": max_up_bps,
+                "max_down_bps": max_down_bps,
+            }
+            metrics = _directional_followup(str(direction), item)
+            if not metrics:
+                continue
+            grouped.setdefault((str(symbol).upper(), str(direction)), []).append(metrics)
+
+        return self._stats_from_groups(grouped)
+
+    def _load_combo_stats(self, conn: sqlite3.Connection) -> dict[tuple[str, str], dict]:
+        rows = conn.execute(
+            """
+            SELECT
+                a.direction,
+                a.payload,
+                f.close_bps,
+                f.max_up_bps,
+                f.max_down_bps
+            FROM alert_followups f
+            JOIN alerts a ON a.id = f.alert_id
+            WHERE f.status = 'resolved'
+              AND f.horizon_minutes = ?
+              AND a.direction IN ('up', 'down')
+            ORDER BY f.resolved_at DESC
+            LIMIT 1200
+            """,
+            (STATS_HORIZON_MINUTES,),
+        ).fetchall()
+        grouped: dict[tuple[str, str], list[dict]] = {}
+        combo_labels: dict[tuple[str, str], str] = {}
+        for direction, payload_text, close_bps, max_up_bps, max_down_bps in rows:
+            try:
+                payload = json.loads(payload_text or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            combo = payload.get("trigger_combo")
+            if not isinstance(combo, dict):
+                combo = trigger_combo(payload)
+            combo_key = str(combo.get("key") or "")
+            if not combo_key:
+                continue
+            item = {
+                "status": "resolved",
+                "close_bps": close_bps,
+                "max_up_bps": max_up_bps,
+                "max_down_bps": max_down_bps,
+            }
+            metrics = _directional_followup(str(direction), item)
+            if not metrics:
+                continue
+            key = (str(direction), combo_key)
+            grouped.setdefault(key, []).append(metrics)
+            combo_labels.setdefault(key, str(combo.get("label") or combo_key))
+
+        output = self._stats_from_groups(grouped)
+        for key, value in output.items():
+            value["combo_key"] = key[1]
+            value["combo_label"] = combo_labels.get(key, key[1])
+        return output
+
+    @staticmethod
+    def _stats_from_groups(grouped: dict[tuple[str, str], list[dict]]) -> dict[tuple[str, str], dict]:
+        output: dict[tuple[str, str], dict] = {}
+        for key, items in grouped.items():
+            sample_count = len(items)
+            if sample_count <= 0:
+                continue
+            positive = [item for item in items if float(item["directional_close_bps"]) > 0]
+            validated = [item for item in items if item.get("verdict") == "validated"]
+            avg_close = sum(float(item["directional_close_bps"]) for item in items) / sample_count
+            avg_favorable = sum(float(item["max_favorable_bps"]) for item in items) / sample_count
+            avg_adverse = sum(float(item["max_adverse_bps"]) for item in items) / sample_count
+            reliability = "high" if sample_count >= 30 else "medium" if sample_count >= 10 else "low"
+            output[key] = {
+                "horizon_minutes": STATS_HORIZON_MINUTES,
+                "label": _followup_label(STATS_HORIZON_MINUTES),
+                "sample_count": sample_count,
+                "reliability": reliability,
+                "win_rate": round(len(positive) / sample_count * 100, 1),
+                "validated_rate": round(len(validated) / sample_count * 100, 1),
+                "avg_close_bps": round(avg_close, 3),
+                "avg_favorable_bps": round(avg_favorable, 3),
+                "avg_adverse_bps": round(avg_adverse, 3),
+            }
+        return output
 
     def _load_followups(self, conn: sqlite3.Connection, alert_ids: list[int]) -> dict[int, list[dict]]:
         if not alert_ids:

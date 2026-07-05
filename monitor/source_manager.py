@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -196,6 +197,7 @@ class SourceFailoverManager:
     ) -> None:
         self.config = config
         self.specs = specs
+        self._lock = threading.Lock()
         self.symbols = list(symbols)
         self.stale_after_seconds = max(float(stale_after_seconds), 5.0)
         self.switch_cooldown_seconds = max(float(switch_cooldown_seconds), 0.0)
@@ -208,6 +210,7 @@ class SourceFailoverManager:
         self._nonce = 0
         self._last_trade_at = 0.0
         self._last_switch_at = 0.0
+        self._reload_requested = False
 
     @property
     def active_exchange(self) -> str:
@@ -237,6 +240,22 @@ class SourceFailoverManager:
         health = stream.health_summary() if hasattr(stream, "health_summary") else {}
         if not isinstance(health, dict):
             health = {}
+        if not health:
+            age_seconds = max(0.0, time.monotonic() - self._last_trade_at)
+            status = "active" if age_seconds <= self.stale_after_seconds else "stale"
+            health = {
+                "status": status,
+                "active_count": 1 if status == "active" else 0,
+                "total_count": 1,
+                "channels": [
+                    {
+                        "key": "market",
+                        "label": "行情",
+                        "status": status,
+                        "age_seconds": age_seconds,
+                    }
+                ],
+            }
         return {
             "exchange": self._active_context.exchange,
             "data_source": self._active_context.data_source,
@@ -247,14 +266,39 @@ class SourceFailoverManager:
             **health,
         }
 
+    def get_symbols(self) -> list[str]:
+        with self._lock:
+            return list(self.symbols)
+
     def set_symbols(self, symbols: list[str]) -> None:
-        self.symbols = list(symbols)
-        if not self._active_context:
+        next_symbols = [str(symbol).upper() for symbol in symbols if str(symbol).strip()]
+        with self._lock:
+            previous_symbols = list(self.symbols)
+            if previous_symbols == next_symbols:
+                return
+            self.symbols = next_symbols
+            if self._active_context:
+                self._reload_requested = True
+
+        if self._active_context:
+            logging.info(
+                "Symbol list changed, reconnecting active source with %s",
+                ", ".join(next_symbols),
+            )
+
+    def _take_reload_request(self) -> bool:
+        with self._lock:
+            requested = self._reload_requested
+            self._reload_requested = False
+            return requested
+
+    async def _reload_if_requested(self) -> None:
+        if not self._active_context or not self._take_reload_request():
             return
-        self._active_context.stream.set_symbols(self.symbols)
-        self._active_context.microstructure_state.set_symbols(self.symbols)
-        if self._active_context.microstructure_stream:
-            self._active_context.microstructure_stream.set_symbols(self.symbols)
+        await self._activate(
+            self._active_index,
+            "监控列表已更新，重建数据源连接",
+        )
 
     async def _stop_active(self) -> None:
         tasks = [task for task in (self._reader_task, self._micro_task) if task]
@@ -268,7 +312,7 @@ class SourceFailoverManager:
     async def _activate(self, index: int, note: str = "") -> None:
         await self._stop_active()
         self._active_index = index
-        self._active_context = build_source_context(self.config, self.symbols, self.specs[index])
+        self._active_context = build_source_context(self.config, self.get_symbols(), self.specs[index])
         self._nonce += 1
         current_nonce = self._nonce
         self._last_trade_at = time.monotonic()
@@ -317,6 +361,7 @@ class SourceFailoverManager:
         await self._activate(self._active_index, "")
         timeout_seconds = min(max(self.stale_after_seconds / 3, 1.0), 5.0)
         while True:
+            await self._reload_if_requested()
             try:
                 nonce, trade = await asyncio.wait_for(
                     self._queue.get(),
@@ -324,9 +369,11 @@ class SourceFailoverManager:
                 )
                 if nonce != self._nonce:
                     continue
+                await self._reload_if_requested()
                 self._last_trade_at = time.monotonic()
                 yield trade
             except asyncio.TimeoutError:
+                await self._reload_if_requested()
                 if time.monotonic() - self._last_trade_at >= self.stale_after_seconds:
                     await self._switch_to_next(
                         f"no trades for {int(time.monotonic() - self._last_trade_at)}s"

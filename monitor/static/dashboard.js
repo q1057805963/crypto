@@ -32,6 +32,9 @@
     const profileSymbolCountEl = document.getElementById("profile-symbol-count");
     const profileThemeEl = document.getElementById("profile-theme");
     const profileSymbolsEl = document.getElementById("profile-symbols");
+    const profileUsersSectionEl = document.getElementById("profile-users-section");
+    const profileUsersMetaEl = document.getElementById("profile-users-meta");
+    const profileUsersEl = document.getElementById("profile-users");
     const authScreen = document.getElementById("auth-screen");
     const authTitle = document.getElementById("auth-title");
     const authHint = document.getElementById("auth-hint");
@@ -44,7 +47,7 @@
     let selectedSymbol = null;
     let inputTouched = false;
     let symbolThresholds = {};
-    let globalThreshold = 70;
+    let globalThreshold = 60;
     let thresholdEditingSymbol = null;
     let aiResults = {};
     let aiRequestedAt = {};
@@ -61,12 +64,16 @@
     let timeframeAnalysisCache = {};
     let timeframeRequestedAt = {};
     let timeframeMeta = {};
+    let timeframeConfluenceCache = {};
+    let timeframeConfluenceRequestedAt = {};
+    let timeframeConfluenceMeta = {};
     let detailInteractionUntil = 0;
     let detailInteractionTimer = null;
     let pendingDetailRefresh = false;
     let pendingAIRefreshSymbol = null;
+    let symbolOrderDrag = null;
     const DETAIL_INTERACTION_LOCK_MS = 900;
-    const AI_ANALYSIS_CACHE_VERSION = "structure-levels-v2";
+    const AI_ANALYSIS_CACHE_VERSION = "scenario-v3";
     const TIMEFRAME_OPTIONS = ["5m", "15m", "1h", "4h", "1d"];
     const DETAIL_PERIOD_OPTIONS = [...TIMEFRAME_OPTIONS];
     const thresholdTriggerFields = {
@@ -167,10 +174,15 @@
     }
 
     function resetViewState() {
+      if (symbolOrderDrag) {
+        symbolOrderDrag.row.classList.remove("dragging");
+        symbolOrderDrag = null;
+        cleanupSymbolDrag();
+      }
       selectedSymbol = null;
       inputTouched = false;
       symbolThresholds = {};
-      globalThreshold = 70;
+      globalThreshold = 60;
       thresholdEditingSymbol = null;
       lastSymbols = [];
       aiResults = {};
@@ -179,6 +191,9 @@
       timeframeAnalysisCache = {};
       timeframeRequestedAt = {};
       timeframeMeta = {};
+      timeframeConfluenceCache = {};
+      timeframeConfluenceRequestedAt = {};
+      timeframeConfluenceMeta = {};
       drawerScrollBySymbol = {};
       aiScrollBySymbol = {};
       clearDeferredDetailState();
@@ -212,7 +227,7 @@
     function updateAuthUser(user) {
       currentUser = user;
       if (user && user.username) {
-        userScopeEl.textContent = `${user.username} · 个人配置`;
+        userScopeEl.textContent = `${user.username} · ${user.role || "user"}`;
         userScopeEl.title = "打开个人配置";
       } else {
         userScopeEl.textContent = `个人配置 ${userId.slice(-6)}`;
@@ -231,11 +246,75 @@
       profileSymbolsEl.innerHTML = lastSymbols.length
         ? lastSymbols.map((symbol) => `<span class="chip">${esc(symbol.symbol || symbol)}</span>`).join("")
         : `<span class="muted">暂无监控对象</span>`;
+      const isAdmin = currentUser && currentUser.role === "admin";
+      profileUsersSectionEl.classList.toggle("visible", Boolean(isAdmin));
+      if (isAdmin) {
+        profileUsersMetaEl.textContent = "正在加载系统用户...";
+        profileUsersEl.innerHTML = "";
+      } else {
+        profileUsersMetaEl.textContent = "仅管理员可见";
+        profileUsersEl.innerHTML = "";
+      }
+    }
+
+    function profileTimeText(ts) {
+      const value = Number(ts || 0);
+      if (!value) return "--";
+      const ms = value > 1e12 ? value : value * 1000;
+      return new Date(ms).toLocaleString();
+    }
+
+    function renderSystemUsers(users) {
+      const list = Array.isArray(users) ? users : [];
+      profileUsersMetaEl.textContent = `${list.length} 个系统用户`;
+      if (!list.length) {
+        profileUsersEl.innerHTML = `<div class="profile-users-meta">暂无用户</div>`;
+        return;
+      }
+      profileUsersEl.innerHTML = list.map((user) => {
+        const role = String(user.role || "user");
+        const symbols = Array.isArray(user.symbols) ? user.symbols : [];
+        const telegramText = user.telegram_enabled
+          ? `推送开 · ${Number(user.telegram_active_chat_count || 0)} 个 Chat`
+          : "推送关";
+        const aiText = user.ai_enabled
+          ? `AI开${user.ai_key_set ? " · Key已配" : " · Key未配"}`
+          : "AI关";
+        const thresholdText = Number(user.symbol_threshold_count || 0) > 0
+          ? `单币规则 ${Number(user.symbol_threshold_count || 0)} 个`
+          : "默认规则";
+        return `
+          <div class="profile-user-card">
+            <div class="profile-user-head">
+              <div class="profile-user-name">${esc(user.username || "--")}</div>
+              <div class="profile-user-role ${role === "admin" ? "admin" : ""}">${esc(role)}</div>
+            </div>
+            <div class="profile-user-meta">ID ${esc(user.user_id || "--")}</div>
+            <div class="profile-user-meta">创建 ${esc(profileTimeText(user.created_at))} · 监控 ${Number(user.symbol_count || symbols.length || 0)} 个</div>
+            <div class="profile-user-flags">${esc(telegramText)} · ${esc(aiText)} · ${esc(thresholdText)}</div>
+            <div class="profile-user-flags">${symbols.length ? esc(symbols.join(", ")) : "暂无监控合约"}</div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function loadSystemUsers() {
+      if (!currentUser || currentUser.role !== "admin") return;
+      try {
+        const response = await apiFetch("/api/users", { cache: "no-store" });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "用户列表加载失败");
+        renderSystemUsers(data.users || []);
+      } catch (error) {
+        profileUsersMetaEl.textContent = error.message || "用户列表加载失败";
+        profileUsersEl.innerHTML = "";
+      }
     }
 
     function openProfileModal() {
       renderProfileModal();
       openModal(profileModal);
+      loadSystemUsers();
     }
 
     function showAuth(mode = "login") {
@@ -375,6 +454,15 @@
         const raw = JSON.parse(localStorage.getItem(storageKey("cfm_ai_results")) || "{}");
         raw[key] = { text, ts: Date.now(), version: AI_ANALYSIS_CACHE_VERSION };
         localStorage.setItem(storageKey("cfm_ai_results"), JSON.stringify(raw));
+      } catch (error) {}
+    }
+
+    function clearStoredAIResults() {
+      aiResults = {};
+      aiRequestedAt = {};
+      aiMeta = {};
+      try {
+        localStorage.removeItem(storageKey("cfm_ai_results"));
       } catch (error) {}
     }
 
@@ -757,6 +845,7 @@
       aiBlock.innerHTML = renderAIBlock(symbol);
       const nextBlock = document.getElementById("ai-block");
       applyScrollRestore(nextBlock, aiScrollBySymbol[key] || 0);
+      syncAICopyButton(symbol);
     }
 
     function structureMarkerHtml(marker) {
@@ -960,14 +1049,14 @@
     }
 
     function signalTag(symbol) {
-      if (Number(symbol.score || 0) >= 70) return "报警";
+      if (Number(symbol.score || 0) >= 60) return "报警";
       if (Number(symbol.score || 0) >= 45) return "关注";
-      if (Math.abs(Number(symbol.price_move_pct_1m || 0)) >= 0.8) return "急动";
-      if (Number(symbol.volume_multiplier || 0) >= 3) return "放量";
-      if (Math.abs(Number(symbol.oi_change_pct_5m || 0)) >= 0.3) return "OI";
-      if ((symbol.liquidation_data_status || "") === "recent_event" && Number(symbol.liquidation_total_quote_1m || 0) >= 250000) return "爆仓";
-      if (Number(symbol.spread_bps || 0) >= 4 || Number(symbol.depth_drop_pct_1m || 0) >= 18) return "盘口";
-      if (Math.abs(Number(symbol.funding_rate || 0)) >= 0.0005) return "费率";
+      if (Math.abs(Number(symbol.price_move_pct_1m || 0)) >= 0.6) return "急动";
+      if (Number(symbol.volume_multiplier || 0) >= 2.2) return "放量";
+      if (Math.abs(Number(symbol.oi_change_pct_5m || 0)) >= 0.8) return "OI";
+      if ((symbol.liquidation_data_status || "") === "recent_event" && Number(symbol.liquidation_total_quote_1m || 0) >= 75000) return "爆仓";
+      if (Number(symbol.spread_bps || 0) >= 3 || Number(symbol.depth_drop_pct_1m || 0) >= 15) return "盘口";
+      if (Math.abs(Number(symbol.funding_rate || 0)) >= 0.0003) return "费率";
       if (Number(symbol.score || 0) > 0) return "监测";
       return "静默";
     }
@@ -1012,6 +1101,18 @@
     }
 
     function structureState(symbol) {
+      const regime = String(symbol.structure_regime || "");
+      const regimeLabels = {
+        support_lost: "支撑失守",
+        resistance_breakout: "压力突破",
+        support_test: "测试支撑",
+        resistance_test: "测试压力",
+        value_area_rotation: "价值区轮动",
+        upper_acceptance: "上方接受",
+        lower_acceptance: "下方接受",
+        balanced: "区间均衡"
+      };
+      if (regimeLabels[regime]) return regimeLabels[regime];
       const supportDistance = Number(symbol.support_distance_pct || 0);
       const resistanceDistance = Number(symbol.resistance_distance_pct || 0);
       const rangePosition = Number(symbol.range_position_pct || 50);
@@ -1034,6 +1135,8 @@
 
     function levelSourceText(source) {
       const labels = {
+        swing_volume_cluster: "摆动点+成交密集",
+        volume_profile_cluster: "成交密集区",
         swing_cluster: "摆动点聚类",
         touch_cluster: "触碰聚类",
         range_low: "阶段低点",
@@ -1044,16 +1147,35 @@
       return labels[source] || "结构聚类";
     }
 
+    function levelStatusText(status) {
+      const labels = {
+        valid: "有效",
+        testing: "测试中",
+        bounce_watch: "反抽确认",
+        rejection_watch: "遇阻确认",
+        lost_soft: "轻微跌破",
+        lost_confirmed: "放量失守",
+        breakout_soft: "轻微突破",
+        breakout_confirmed: "放量突破",
+        unknown: "待确认"
+      };
+      return labels[status] || "待确认";
+    }
+
     function levelEvidenceText(data, side) {
       const source = levelSourceText(data[`${side}_source`]);
       const touches = Number(data[`${side}_touch_count`] || 0);
       const pivots = Number(data[`${side}_pivot_count`] || 0);
       const strength = Number(data[`${side}_strength`] || 0);
+      const score = Number(data[`${side}_confluence_score`] || 0);
+      const status = levelStatusText(data[`${side}_status`]);
       const sampleCount = Number(data.structure_sample_count || 0);
       const parts = [source];
       if (touches > 0) parts.push(`${touches} 次触碰`);
       if (pivots > 0) parts.push(`${pivots} 个摆动点`);
-      if (strength > 0) parts.push(`强度 ${fmtNumber(strength, 1)}`);
+      if (score > 0) parts.push(`评分 ${fmtNumber(score, 0)}`);
+      else if (strength > 0) parts.push(`强度 ${fmtNumber(strength, 1)}`);
+      if (data[`${side}_status`]) parts.push(status);
       if (sampleCount > 0) parts.push(`${sampleCount} 根K线`);
       return parts.join(" · ");
     }
@@ -1095,7 +1217,7 @@
       const depthDrop = Number(symbol.depth_drop_pct_1m || 0);
       const imbalance = Number(symbol.depth_imbalance || 0) * 100;
       const spread = Number(symbol.spread_bps || 0);
-      if (depthDrop >= 18 && spread >= 4) {
+      if (depthDrop >= 15 && spread >= 3) {
         return `盘口明显变薄，点差 ${spread.toFixed(2)} bps，当前更要防插针和瞬时滑点。`;
       }
       if (buyRatio >= 65 && imbalance >= 10) {
@@ -1108,15 +1230,60 @@
     }
 
     function structureStateClass(state) {
-      if (state.includes("支撑")) return "up";
-      if (state.includes("压力")) return "down";
-      if (state.includes("上沿") || state.includes("下沿") || state.includes("窄")) return "mixed";
+      if (state.includes("失守") || state.includes("压力") || state.includes("下方")) return "down";
+      if (state.includes("突破") || state.includes("支撑") || state.includes("上方")) return "up";
+      if (state.includes("价值区") || state.includes("均衡") || state.includes("上沿") || state.includes("下沿") || state.includes("窄")) return "mixed";
       return "muted";
     }
 
     function hasEnabledThresholdRules(rules) {
       const conditions = rules && rules.conditions ? rules.conditions : {};
       return Object.values(conditions).some((cfg) => Boolean(cfg && cfg.enabled));
+    }
+
+    const aiTriggerLabels = {
+      score: ["异常分", "", 1],
+      quote_volume_1m: ["1分钟成交额", " USDT", 0],
+      volume_multiplier: ["量能倍数", "x", 2],
+      price_move_pct_1m_abs: ["1分钟波动", "%", 3],
+      oi_change_pct_5m_abs: ["OI 5分钟", "%", 3],
+      liquidation_total_quote_1m: ["1分钟爆仓额", " USDT", 0],
+      depth_imbalance_abs: ["盘口失衡", "%", 1],
+      depth_drop_pct_1m: ["深度下降", "%", 1],
+      spread_bps: ["盘口点差", " bps", 2]
+    };
+
+    function aiReasonText(reason) {
+      return {
+        "ai trigger not met": "触发条件未满足",
+        "retry cooldown": "失败冷却中",
+        "missing api key": "缺少 API Key",
+        "ai disabled": "AI 未开启",
+        "analysis timeout": "分析超时",
+        "analysis failed": "分析失败",
+        "no data": "暂无数据"
+      }[reason] || reason || "暂无分析";
+    }
+
+    function triggerCheckText(check) {
+      const spec = aiTriggerLabels[check.key] || [check.key || "条件", "", 2];
+      const digits = spec[2];
+      const value = Number(check.value || 0);
+      const threshold = Number(check.threshold || 0);
+      const format = (number) => Number(number).toLocaleString(undefined, {
+        maximumFractionDigits: digits,
+        minimumFractionDigits: 0
+      });
+      return `${spec[0]} ${format(value)}${spec[1]} / ${format(threshold)}${spec[1]}`;
+    }
+
+    function aiTriggerStatusText(trigger) {
+      if (!trigger || !Array.isArray(trigger.checks) || !trigger.checks.length) return "";
+      const matchedChecks = trigger.checks.filter((check) => check && check.matched);
+      const visibleChecks = (matchedChecks.length ? matchedChecks : trigger.checks).slice(0, 2);
+      const modeText = trigger.mode === "all" ? "全部条件" : "任一条件";
+      const resultText = trigger.matched ? "已满足" : "未满足";
+      return `${modeText}${resultText}: ${visibleChecks.map(triggerCheckText).join("; ")}`;
     }
 
     function applyThresholdRuleForm(rules, fallbackScore = globalThreshold) {
@@ -1196,10 +1363,81 @@
       return sections;
     }
 
+    function aiOpinionText(symbol, period = detailPeriod()) {
+      const text = String(aiResults[aiAnalysisKey(symbol, period)] || "").trim();
+      if (!text) return "";
+      const sections = aiSections(text);
+      if (!sections.length) return text;
+      const header = `${String(symbol || "").toUpperCase()} ${detailPeriodLabel(period)} AI 观点`;
+      return [
+        header,
+        "",
+        ...sections.map((item, index) => `${index + 1}. ${item.title}\n${item.body}`)
+      ].join("\n\n");
+    }
+
+    function hasAIAnalysis(symbol, period = detailPeriod()) {
+      return Boolean(String(aiResults[aiAnalysisKey(symbol, period)] || "").trim());
+    }
+
+    function syncAICopyButton(symbol = selectedSymbol) {
+      const button = document.getElementById("ai-copy-btn");
+      if (!button || button.dataset.copyFeedback === "1") return;
+      button.disabled = !hasAIAnalysis(symbol);
+    }
+
+    function writeClipboardText(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        return navigator.clipboard.writeText(text);
+      }
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.left = "-9999px";
+      document.body.appendChild(area);
+      area.select();
+      try {
+        document.execCommand("copy");
+        return Promise.resolve();
+      } finally {
+        document.body.removeChild(area);
+      }
+    }
+
+    async function copyAIOpinions(symbol) {
+      const text = aiOpinionText(symbol);
+      const button = document.getElementById("ai-copy-btn");
+      if (!text) {
+        updatedEl.textContent = "暂无可复制的 AI 观点";
+        return;
+      }
+      try {
+        await writeClipboardText(text);
+        updatedEl.textContent = "AI 观点已复制";
+        if (button) {
+          const original = button.textContent;
+          button.textContent = "已复制";
+          button.disabled = true;
+          button.dataset.copyFeedback = "1";
+          setTimeout(() => {
+            if (button.isConnected) {
+              button.textContent = original || "复制观点";
+              delete button.dataset.copyFeedback;
+              syncAICopyButton(symbol);
+            }
+          }, 1200);
+        }
+      } catch (error) {
+        updatedEl.textContent = "AI 观点复制失败";
+      }
+    }
+
     function renderAIBlock(symbol) {
       const period = detailPeriod();
       const periodLabel = detailPeriodLabel(period);
-      const text = aiResults[aiAnalysisKey(symbol, period)];
+      const key = aiAnalysisKey(symbol, period);
+      const text = aiResults[key];
       if (!text) {
         return `${aiStatusLine(symbol)}<div class="detail-placeholder">等待 AI 基于当前 ${esc(periodLabel)} 档位生成观察建议。</div>`;
       }
@@ -1244,6 +1482,31 @@
     function activeTimeframeData(symbol) {
       if (!symbol || !symbol.symbol || detailPeriod() === "realtime") return null;
       return cachedTimeframeAnalysis(symbol.symbol, detailPeriod());
+    }
+
+    function activeConfluenceData(symbol) {
+      if (!symbol || !symbol.symbol) return null;
+      return cachedTimeframeConfluence(symbol.symbol);
+    }
+
+    function confluenceTone(data) {
+      if (!data) return "muted";
+      if (data.direction === "up") return "up";
+      if (data.direction === "down") return "down";
+      return "mixed";
+    }
+
+    function confluenceLabel(data) {
+      if (!data) return "等待共振";
+      return `${data.label || "多周期共振"} ${fmtNumber(data.score, 1)}`;
+    }
+
+    function confluenceCopy(data) {
+      if (!data) return "正在汇总 5m、15m、1h、4h 的结构与动能。";
+      const conflicts = Array.isArray(data.conflicts) && data.conflicts.length
+        ? `分歧：${data.conflicts.slice(0, 1).join("；")}`
+        : "暂无明显周期冲突";
+      return `${data.summary || ""} ${conflicts}`.trim();
     }
 
     function timeframeAmplitudePct(data) {
@@ -1310,6 +1573,7 @@
 
     function renderOverviewPanel(symbol) {
       const periodData = activeTimeframeData(symbol);
+      const confluence = activeConfluenceData(symbol);
       if (periodData) {
         const period = periodData.period_label || detailPeriod();
         const focusItems = timeframeFocusItems(periodData);
@@ -1319,6 +1583,7 @@
               ${insightCard(`${period} 动能`, timeframeImpulseLabel(periodData), timeframeImpulseCopy(periodData), valueClass(periodData.price_move_pct))}
               ${insightCard("结构", structureState(periodData), timeframeNarrative(periodData), structureStateClass(structureState(periodData)))}
               ${insightCard("标记价", timeframeMarkLabel(periodData), timeframeMarkCopy(periodData), valueClass(periodData.mark_premium_bps))}
+              ${insightCard("多周期", confluenceLabel(confluence), confluenceCopy(confluence), confluenceTone(confluence))}
             </div>
             <div>
               <div class="detail-title">${esc(period)} 关注点</div>
@@ -1346,6 +1611,7 @@
             ${insightCard("结构", structureLive ? structureState(symbol) : "等待结构", structureText, structureLive ? structureStateClass(structureState(symbol)) : "muted")}
             ${insightCard("盘口", shortBias(symbol.bias || "观察"), flowText, rowClass(symbol))}
             ${insightCard("爆仓", liquidationStatusText(symbol), liquidationText, liquidationStatusClass(symbol))}
+            ${insightCard("多周期", confluenceLabel(confluence), confluenceCopy(confluence), confluenceTone(confluence))}
           </div>
           <div>
             <div class="detail-title">本次关注点</div>
@@ -1372,7 +1638,6 @@
         const spread = Math.max(resistance - support, 1e-9);
         const rangePos = clamp(Number(periodData.range_position_pct || 50), 0, 100);
         const vwapPos = clamp(((vwap - support) / spread) * 100, 0, 100);
-        const amplitude = timeframeAmplitudePct(periodData);
         return `
           <div class="detail-panel">
             <div class="range-rail-card">
@@ -1425,14 +1690,14 @@
                 <div class="metric-copy">${esc(period)} 均价偏离度</div>
               </div>
               <div class="metric">
-                <div class="metric-label">阶段高低</div>
-                <div class="metric-value ${amplitude !== null && amplitude >= 2 ? "mixed" : "muted"}">${amplitude === null ? "--" : fmtPlainPct(amplitude, 2)}</div>
-                <div class="metric-copy">${fmtPriceLevel(periodData.period_low_price)} / ${fmtPriceLevel(periodData.period_high_price)}</div>
+                <div class="metric-label">成交密集 POC</div>
+                <div class="metric-value">${fmtPriceLevel(periodData.profile_poc_price)}</div>
+                <div class="metric-copy">成交额 ${fmtNumber(periodData.profile_poc_quote_volume, 0)} USDT</div>
               </div>
               <div class="metric">
-                <div class="metric-label">相对前收</div>
-                <div class="metric-value ${valueClass(periodData.prev_close_pct)}">${fmtPlainPct(periodData.prev_close_pct, 2)}</div>
-                <div class="metric-copy">看上一根收盘后的延续性</div>
+                <div class="metric-label">价值区间</div>
+                <div class="metric-value">${fmtPriceLevel(periodData.value_area_low)} / ${fmtPriceLevel(periodData.value_area_high)}</div>
+                <div class="metric-copy">约 70% 成交额集中的接受区</div>
               </div>
             </div>
             <div class="period-note">${esc(timeframeNarrative(periodData))}</div>
@@ -1533,9 +1798,9 @@
               <div class="metric"><div class="metric-label">${esc(period)} 成交额</div><div class="metric-value">${fmtNumber(periodData.quote_volume, 0)} USDT</div><div class="metric-copy">该周期最新一根 K 线成交额</div></div>
               <div class="metric"><div class="metric-label">量能 / 均值</div><div class="metric-value ${Number(periodData.volume_multiplier || 0) >= 1.5 ? "up" : "muted"}">${fmtNumber(periodData.volume_multiplier, 2)}x</div><div class="metric-copy">相对近邻 K 线的放量程度</div></div>
               <div class="metric"><div class="metric-label">高低振幅</div><div class="metric-value ${amplitude !== null && amplitude >= 2 ? "mixed" : "muted"}">${amplitude === null ? "--" : fmtPlainPct(amplitude, 2)}</div><div class="metric-copy">${esc(timeframeCandleStatus(periodData))}</div></div>
-              <div class="metric"><div class="metric-label">相对前收</div><div class="metric-value ${valueClass(periodData.prev_close_pct)}">${fmtPlainPct(periodData.prev_close_pct, 2)}</div><div class="metric-copy">看是否承接上一根方向</div></div>
               <div class="metric"><div class="metric-label">标记价偏离</div><div class="metric-value ${valueClass(periodData.mark_premium_bps)}">${periodData.mark_premium_bps === null || periodData.mark_premium_bps === undefined ? "--" : `${fmtSignedNumber(periodData.mark_premium_bps, 1)} bps`}</div><div class="metric-copy">${esc(timeframeMarkLabel(periodData))}</div></div>
-              <div class="metric"><div class="metric-label">标记价涨跌</div><div class="metric-value ${valueClass(periodData.mark_move_pct)}">${periodData.mark_move_pct === null || periodData.mark_move_pct === undefined ? "--" : fmtPlainPct(periodData.mark_move_pct, 2)}</div><div class="metric-copy">观察标记价是否和成交价同步</div></div>
+              <div class="metric"><div class="metric-label">成交密集 POC</div><div class="metric-value">${fmtPriceLevel(periodData.profile_poc_price)}</div><div class="metric-copy">成交额 ${fmtNumber(periodData.profile_poc_quote_volume, 0)} USDT</div></div>
+              <div class="metric"><div class="metric-label">价值区间</div><div class="metric-value">${fmtPriceLevel(periodData.value_area_low)} / ${fmtPriceLevel(periodData.value_area_high)}</div><div class="metric-copy">判断市场接受区</div></div>
             </div>
             <div class="period-note">${esc(`${period} 周期里优先看成交额、量能倍数和标记价是否同步放大；这些更能说明这一档周期的推动质量。`)}</div>
             <div class="detail-title" style="margin-top:14px">实时补充</div>
@@ -1639,15 +1904,15 @@
         <div class="meter-grid">
           ${meterHtml("主动买入", tradeLive ? Number(symbol.taker_buy_ratio_1m || 0) * 100 : 0, tradeLive ? `${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%` : "--", Number(symbol.taker_buy_ratio_1m || 0) >= 0.6 ? "up" : Number(symbol.taker_buy_ratio_1m || 0) <= 0.4 ? "down" : "mixed", "看主动成交方向是否持续。")}
           ${meterHtml("盘口失衡", depthLive ? depthBalance : 0, depthLive ? `${fmtNumber(Number(symbol.depth_imbalance || 0) * 100, 1)}%` : "--", Number(symbol.depth_imbalance || 0) >= 0.1 ? "up" : Number(symbol.depth_imbalance || 0) <= -0.1 ? "down" : "mixed", "正值偏买盘，负值偏卖盘。")}
-          ${meterHtml("盘口点差", depthLive ? clamp((Number(symbol.spread_bps || 0) / 8) * 100, 0, 100) : 0, depthLive ? `${fmtNumber(symbol.spread_bps, 2)} bps` : "--", Number(symbol.spread_bps || 0) >= 4 ? "down" : Number(symbol.spread_bps || 0) >= 2 ? "mixed" : "blue", "越大越容易出现滑点。")}
-          ${meterHtml("深度下降", depthLive ? clamp((Number(symbol.depth_drop_pct_1m || 0) / 30) * 100, 0, 100) : 0, depthLive ? `${fmtNumber(symbol.depth_drop_pct_1m, 1)}%` : "--", Number(symbol.depth_drop_pct_1m || 0) >= 18 ? "down" : Number(symbol.depth_drop_pct_1m || 0) >= 10 ? "mixed" : "blue", "下降越快，越要防瞬时插针。")}
+          ${meterHtml("盘口点差", depthLive ? clamp((Number(symbol.spread_bps || 0) / 7) * 100, 0, 100) : 0, depthLive ? `${fmtNumber(symbol.spread_bps, 2)} bps` : "--", Number(symbol.spread_bps || 0) >= 3 ? "down" : Number(symbol.spread_bps || 0) >= 1.8 ? "mixed" : "blue", "越大越容易出现滑点。")}
+          ${meterHtml("深度下降", depthLive ? clamp((Number(symbol.depth_drop_pct_1m || 0) / 30) * 100, 0, 100) : 0, depthLive ? `${fmtNumber(symbol.depth_drop_pct_1m, 1)}%` : "--", Number(symbol.depth_drop_pct_1m || 0) >= 15 ? "down" : Number(symbol.depth_drop_pct_1m || 0) >= 8 ? "mixed" : "blue", "下降越快，越要防瞬时插针。")}
         </div>
       `;
     }
 
     function eventLevel(event) {
       const score = Number(event.score || 0);
-      if (score >= 70) return "风险预警";
+      if (score >= 60) return "风险预警";
       if (score >= 45) return "关注信号";
       return "观察信号";
     }
@@ -1677,6 +1942,7 @@
     const defaultCollapsedSections = {
       detail_micro: true,
       detail_reasons: true,
+      detail_ai: false,
       events: false,
     };
 
@@ -1729,37 +1995,15 @@
       const tradeLive = hasCoreTradeData(symbol);
       const oiLive = hasOiData(symbol);
       const depthLive = hasDepthData(symbol);
-      const periodData = activeTimeframeData(symbol);
-      const periodLabel = periodData && periodData.period_label ? periodData.period_label : detailPeriod();
-      const structureSource = periodData || symbol;
-      const structureLive = periodData
-        ? Number(periodData.support_price || 0) > 0 && Number(periodData.resistance_price || 0) > 0
-        : hasStructureData(symbol);
-      const items = periodData
-        ? [
-            ["风险", `<span class="${riskClass(symbol.risk_level)}">${esc(symbol.risk_level || "低风险")}</span>`],
-            ["置信度", tradeLive ? `${fmtNumber(symbol.confidence, 1)}%` : mutedValue()],
-            [`${periodLabel}波动`, fmtPctMaybe(periodData.price_move_pct, true)],
-            [`${periodLabel}成交额`, `${fmtNumber(periodData.quote_volume, 0)} USDT`],
-            [`${periodLabel}量能`, `<span class="${Number(periodData.volume_multiplier || 0) >= 1.5 ? "up" : "muted"}">${fmtNumber(periodData.volume_multiplier, 2)}x</span>`],
-            ["标记价", periodData.mark_move_pct === null || periodData.mark_move_pct === undefined ? mutedValue() : fmtPctMaybe(periodData.mark_move_pct, true)],
-            ["结构", structureLive ? `<span class="${structureStateClass(structureState(structureSource))}">${esc(structureState(structureSource))}</span>` : mutedValue("等待结构")],
-            ["标记偏离", periodData.mark_premium_bps === null || periodData.mark_premium_bps === undefined ? mutedValue() : `<span class="${valueClass(periodData.mark_premium_bps)}">${fmtSignedNumber(periodData.mark_premium_bps, 1)} bps</span>`],
-            [`${periodLabel}爆仓`, periodLiquidationHtml(periodData)],
-            ["点差", depthLive ? `${fmtBps(symbol.spread_bps)} bps` : mutedValue()]
-          ]
-        : [
-            ["风险", `<span class="${riskClass(symbol.risk_level)}">${esc(symbol.risk_level || "低风险")}</span>`],
-            ["置信度", tradeLive ? `${fmtNumber(symbol.confidence, 1)}%` : mutedValue()],
-            ["1m波动", fmtPctMaybe(symbol.price_move_pct_1m, tradeLive)],
-            ["1m成交额", fmtNumberMaybe(symbol.quote_volume_1m, 0, tradeLive)],
-            ["量能", tradeLive ? `<span class="${rowClass(symbol)}">${fmtNumber(symbol.volume_multiplier, 2)}x</span>` : mutedValue()],
-            ["OI 5m", fmtPctMaybe(symbol.oi_change_pct_5m, oiLive)],
-            ["主动买入", tradeLive ? `${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%` : mutedValue()],
-            ["结构", structureLive ? `<span class="${structureStateClass(structureState(structureSource))}">${esc(structureState(structureSource))}</span>` : mutedValue("等待结构")],
-            ["爆仓", `<span class="${liquidationStatusClass(symbol)}">${esc(liquidationStatusText(symbol))}</span>`],
-            ["点差", depthLive ? `${fmtBps(symbol.spread_bps)} bps` : mutedValue()]
-          ];
+      const items = [
+        ["1m波动", fmtPctMaybe(symbol.price_move_pct_1m, tradeLive)],
+        ["1m成交额", fmtNumberMaybe(symbol.quote_volume_1m, 0, tradeLive)],
+        ["1m量能", tradeLive ? `<span class="${rowClass(symbol)}">${fmtNumber(symbol.volume_multiplier, 2)}x</span>` : mutedValue()],
+        ["OI 5m", fmtPctMaybe(symbol.oi_change_pct_5m, oiLive)],
+        ["主动买入", tradeLive ? `${fmtNumber(Number(symbol.taker_buy_ratio_1m || 0) * 100, 1)}%` : mutedValue()],
+        ["爆仓1m", `<span class="${liquidationStatusClass(symbol)}">${esc(liquidationStatusText(symbol))}</span>`],
+        ["点差", depthLive ? `${fmtBps(symbol.spread_bps)} bps` : mutedValue()]
+      ];
       return `
         <div class="metric-summary ${extraClass}">
           ${items.map(([label, value]) => `
@@ -1772,6 +2016,145 @@
       `;
     }
 
+    function symbolNames(symbols) {
+      return (symbols || [])
+        .map((symbol) => String(symbol.symbol || symbol || "").toUpperCase())
+        .filter(Boolean);
+    }
+
+    function currentRowSymbolOrder() {
+      return Array.from(symbolsEl.querySelectorAll("tr[data-symbol]"))
+        .map((row) => String(row.dataset.symbol || "").toUpperCase())
+        .filter(Boolean);
+    }
+
+    function orderSymbolsByNames(symbols, names) {
+      const bySymbol = new Map((symbols || []).map((symbol) => [String(symbol.symbol || "").toUpperCase(), symbol]));
+      const seen = new Set();
+      const ordered = [];
+      for (const name of names || []) {
+        const key = String(name || "").toUpperCase();
+        if (!key || seen.has(key) || !bySymbol.has(key)) continue;
+        ordered.push(bySymbol.get(key));
+        seen.add(key);
+      }
+      for (const symbol of symbols || []) {
+        const key = String(symbol.symbol || "").toUpperCase();
+        if (!key || seen.has(key)) continue;
+        ordered.push(symbol);
+        seen.add(key);
+      }
+      return ordered;
+    }
+
+    function rowAfterPointer(clientY) {
+      const rows = Array.from(symbolsEl.querySelectorAll("tr[data-symbol]:not(.dragging)"));
+      let closest = { offset: Number.NEGATIVE_INFINITY, element: null };
+      rows.forEach((row) => {
+        const box = row.getBoundingClientRect();
+        const offset = clientY - box.top - box.height / 2;
+        if (offset < 0 && offset > closest.offset) {
+          closest = { offset, element: row };
+        }
+      });
+      return closest.element;
+    }
+
+    function cleanupSymbolDrag() {
+      window.removeEventListener("pointermove", moveSymbolDrag);
+      window.removeEventListener("pointerup", endSymbolDrag);
+      window.removeEventListener("pointercancel", cancelSymbolDrag);
+      symbolsEl.classList.remove("drag-active");
+    }
+
+    function beginSymbolDrag(event) {
+      if (event.button !== undefined && event.button !== 0) return;
+      const row = event.target.closest("tr[data-symbol]");
+      if (!row) return;
+      event.preventDefault();
+      event.stopPropagation();
+      symbolOrderDrag = {
+        row,
+        moved: false,
+        pointerId: event.pointerId,
+      };
+      row.classList.add("dragging");
+      symbolsEl.classList.add("drag-active");
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId);
+      } catch (error) {
+        // Pointer capture may be unavailable in older embedded browsers.
+      }
+      window.addEventListener("pointermove", moveSymbolDrag, { passive: false });
+      window.addEventListener("pointerup", endSymbolDrag);
+      window.addEventListener("pointercancel", cancelSymbolDrag);
+    }
+
+    function moveSymbolDrag(event) {
+      if (!symbolOrderDrag) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const afterRow = rowAfterPointer(event.clientY);
+      if (afterRow) {
+        symbolsEl.insertBefore(symbolOrderDrag.row, afterRow);
+      } else {
+        symbolsEl.appendChild(symbolOrderDrag.row);
+      }
+      symbolOrderDrag.moved = true;
+      lastSymbols = orderSymbolsByNames(lastSymbols, currentRowSymbolOrder());
+    }
+
+    async function saveSymbolOrder(order) {
+      if (!order.length) return;
+      symbolInputEl.value = order.join(", ");
+      inputTouched = false;
+      try {
+        const response = await apiFetch("/api/symbols", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ symbols: order })
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "排序保存失败");
+        updatedEl.textContent = "监控顺序已保存";
+      } catch (error) {
+        updatedEl.textContent = error.message || "排序保存失败";
+      }
+    }
+
+    function endSymbolDrag(event) {
+      if (!symbolOrderDrag) return;
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      const moved = symbolOrderDrag.moved;
+      const row = symbolOrderDrag.row;
+      row.classList.remove("dragging");
+      symbolOrderDrag = null;
+      cleanupSymbolDrag();
+
+      if (!moved) return;
+      const order = currentRowSymbolOrder();
+      const orderedSymbols = orderSymbolsByNames(lastSymbols, order);
+      renderSymbols(orderedSymbols);
+      renderDetail(orderedSymbols);
+      renderEvents(lastEvents);
+      saveSymbolOrder(order);
+    }
+
+    function cancelSymbolDrag(event) {
+      if (!symbolOrderDrag) return;
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      symbolOrderDrag.row.classList.remove("dragging");
+      symbolOrderDrag = null;
+      cleanupSymbolDrag();
+      renderSymbols(lastSymbols);
+    }
+
     function renderSymbols(symbols) {
       lastSymbols = symbols || [];
       countEl.textContent = `${symbols.length} 个合约`;
@@ -1780,29 +2163,34 @@
         if (!selectedSymbol) setDrawerOpen(false);
       }
       if (!inputTouched) {
-        symbolInputEl.value = symbols.map((symbol) => symbol.symbol).join(", ");
+        symbolInputEl.value = symbolNames(symbols).join(", ");
       }
 
       symbolsEl.innerHTML = symbols.map((symbol) => `
         <tr data-symbol="${esc(symbol.symbol)}" class="${symbol.symbol === selectedSymbol ? "selected" : ""}">
-          <td>
-            <div class="symbol">${esc(symbol.symbol)}</div>
-            <div class="symbol-meta">
-              <span class="sub-pill">${esc(signalTag(symbol))}</span>
-              <button class="row-action-btn js-threshold ${thresholdButtonText(symbol.symbol) !== "规则" ? "active" : ""}" data-symbol="${esc(symbol.symbol)}" type="button" title="${esc(currentThresholdText(symbol.symbol))}">${esc(thresholdButtonText(symbol.symbol))}</button>
+          <td data-label="合约">
+            <div class="symbol-cell">
+              <button class="drag-handle js-drag-handle" type="button" aria-label="拖拽调整顺序" title="拖拽调整顺序"></button>
+              <div class="symbol-text">
+                <div class="symbol">${esc(symbol.symbol)}</div>
+                <div class="symbol-meta">
+                  <span class="sub-pill">${esc(signalTag(symbol))}</span>
+                  <button class="row-action-btn js-threshold ${thresholdButtonText(symbol.symbol) !== "规则" ? "active" : ""}" data-symbol="${esc(symbol.symbol)}" type="button" title="${esc(currentThresholdText(symbol.symbol))}">${esc(thresholdButtonText(symbol.symbol))}</button>
+                </div>
+              </div>
             </div>
           </td>
-          <td><span class="score">${fmtNumber(symbol.score, 1)}</span></td>
-          <td><span class="risk ${riskClass(symbol.risk_level)}">${esc(symbol.risk_level || "低风险")}</span></td>
-          <td><span class="tag ${biasClass(symbol.bias)}">${esc(shortBias(symbol.bias))}</span></td>
-          <td>${fmtNumber(symbol.price, 8)}</td>
-          <td>${fmtPct(symbol.price_move_pct_1m)}</td>
-          <td>${fmtPct(symbol.price_move_pct_5m)}</td>
-          <td>${fmtNumber(symbol.quote_volume_1m, 0)}</td>
-          <td class="${rowClass(symbol)}">${fmtNumber(symbol.volume_multiplier, 2)}x</td>
-          <td>${fmtPct(symbol.oi_change_pct_5m)}</td>
-          <td>${liquidationTotalHtml(symbol)}</td>
-          <td>${fmtBps(symbol.spread_bps)}</td>
+          <td data-label="异常分"><span class="score">${fmtNumber(symbol.score, 1)}</span></td>
+          <td data-label="风险"><span class="risk ${riskClass(symbol.risk_level)}">${esc(symbol.risk_level || "低风险")}</span></td>
+          <td data-label="倾向"><span class="tag ${biasClass(symbol.bias)}">${esc(shortBias(symbol.bias))}</span></td>
+          <td data-label="价格">${fmtNumber(symbol.price, 8)}</td>
+          <td data-label="1分钟">${fmtPct(symbol.price_move_pct_1m)}</td>
+          <td data-label="5分钟">${fmtPct(symbol.price_move_pct_5m)}</td>
+          <td data-label="1分钟成交额">${fmtNumber(symbol.quote_volume_1m, 0)}</td>
+          <td data-label="放大倍数" class="${rowClass(symbol)}">${fmtNumber(symbol.volume_multiplier, 2)}x</td>
+          <td data-label="OI 5分钟">${fmtPct(symbol.oi_change_pct_5m)}</td>
+          <td data-label="爆仓1m">${liquidationTotalHtml(symbol)}</td>
+          <td data-label="点差">${fmtBps(symbol.spread_bps)}</td>
         </tr>
       `).join("");
 
@@ -1817,13 +2205,16 @@
       });
       symbolsEl.querySelectorAll(".js-threshold").forEach((button) => {
         button.addEventListener("click", (event) => {
+          event.preventDefault();
           event.stopPropagation();
-          selectedSymbol = button.dataset.symbol;
-          openDetailDrawer(selectedSymbol);
-          renderSymbols(symbols);
-          renderDetail(symbols);
-          renderEvents(lastEvents);
-          openThresholdModal(selectedSymbol);
+          openThresholdModal(button.dataset.symbol);
+        });
+      });
+      symbolsEl.querySelectorAll(".js-drag-handle").forEach((handle) => {
+        handle.addEventListener("pointerdown", beginSymbolDrag);
+        handle.addEventListener("click", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
         });
       });
     }
@@ -1847,6 +2238,7 @@
       const activeTab = detailTab();
       maybeLoadAIAnalysis(symbol);
       maybeLoadTimeframeAnalysis(symbol.symbol);
+      maybeLoadTimeframeConfluence(symbol.symbol);
       detailEl.innerHTML = `
         <div class="detail-head">
           <div class="detail-meta">
@@ -1879,12 +2271,15 @@
           ${detailTabButton("liquidity", "流动性")}
         </div>
         ${activeTab === "ai" ? `
-          <div class="detail-panel">
+          <div class="detail-panel collapsible${collapseClass("detail_ai")}">
             <div class="ai-panel-head">
-              <div class="detail-title">AI 会优先基于当前 ${esc(detailPeriodLabel())} 档位生成分析</div>
-              <button class="inline-link" id="ai-refresh-btn" type="button">刷新</button>
+              ${collapseHead("detail_ai", `AI 会优先基于当前 ${detailPeriodLabel()} 档位生成分析`)}
+              <div class="ai-actions">
+                <button class="inline-link" id="ai-copy-btn" type="button" ${hasAIAnalysis(symbol.symbol) ? "" : "disabled"}>复制观点</button>
+                <button class="inline-link" id="ai-refresh-btn" type="button">刷新</button>
+              </div>
             </div>
-            <div class="detail-list ai-inline" id="ai-block">${renderAIBlock(symbol.symbol)}</div>
+            <div class="detail-list ai-inline collapsible-body" id="ai-block">${renderAIBlock(symbol.symbol)}</div>
           </div>
         ` : ""}
         ${activeTab === "overview" ? renderOverviewPanel(symbol) : ""}
@@ -1907,18 +2302,78 @@
         eventsEl.innerHTML = `<div class="empty">${selectedSymbol ? "暂无该合约报警" : "暂无报警"}</div>`;
         return;
       }
+      function verdictText(verdict) {
+        return {
+          validated: "验证",
+          failed: "失败",
+          faded: "回吐",
+          neutral: "中性"
+        }[verdict] || "待判";
+      }
       function followupTone(item) {
         if (!item || item.status !== "resolved") return "pending";
-        const closeBps = Number(item.close_bps || 0);
-        if (closeBps > 0) return "up";
-        if (closeBps < 0) return "down";
+        if (item.verdict === "validated") return "up";
+        if (item.verdict === "failed") return "down";
         return "mixed";
       }
       function followupText(item) {
         if (!item) return "";
         const label = item.label || `${item.horizon_minutes || 0}m`;
         if (item.status !== "resolved") return `${label} 待回写`;
-        return `${label} ${fmtSignedNumber(item.close_bps, 1)}bp · ↑${fmtSignedNumber(item.max_up_bps, 1)} · ↓${fmtSignedNumber(item.max_down_bps, 1)}`;
+        const directional = item.directional_close_bps === undefined ? item.close_bps : item.directional_close_bps;
+        return `${label} ${verdictText(item.verdict)} ${fmtSignedNumber(directional, 1)}bp · 顺${fmtNumber(item.max_favorable_bps, 1)} · 逆${fmtNumber(item.max_adverse_bps, 1)}`;
+      }
+      function decisionRow(event) {
+        const decision = event.decision || {};
+        if (!decision.directional || !decision.invalidation_price) return "";
+        const direction = String(event.direction || "");
+        const invalidationSign = direction === "up" ? "跌破" : "站上";
+        const targetText = decision.target_price
+          ? `目标 ${fmtPriceLevel(decision.target_price)}${decision.reward_risk ? ` · RR ${fmtNumber(decision.reward_risk, 2)}` : ""}`
+          : "目标等待结构确认";
+        const qualityText = {
+          high: "高质量",
+          medium: "中等质量",
+          low: "低质量"
+        }[decision.boundary_quality] || "";
+        const basisText = decision.invalidation_basis
+          ? ` · 依据 ${decision.invalidation_basis}${qualityText ? ` / ${qualityText}` : ""}`
+          : "";
+        return `
+          <div class="event-row">
+            <span class="event-label">边界</span>
+            <span class="event-text">${esc(invalidationSign)} ${fmtPriceLevel(decision.invalidation_price)} 失效 · 风险 ${fmtNumber(decision.invalidation_bps, 1)}bp · ${esc(targetText + basisText)}</span>
+          </div>
+        `;
+      }
+      function statsRow(event) {
+        const stats = event.signal_stats || {};
+        const sampleCount = Number(stats.sample_count || 0);
+        if (!sampleCount) return "";
+        const sampleTone = sampleCount >= 20 ? "" : " muted";
+        return `
+          <div class="event-row">
+            <span class="event-label">同币</span>
+            <span class="event-text${sampleTone}">${esc(stats.label || "15m")} 同币同向样本 ${sampleCount} · 胜率 ${fmtNumber(stats.win_rate, 1)}% · 均值 ${fmtSignedNumber(stats.avg_close_bps, 1)}bp · 顺${fmtNumber(stats.avg_favorable_bps, 1)} / 逆${fmtNumber(stats.avg_adverse_bps, 1)}</span>
+          </div>
+        `;
+      }
+      function comboStatsRow(event) {
+        const combo = event.trigger_combo || {};
+        const stats = event.combo_stats || {};
+        const comboLabel = combo.label || stats.combo_label || "";
+        const sampleCount = Number(stats.sample_count || 0);
+        if (!comboLabel && !sampleCount) return "";
+        const sampleTone = sampleCount >= 20 ? "" : " muted";
+        const statsText = sampleCount
+          ? `${esc(stats.label || "15m")} 同组合样本 ${sampleCount} · 胜率 ${fmtNumber(stats.win_rate, 1)}% · 均值 ${fmtSignedNumber(stats.avg_close_bps, 1)}bp · 顺${fmtNumber(stats.avg_favorable_bps, 1)} / 逆${fmtNumber(stats.avg_adverse_bps, 1)}`
+          : "同组合样本不足，先只作为分类观察";
+        return `
+          <div class="event-row">
+            <span class="event-label">组合</span>
+            <span class="event-text${sampleTone}">${comboLabel ? `${esc(comboLabel)} · ` : ""}${statsText}</span>
+          </div>
+        `;
       }
       function followupRow(event) {
         const items = event.followups || [];
@@ -1953,8 +2408,11 @@
               </div>
               <span class="event-badge ${directionClass}">${esc(directionLabel)}</span>
             </div>
-            <div class="event-row"><span class="event-label">触发</span><span class="event-text">${esc(reasons)}</span></div>
-            <div class="event-row"><span class="event-label">观察</span><span class="event-text ${aiObservation ? "" : "muted"}">${esc(observation)}</span></div>
+            <div class="event-row"><span class="event-label">触发原因</span><span class="event-text">${esc(reasons)}</span></div>
+            <div class="event-row"><span class="event-label">观察建议</span><span class="event-text ${aiObservation ? "" : "muted"}">${esc(observation)}</span></div>
+            ${decisionRow(event)}
+            ${statsRow(event)}
+            ${comboStatsRow(event)}
             ${followupRow(event)}
           </div>
         `;
@@ -1969,15 +2427,22 @@
         const exchangeLabel = (data.exchange || "binance_usdm").startsWith("okx") ? "OKX" : "Binance";
         const transportLabel = data.data_source === "websocket" ? "WebSocket" : "REST";
         const symbols = data.symbols || [];
+        const displaySymbols = symbolOrderDrag
+          ? orderSymbolsByNames(symbols, currentRowSymbolOrder())
+          : symbols;
         sourceLabelEl.textContent = `${exchangeLabel} ${transportLabel}`;
         renderSourceHealth(data.source_health || {});
-        renderSymbols(symbols);
-        if (shouldDeferDetailRender(symbols)) {
+        if (symbolOrderDrag) {
+          lastSymbols = displaySymbols;
+        } else {
+          renderSymbols(displaySymbols);
+        }
+        if (shouldDeferDetailRender(displaySymbols)) {
           pendingDetailRefresh = true;
         } else {
           pendingDetailRefresh = false;
           pendingAIRefreshSymbol = null;
-          renderDetail(symbols);
+          renderDetail(displaySymbols);
         }
         lastEvents = data.events || [];
         renderEvents(lastEvents);
@@ -2258,6 +2723,18 @@
     const aiSaveBtn = document.getElementById("ai-save-btn");
     let aiEnabled = false;
 
+    function syncAIScoreThresholdFromMain() {
+      const fields = aiTriggerFields.score;
+      if (!fields || !fields[0].checked) return;
+      fields[1].value = aiThreshold.value || fields[1].value;
+    }
+
+    function syncAIMainThresholdFromScore() {
+      const fields = aiTriggerFields.score;
+      if (!fields || !fields[0].checked) return;
+      aiThreshold.value = fields[1].value || aiThreshold.value;
+    }
+
     async function loadAIConfig() {
       try {
         const response = await apiFetch("/api/ai/config", { cache: "no-store" });
@@ -2277,7 +2754,8 @@
         Object.entries(aiTriggerFields).forEach(([key, fields]) => {
           const cfg = conditions[key] || {};
           fields[0].checked = Boolean(cfg.enabled ?? (key === "score"));
-          fields[1].value = cfg.threshold ?? fields[1].value;
+          const defaultThreshold = key === "score" ? (data.activation_threshold || fields[1].value) : fields[1].value;
+          fields[1].value = cfg.threshold ?? defaultThreshold;
         });
       } catch (error) {
         updatedEl.textContent = "AI 配置读取失败";
@@ -2296,6 +2774,7 @@
     }
 
     async function saveAIConfig() {
+      syncAIScoreThresholdFromMain();
       const body = {
         enabled: aiEnabled,
         provider: aiProvider.value,
@@ -2317,7 +2796,7 @@
         });
         const data = await response.json();
         if (!response.ok || !data.ok) throw new Error(data.error || "保存失败");
-        aiResults = {};
+        clearStoredAIResults();
         updatedEl.textContent = "AI 设置已保存";
         closeModal(aiModal);
       } catch (error) {
@@ -2333,13 +2812,16 @@
       aiEnabled = !aiEnabled;
       setToggle(aiToggle, aiToggleLabel, aiEnabled);
     });
+    aiThreshold.addEventListener("input", syncAIScoreThresholdFromMain);
+    aiTriggerFields.score[0].addEventListener("change", syncAIScoreThresholdFromMain);
+    aiTriggerFields.score[1].addEventListener("input", syncAIMainThresholdFromScore);
     aiSaveBtn.addEventListener("click", saveAIConfig);
 
     async function loadSymbolThresholds() {
       try {
         const response = await apiFetch("/api/symbol_thresholds", { cache: "no-store" });
         const data = await response.json();
-        globalThreshold = Number(data.default_score || 70);
+        globalThreshold = Number(data.default_score || 60);
         symbolThresholds = data.symbol_thresholds || {};
       } catch (error) {
         symbolThresholds = {};
@@ -2425,23 +2907,17 @@
             status: data.cached ? "使用缓存" : "已更新",
             ts: Date.now()
           };
+          if (selectedSymbol === symbol && detailPeriod() === period) refreshAIBlock(symbol);
+          updatedEl.textContent = data.cached ? `AI ${periodLabel} 分析使用缓存` : `AI ${periodLabel} 分析已更新`;
         } else {
           const reason = data.reason || "暂无分析";
-          if (reason === "ai trigger not met") {
-            aiMeta[key] = { status: "触发条件未满足", ts: Date.now() };
-            if (selectedSymbol === symbol && detailPeriod() === period) refreshAIBlock(symbol);
-            updatedEl.textContent = `AI ${periodLabel} 触发条件未满足`;
-            return;
-          }
-          if (reason === "retry cooldown") {
-            aiMeta[key] = { status: "冷却中", ts: Date.now() };
-          } else {
-            aiMeta[key] = { status: reason, ts: Date.now() };
-            aiResults[key] = reason;
-          }
+          const triggerText = aiTriggerStatusText(data.trigger);
+          const status = triggerText ? `${aiReasonText(reason)} · ${triggerText}` : aiReasonText(reason);
+          aiMeta[key] = { status, ts: Date.now() };
+          if (selectedSymbol === symbol && detailPeriod() === period) refreshAIBlock(symbol);
+          updatedEl.textContent = `AI ${periodLabel} ${status}`;
+          return;
         }
-        if (selectedSymbol === symbol && detailPeriod() === period) refreshAIBlock(symbol);
-        updatedEl.textContent = data.cached ? `AI ${periodLabel} 分析使用缓存` : `AI ${periodLabel} 分析已更新`;
       } catch (error) {
         aiMeta[key] = { status: "AI 请求失败", ts: Date.now() };
         if (selectedSymbol === symbol && detailPeriod() === period) {
@@ -2467,6 +2943,49 @@
 
     function cachedTimeframeAnalysis(symbol, period = detailPeriod()) {
       return timeframeAnalysisCache[timeframeKey(symbol, period)] || null;
+    }
+
+    function confluenceKey(symbol) {
+      return `${String(symbol || "").toUpperCase()}::multi`;
+    }
+
+    function cachedTimeframeConfluence(symbol) {
+      return timeframeConfluenceCache[confluenceKey(symbol)] || null;
+    }
+
+    async function fetchTimeframeConfluence(symbol, force = false) {
+      if (!symbol) return;
+      const key = confluenceKey(symbol);
+      if (!force && timeframeConfluenceMeta[key] && timeframeConfluenceMeta[key].loading) return;
+      timeframeConfluenceMeta[key] = { loading: true, error: "", ts: Date.now() };
+      timeframeConfluenceRequestedAt[key] = Date.now();
+      try {
+        const url = `/api/timeframe/confluence?symbol=${encodeURIComponent(symbol)}${force ? "&force=1" : ""}`;
+        const response = await apiFetch(url, { cache: "no-store" });
+        const data = await response.json();
+        if (!response.ok || !data.ok || !data.analysis) {
+          throw new Error(data.error || "多周期共振失败");
+        }
+        timeframeConfluenceCache[key] = data.analysis;
+        timeframeConfluenceMeta[key] = { loading: false, error: "", ts: Date.now() };
+      } catch (error) {
+        timeframeConfluenceMeta[key] = {
+          loading: false,
+          error: error && error.message ? error.message : "多周期共振失败",
+          ts: Date.now()
+        };
+      }
+      if (selectedSymbol === symbol) renderDetail(lastSymbols);
+    }
+
+    function maybeLoadTimeframeConfluence(symbol, force = false) {
+      if (!symbol) return;
+      const key = confluenceKey(symbol);
+      const cached = timeframeConfluenceCache[key];
+      const lastRequested = timeframeConfluenceRequestedAt[key] || 0;
+      if (!force && cached && Date.now() - Number(cached.generated_at || 0) * 1000 < 30000) return;
+      if (!force && Date.now() - lastRequested < 6000) return;
+      fetchTimeframeConfluence(symbol, force);
     }
 
     async function fetchTimeframeAnalysis(symbol, period = detailPeriod(), force = false) {
@@ -2539,6 +3058,24 @@
       const volume = Number(data.volume_multiplier || 0);
       const support = fmtPriceLevel(data.support_price);
       const resistance = fmtPriceLevel(data.resistance_price);
+      const poc = fmtPriceLevel(data.profile_poc_price);
+      const valueLow = fmtPriceLevel(data.value_area_low);
+      const valueHigh = fmtPriceLevel(data.value_area_high);
+      if (state === "支撑失守") {
+        return `${data.period_label} 支撑 ${support} 已被跌破，若无法快速收回价值区 ${valueLow} - ${valueHigh}，先按破位后的反抽压力处理。`;
+      }
+      if (state === "压力突破") {
+        return `${data.period_label} 压力 ${resistance} 已被突破，重点看价格能否在 POC ${poc} 上方继续被市场接受。`;
+      }
+      if (state === "测试支撑") {
+        return `当前正在测试 ${data.period_label} 支撑 ${support}，更有价值的确认是缩量不破，或快速收回 POC ${poc}。`;
+      }
+      if (state === "测试压力") {
+        return `当前正在测试 ${data.period_label} 压力 ${resistance}，若没有放量站上，容易先回到价值区 ${valueLow} - ${valueHigh} 内轮动。`;
+      }
+      if (state === "价值区轮动") {
+        return `价格仍在价值区 ${valueLow} - ${valueHigh} 内轮动，优先按均值回归处理，等待离开价值区后的接受/拒绝信号。`;
+      }
       if (move >= 1 && volume >= 1.5) {
         return `${data.period_label} 周期里价格正向推动明显，且量能高于近邻均值；短线重点看 ${resistance} 一带能否被继续放量站上。`;
       }
@@ -2560,7 +3097,7 @@
         <div class="period-head">
           <div>
             <div class="detail-title">周期视图</div>
-            <div class="period-meta">查看当前周期下的价格、量能、结构、标记价与实时补充。</div>
+            <div class="period-meta">交易所原生 K 线、成交额与标记价走势。</div>
           </div>
         </div>
       `;
@@ -2583,7 +3120,9 @@
       const key = timeframeKey(symbol.symbol, period);
       const meta = timeframeMeta[key] || null;
       const data = cachedTimeframeAnalysis(symbol.symbol, period);
+      const confluence = cachedTimeframeConfluence(symbol.symbol);
       maybeLoadTimeframeAnalysis(symbol.symbol, false);
+      maybeLoadTimeframeConfluence(symbol.symbol, false);
       const statusText = timeframeStatusText(meta, data);
       const statusClass = meta && meta.error ? "period-status error" : "period-status";
       if (!data) {
@@ -2615,8 +3154,8 @@
               <div class="period-pill-value ${priceTone}">${fmtPctMaybe(data.price_move_pct, true)}</div>
             </div>
             <div class="period-pill">
-              <div class="period-pill-label">相对前收</div>
-              <div class="period-pill-value ${valueClass(data.prev_close_pct)}">${fmtPctMaybe(data.prev_close_pct, true)}</div>
+              <div class="period-pill-label">结构状态</div>
+              <div class="period-pill-value ${structureStateClass(structureState(data))}">${esc(structureState(data))}</div>
             </div>
             <div class="period-pill">
               <div class="period-pill-label">量能 / 均值</div>
@@ -2626,19 +3165,16 @@
               <div class="period-pill-label">标记价偏离</div>
               <div class="period-pill-value ${valueClass(data.mark_premium_bps)}">${data.mark_premium_bps === null || data.mark_premium_bps === undefined ? "--" : `${fmtSignedNumber(data.mark_premium_bps, 1)} bps`}</div>
             </div>
+            <div class="period-pill">
+              <div class="period-pill-label">多周期共振</div>
+              <div class="period-pill-value ${confluenceTone(confluence)}">${confluence ? fmtNumber(confluence.score, 1) : "--"}</div>
+            </div>
           </div>
           <div class="visual-grid">
             ${chartCard(`${data.period_label} 价格轨迹`, fmtPctMaybe(data.price_move_pct, true), priceChart, "span-2")}
             ${chartCard(`${data.period_label} 成交额`, `${fmtNumber(data.quote_volume, 0)} USDT`, volumeChart)}
             ${chartCard(`${data.period_label} 标记价`, data.mark_move_pct === null || data.mark_move_pct === undefined ? mutedValue() : fmtPctMaybe(data.mark_move_pct, true), markChart)}
           </div>
-          <div class="metric-grid compact" style="margin-top:12px">
-            <div class="metric"><div class="metric-label">结构支撑</div><div class="metric-value up">${fmtPriceLevel(data.support_price)}</div><div class="metric-copy">${esc(levelEvidenceText(data, "support"))}</div></div>
-            <div class="metric"><div class="metric-label">结构压力</div><div class="metric-value down">${fmtPriceLevel(data.resistance_price)}</div><div class="metric-copy">${esc(levelEvidenceText(data, "resistance"))}</div></div>
-            <div class="metric"><div class="metric-label">VWAP</div><div class="metric-value ${valueClass(data.vwap_deviation_pct)}">${fmtPriceLevel(data.window_vwap)}</div><div class="metric-copy">偏离 ${fmtPlainPct(data.vwap_deviation_pct, 3)}</div></div>
-            <div class="metric"><div class="metric-label">阶段高低</div><div class="metric-value">${fmtPriceLevel(data.period_low_price)} / ${fmtPriceLevel(data.period_high_price)}</div><div class="metric-copy">${esc(structureState(data))}</div></div>
-          </div>
-          <div class="period-note">${esc(timeframeNarrative(data))}</div>
         </section>
       `;
     }
@@ -2662,8 +3198,13 @@
         fetchAIAnalysis(selectedSymbol, true);
         return;
       }
+      if (event.target.id === "ai-copy-btn" && selectedSymbol) {
+        copyAIOpinions(selectedSymbol);
+        return;
+      }
       if (event.target.id === "period-refresh-btn" && selectedSymbol) {
         fetchTimeframeAnalysis(selectedSymbol, detailPeriod(), true);
+        fetchTimeframeConfluence(selectedSymbol, true);
       }
     });
     detailEl.addEventListener("scroll", (event) => {

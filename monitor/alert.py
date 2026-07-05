@@ -32,8 +32,8 @@ class ConsoleAlert:
         print(f"空头爆仓1m: {event.short_liquidation_quote_1m:,.0f} USDT")
         print(f"盘口点差: {event.spread_bps:.2f} bps")
         print(f"盘口深度下降: {event.depth_drop_pct_1m:.2f}%")
-        print("原因: " + "; ".join(event.reasons))
-        print("观察: " + "; ".join(event.suggestions))
+        print("触发原因: " + ("; ".join(event.reasons) or "暂无明确触发项"))
+        print("观察建议: " + ("; ".join(event.suggestions) or "继续观察"))
         if event.ai_summary:
             print("AI: " + "; ".join(event.ai_summary))
         print("=" * 72)

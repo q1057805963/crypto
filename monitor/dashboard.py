@@ -64,22 +64,22 @@ SIGNAL_SETTING_FIELDS = {
     "liquidation": {
         "enabled_key": "liquidation_enabled",
         "threshold_key": "liquidation_quote_1m",
-        "default_threshold": 250000,
+        "default_threshold": 75000,
     },
     "spread": {
         "enabled_key": "spread_enabled",
         "threshold_key": "spread_bps",
-        "default_threshold": 4.0,
+        "default_threshold": 3.0,
     },
     "depth_imbalance": {
         "enabled_key": "depth_imbalance_enabled",
         "threshold_key": "depth_imbalance_abs",
-        "default_threshold": 0.18,
+        "default_threshold": 0.22,
     },
     "depth_drop": {
         "enabled_key": "depth_drop_enabled",
         "threshold_key": "depth_drop_pct_1m",
-        "default_threshold": 18.0,
+        "default_threshold": 15.0,
     },
 }
 
@@ -120,6 +120,38 @@ def apply_signal_settings(thresholds: dict, payload: dict) -> dict:
     return updated
 
 
+def user_admin_summary(auth_user: dict, user_config: dict | None = None) -> dict:
+    config = user_config or {}
+    telegram = config.get("telegram") or {}
+    ai = config.get("ai") or {}
+    telegram_users = normalize_telegram_users(
+        telegram.get("users"),
+        str(telegram.get("bot_token", "")),
+        telegram.get("chat_ids", []),
+    )
+    active_telegram_users = [
+        user for user in telegram_users
+        if user.get("enabled", True) and user.get("bot_token") and user.get("chat_ids")
+    ]
+    active_chat_ids = sum(len(user.get("chat_ids") or []) for user in active_telegram_users)
+    symbols = [str(symbol).upper() for symbol in config.get("symbols", []) if str(symbol).strip()]
+    return {
+        "user_id": str(auth_user.get("user_id", "")),
+        "username": str(auth_user.get("username", "")),
+        "role": str(auth_user.get("role", "user")),
+        "created_at": int(auth_user.get("created_at", 0) or 0),
+        "symbols": symbols,
+        "symbol_count": len(symbols),
+        "telegram_enabled": bool(telegram.get("enabled", False)),
+        "telegram_channel_count": len(telegram_users),
+        "telegram_active_chat_count": active_chat_ids,
+        "ai_enabled": bool(ai.get("enabled", False)),
+        "ai_key_set": bool(ai.get("api_key")),
+        "symbol_threshold_count": len(config.get("symbol_thresholds") or {}),
+        "updated_at": float(config.get("updated_at", 0) or 0),
+    }
+
+
 class DashboardServer:
     def __init__(
         self,
@@ -137,6 +169,7 @@ class DashboardServer:
         auth_manager: AuthManager | None = None,
         period_liquidation_provider=None,
         source_health_provider=None,
+        alert_store=None,
     ) -> None:
         self.state = state
         self.host = host
@@ -152,6 +185,7 @@ class DashboardServer:
         self.auth_manager = auth_manager
         self.period_liquidation_provider = period_liquidation_provider
         self.source_health_provider = source_health_provider
+        self.alert_store = alert_store
         self._ai_analyzers: dict[str, AIAnalyzer] = {}
         self._event_loop = None
         self._server: ThreadingHTTPServer | None = None
@@ -257,6 +291,31 @@ class DashboardServer:
                         return
                     self._request_user = user
 
+                if path == "/api/users":
+                    user = getattr(self, "_request_user", None) or {}
+                    if user.get("role") != "admin":
+                        self._send_json({"ok": False, "error": "仅管理员可查看系统用户"}, status=403)
+                        return
+                    auth_users = (
+                        server_ref.auth_manager.public_users()
+                        if server_ref.auth_manager and server_ref.auth_manager.enabled
+                        else [user]
+                    )
+                    configs = server_ref.user_config_store.all() if server_ref.user_config_store else {}
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "users": [
+                                user_admin_summary(
+                                    auth_user,
+                                    configs.get(str(auth_user.get("user_id", "")), {}),
+                                )
+                                for auth_user in auth_users
+                            ],
+                        }
+                    )
+                    return
+
                 if path == "/api/state":
                     user_config = server_ref._get_user_config(self._user_id())
                     if server_ref.source_health_provider:
@@ -277,7 +336,7 @@ class DashboardServer:
                     self._send_json(
                         {
                             "default_score": server_ref.config.get("thresholds", {}).get(
-                                "anomaly_score", 70
+                                "anomaly_score", 60
                             ),
                             "symbol_thresholds": user_config.get("symbol_thresholds", {}),
                         }
@@ -302,6 +361,10 @@ class DashboardServer:
 
                 if path == "/api/timeframe":
                     self._handle_timeframe_analysis_get()
+                    return
+
+                if path == "/api/timeframe/confluence":
+                    self._handle_timeframe_confluence_get()
                     return
 
                 self.send_error(404)
@@ -608,7 +671,22 @@ class DashboardServer:
                 if not snapshot_data:
                     self._send_json({"analysis": None, "reason": "no data"})
                     return
+                snapshot_data = dict(snapshot_data)
+                if server_ref.alert_store:
+                    snapshot_data.update(server_ref.alert_store.signal_context(snapshot_data))
+                trigger_status = analyzer.trigger_status(snapshot_data)
+                cached = analyzer.get_cached(symbol, period=period)
+                if cached and not force_refresh:
+                    self._send_json(
+                        {
+                            "analysis": cached,
+                            "cached": True,
+                            "trigger": trigger_status,
+                        }
+                    )
+                    return
                 timeframe_data = None
+                confluence_data = None
                 if period != "realtime":
                     try:
                         source = state.get_source()
@@ -624,13 +702,18 @@ class DashboardServer:
                                     symbol,
                                     int(TIMEFRAME_CONFIG[period]["seconds"]),
                                 )
-                            )
+                        )
                     except Exception:
                         timeframe_data = None
-                cached = analyzer.get_cached(symbol, period=period)
-                if cached and not force_refresh:
-                    self._send_json({"analysis": cached, "cached": True})
-                    return
+                try:
+                    source = state.get_source()
+                    confluence_data = server_ref.timeframe_analysis.confluence(
+                        symbol=symbol,
+                        exchange=str(source.get("exchange", "binance_usdm")),
+                        force=force_refresh,
+                    )
+                except Exception:
+                    confluence_data = None
                 loop = server_ref._event_loop
                 if loop:
                     import asyncio
@@ -639,6 +722,7 @@ class DashboardServer:
                             symbol,
                             snapshot_data,
                             timeframe_data=timeframe_data,
+                            confluence_data=confluence_data,
                             period=period,
                             force=force_refresh,
                         ),
@@ -650,6 +734,7 @@ class DashboardServer:
                             {
                                 "analysis": result,
                                 "cached": False,
+                                "trigger": trigger_status,
                                 "reason": None
                                 if result
                                 else (
@@ -660,7 +745,13 @@ class DashboardServer:
                             }
                         )
                     except Exception:
-                        self._send_json({"analysis": None, "reason": "analysis timeout"})
+                        self._send_json(
+                            {
+                                "analysis": None,
+                                "reason": "analysis timeout",
+                                "trigger": trigger_status,
+                            }
+                        )
                 else:
                     self._send_json({"analysis": None, "reason": "event loop not ready"})
 
@@ -692,6 +783,26 @@ class DashboardServer:
                                 int(TIMEFRAME_CONFIG[period]["seconds"]),
                             )
                         )
+                    self._send_json({"ok": True, "analysis": analysis})
+                except Exception as exc:
+                    self._send_json({"ok": False, "error": str(exc)}, status=502)
+
+            def _handle_timeframe_confluence_get(self) -> None:
+                from urllib.parse import urlparse, parse_qs
+                parsed = urlparse(self.path)
+                params = parse_qs(parsed.query)
+                symbol = (params.get("symbol", [""])[0]).upper()
+                force = params.get("force", ["0"])[0] == "1"
+                if not symbol:
+                    self._send_json({"ok": False, "error": "symbol required"}, status=400)
+                    return
+                try:
+                    source = state.get_source()
+                    analysis = server_ref.timeframe_analysis.confluence(
+                        symbol=symbol,
+                        exchange=str(source.get("exchange", "binance_usdm")),
+                        force=force,
+                    )
                     self._send_json({"ok": True, "analysis": analysis})
                 except Exception as exc:
                     self._send_json({"ok": False, "error": str(exc)}, status=502)

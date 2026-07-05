@@ -1,13 +1,13 @@
 DEFAULT_TRIGGER_CONDITIONS: dict[str, dict[str, float | bool]] = {
     "score": {"enabled": True, "threshold": 60.0},
-    "quote_volume_1m": {"enabled": False, "threshold": 500000.0},
-    "volume_multiplier": {"enabled": False, "threshold": 3.0},
-    "price_move_pct_1m_abs": {"enabled": False, "threshold": 0.8},
-    "oi_change_pct_5m_abs": {"enabled": False, "threshold": 1.5},
-    "liquidation_total_quote_1m": {"enabled": False, "threshold": 250000.0},
-    "depth_imbalance_abs": {"enabled": False, "threshold": 18.0},
-    "depth_drop_pct_1m": {"enabled": False, "threshold": 18.0},
-    "spread_bps": {"enabled": False, "threshold": 4.0},
+    "quote_volume_1m": {"enabled": False, "threshold": 300000.0},
+    "volume_multiplier": {"enabled": False, "threshold": 2.2},
+    "price_move_pct_1m_abs": {"enabled": False, "threshold": 0.6},
+    "oi_change_pct_5m_abs": {"enabled": False, "threshold": 0.8},
+    "liquidation_total_quote_1m": {"enabled": False, "threshold": 75000.0},
+    "depth_imbalance_abs": {"enabled": False, "threshold": 22.0},
+    "depth_drop_pct_1m": {"enabled": False, "threshold": 15.0},
+    "spread_bps": {"enabled": False, "threshold": 3.0},
 }
 
 
@@ -70,6 +70,16 @@ def metric_value(key: str, data: dict | None) -> float | None:
 
 
 def evaluate_trigger_rules(rules: dict | None, data: dict | None) -> bool:
+    status = trigger_rule_status(rules, data)
+    checks = [bool(item.get("matched")) for item in status.get("checks", [])]
+    if not checks:
+        return False
+    if status.get("mode") == "all":
+        return all(checks)
+    return any(checks)
+
+
+def trigger_rule_status(rules: dict | None, data: dict | None) -> dict:
     normalized = normalize_trigger_rules(rules, score_enabled=False)
     checks = []
     for key, cfg in normalized.get("conditions", {}).items():
@@ -78,10 +88,22 @@ def evaluate_trigger_rules(rules: dict | None, data: dict | None) -> bool:
         value = metric_value(key, data)
         if value is None:
             continue
-        checks.append(value >= float(cfg.get("threshold", 0)))
+        threshold = float(cfg.get("threshold", 0))
+        checks.append(
+            {
+                "key": key,
+                "value": value,
+                "threshold": threshold,
+                "matched": value >= threshold,
+            }
+        )
 
-    if not checks:
-        return False
-    if normalized.get("mode") == "all":
-        return all(checks)
-    return any(checks)
+    matched_values = [bool(item["matched"]) for item in checks]
+    matched = False
+    if matched_values:
+        matched = all(matched_values) if normalized.get("mode") == "all" else any(matched_values)
+    return {
+        "mode": normalized.get("mode", "any"),
+        "matched": matched,
+        "checks": checks,
+    }

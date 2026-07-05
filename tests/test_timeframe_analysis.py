@@ -2,7 +2,12 @@ import json
 import unittest
 from unittest.mock import patch
 
-from monitor.timeframe_analysis import TimeframeAnalysisService, build_followup_result, build_timeframe_analysis
+from monitor.timeframe_analysis import (
+    TimeframeAnalysisService,
+    build_followup_result,
+    build_multi_timeframe_confluence,
+    build_timeframe_analysis,
+)
 
 
 class TimeframeAnalysisTests(unittest.TestCase):
@@ -176,9 +181,26 @@ class TimeframeAnalysisTests(unittest.TestCase):
 
         self.assertEqual(result["period_low_price"], 80.0)
         self.assertGreater(result["support_price"], 100.0)
-        self.assertIn(result["support_source"], {"touch_cluster", "swing_cluster"})
+        self.assertIn(result["support_source"], {"touch_cluster", "swing_cluster", "volume_profile_cluster", "swing_volume_cluster"})
         self.assertGreater(result["support_touch_count"], 1)
         self.assertGreater(result["resistance_touch_count"], 1)
+        self.assertGreater(result["profile_poc_price"], 0)
+        self.assertGreater(result["value_area_high"], result["value_area_low"])
+        self.assertGreaterEqual(result["support_confluence_score"], 0)
+        self.assertGreaterEqual(result["resistance_confluence_score"], 0)
+        self.assertIn(
+            result["structure_regime"],
+            {
+                "support_lost",
+                "resistance_breakout",
+                "support_test",
+                "resistance_test",
+                "value_area_rotation",
+                "upper_acceptance",
+                "lower_acceptance",
+                "balanced",
+            },
+        )
 
     def test_build_followup_result_from_native_candles(self) -> None:
         result = build_followup_result(
@@ -208,6 +230,58 @@ class TimeframeAnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(result["max_down_bps"], -200.0)
         self.assertEqual(result["sample_count"], 3)
         self.assertAlmostEqual(result["mark_close_bps"], 380.0)
+
+    def test_build_multi_timeframe_confluence_summarizes_alignment_and_conflicts(self) -> None:
+        analyses = [
+            {
+                "period": "5m",
+                "period_label": "5m",
+                "structure_regime": "resistance_breakout",
+                "price_move_pct": 1.1,
+                "volume_multiplier": 1.8,
+                "vwap_deviation_pct": 0.4,
+                "range_position_pct": 82,
+            },
+            {
+                "period": "15m",
+                "period_label": "15m",
+                "structure_regime": "upper_acceptance",
+                "price_move_pct": 0.7,
+                "volume_multiplier": 1.3,
+                "vwap_deviation_pct": 0.2,
+                "range_position_pct": 76,
+            },
+            {
+                "period": "1h",
+                "period_label": "1h",
+                "structure_regime": "upper_acceptance",
+                "price_move_pct": 0.9,
+                "volume_multiplier": 1.6,
+                "vwap_deviation_pct": 0.3,
+                "range_position_pct": 72,
+            },
+            {
+                "period": "4h",
+                "period_label": "4h",
+                "structure_regime": "resistance_test",
+                "price_move_pct": -0.4,
+                "volume_multiplier": 1.1,
+                "vwap_deviation_pct": -0.1,
+                "range_position_pct": 68,
+            },
+        ]
+
+        result = build_multi_timeframe_confluence(
+            symbol="BTCUSDT",
+            exchange="okx_swap",
+            analyses=analyses,
+        )
+
+        self.assertEqual(result["direction"], "up")
+        self.assertGreater(result["score"], 40)
+        self.assertEqual(result["sample_count"], 4)
+        self.assertTrue(result["confirmations"])
+        self.assertTrue(result["conflicts"])
 
 
 if __name__ == "__main__":

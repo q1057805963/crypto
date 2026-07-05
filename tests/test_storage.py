@@ -20,6 +20,8 @@ def build_event(**overrides) -> AnomalyEvent:
         "open_interest": 100000.0,
         "oi_change_pct_5m": 2.1,
         "funding_rate": 0.0004,
+        "mark_price": 100.08,
+        "mark_premium_bps": 8.0,
         "spread_bps": 1.2,
         "depth_imbalance": 0.15,
         "bid_depth_notional": 500000.0,
@@ -57,6 +59,8 @@ def build_snapshot(updated_at: float, price: float, **overrides) -> SymbolSnapsh
         "open_interest": 100000.0,
         "oi_change_pct_5m": 1.1,
         "funding_rate": 0.0003,
+        "mark_price": price,
+        "mark_premium_bps": 0.0,
         "spread_bps": 1.0,
         "depth_imbalance": 0.1,
         "bid_depth_notional": 400000.0,
@@ -104,9 +108,24 @@ class AlertStoreFollowupTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_followups_start_pending_and_resolve_by_horizon(self) -> None:
-        self.store.record_event(build_event())
+        self.store.record_event(
+            build_event(),
+            {
+                "support_price": 98.0,
+                "resistance_price": 106.0,
+                "spread_bps": 1.2,
+            },
+        )
         initial = self.store.recent(1)[0]
         self.assertEqual([item["status"] for item in initial["followups"]], ["pending"] * 5)
+        self.assertTrue(initial["decision"]["directional"])
+        self.assertLess(initial["decision"]["invalidation_price"], 98.0)
+        self.assertEqual(initial["decision"]["target_price"], 106.0)
+        self.assertEqual(initial["decision"]["invalidation_basis"], "结构支撑")
+        self.assertEqual(initial["decision"]["target_basis"], "结构压力")
+        self.assertIn(initial["decision"]["boundary_quality"], {"medium", "high"})
+        self.assertGreater(initial["decision"]["buffer_components"]["mark_premium_bps"], 0)
+        self.assertIn("放量", initial["trigger_combo"]["label"])
 
         for updated_at, price in (
             (1060.0, 101.0),
@@ -124,6 +143,10 @@ class AlertStoreFollowupTests(unittest.TestCase):
         self.assertAlmostEqual(followup_5m["close_bps"], 200.0, places=3)
         self.assertAlmostEqual(followup_5m["max_up_bps"], 400.0, places=3)
         self.assertAlmostEqual(followup_5m["max_down_bps"], -100.0, places=3)
+        self.assertAlmostEqual(followup_5m["directional_close_bps"], 200.0, places=3)
+        self.assertAlmostEqual(followup_5m["max_favorable_bps"], 400.0, places=3)
+        self.assertAlmostEqual(followup_5m["max_adverse_bps"], 100.0, places=3)
+        self.assertEqual(followup_5m["verdict"], "validated")
         self.assertEqual(followup_5m["sample_count"], 5)
         self.assertEqual(after_5m["followups"][1]["status"], "pending")
 
@@ -137,6 +160,16 @@ class AlertStoreFollowupTests(unittest.TestCase):
         self.assertAlmostEqual(followup_15m["max_up_bps"], 1000.0, places=3)
         self.assertAlmostEqual(followup_15m["max_down_bps"], -100.0, places=3)
         self.assertEqual(followup_15m["sample_count"], 6)
+        self.assertEqual(followup_15m["verdict"], "validated")
+        self.assertEqual(after_15m["signal_stats"]["sample_count"], 1)
+        self.assertAlmostEqual(after_15m["signal_stats"]["win_rate"], 100.0)
+        self.assertAlmostEqual(after_15m["signal_stats"]["avg_close_bps"], 1000.0)
+        self.assertEqual(after_15m["combo_stats"]["sample_count"], 1)
+        self.assertIn("放量", after_15m["combo_stats"]["combo_label"])
+
+        context = self.store.signal_context(after_15m)
+        self.assertEqual(context["combo_stats"]["sample_count"], 1)
+        self.assertIn("trigger_combo", context)
 
     def test_followup_resolver_takes_precedence_over_snapshot_sampling(self) -> None:
         calls = []

@@ -1,5 +1,6 @@
 .venv/
 .venv311/
+.venv_py39_backup/
 .DS_Store
 __pycache__/
 *.pyc
@@ -7,6 +8,7 @@ __pycache__/
 *.pyd
 
 data/
+dist/
 monitor.out
 monitor.err
 monitor.log

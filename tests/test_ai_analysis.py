@@ -13,6 +13,27 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertIsNone(analyzer.get_cached("BTCUSDT", "1h"))
         self.assertIsNone(analyzer.get_cached("ETHUSDT", "5m"))
 
+    def test_trigger_status_reports_score_threshold_match(self) -> None:
+        analyzer = AIAnalyzer(
+            {
+                "activation_threshold": 30,
+                "triggers": {
+                    "mode": "any",
+                    "conditions": {
+                        "score": {"enabled": True, "threshold": 30},
+                        "liquidation_total_quote_1m": {"enabled": True, "threshold": 10000},
+                    },
+                },
+            }
+        )
+
+        status = analyzer.trigger_status({"score": 30.3, "liquidation_total_quote_1m": 0})
+
+        self.assertTrue(status["matched"])
+        self.assertEqual(status["mode"], "any")
+        self.assertTrue(status["checks"][0]["matched"])
+        self.assertFalse(status["checks"][1]["matched"])
+
     def test_build_prompt_includes_selected_timeframe_context(self) -> None:
         analyzer = AIAnalyzer({})
         snapshot = {
@@ -43,6 +64,25 @@ class AIAnalyzerTests(unittest.TestCase):
             "ask_wall_price": 62120,
             "ask_wall_notional": 760000,
             "reasons": ["volume expansion"],
+            "trigger_combo": {"label": "放量 + 价仓同向", "key": "volume+oi_aligned"},
+            "signal_stats": {
+                "label": "15m",
+                "sample_count": 12,
+                "win_rate": 58.3,
+                "avg_close_bps": 24.5,
+                "avg_favorable_bps": 72.0,
+                "avg_adverse_bps": 31.0,
+                "reliability": "medium",
+            },
+            "combo_stats": {
+                "label": "15m",
+                "sample_count": 8,
+                "win_rate": 62.5,
+                "avg_close_bps": 31.5,
+                "avg_favorable_bps": 81.0,
+                "avg_adverse_bps": 28.0,
+                "reliability": "low",
+            },
         }
         timeframe = {
             "period_label": "15m",
@@ -77,8 +117,26 @@ class AIAnalyzerTests(unittest.TestCase):
             "mark_move_pct": 0.72,
             "mark_premium_bps": -3.5,
         }
+        confluence = {
+            "label": "多周期偏多共振",
+            "direction": "up",
+            "score": 72.5,
+            "summary": "多周期偏多共振，3/4 个周期同向。",
+            "confirmations": ["15m 上半区接受"],
+            "conflicts": ["4h 测试压力"],
+            "periods": [
+                {
+                    "period_label": "15m",
+                    "structure_label": "上半区接受",
+                    "bias": "up",
+                    "price_move_pct": 0.8,
+                    "volume_multiplier": 1.5,
+                    "vwap_deviation_pct": 0.2,
+                }
+            ],
+        }
 
-        prompt = analyzer._build_prompt(snapshot, timeframe, "15m")
+        prompt = analyzer._build_prompt(snapshot, timeframe, "15m", confluence)
 
         self.assertIn("15m", prompt)
         self.assertIn("12,345,000 USDT", prompt)
@@ -89,6 +147,11 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertIn("阶段最低/最高: 60400 / 63100", prompt)
         self.assertIn("96 根K线", prompt)
         self.assertIn("不要把旧的单根最高最低当作主支撑压力", prompt)
+        self.assertIn("同组合后效", prompt)
+        self.assertIn("多周期偏多共振", prompt)
+        self.assertIn("主假设", prompt)
+        self.assertIn("延续条件", prompt)
+        self.assertIn("失效条件", prompt)
 
     def test_extract_text_supports_anthropic_style_content(self) -> None:
         payload = {

@@ -57,6 +57,17 @@ class AuthManager:
         with self._lock:
             return len(self._read().get("users", {}))
 
+    def public_users(self) -> list[dict]:
+        with self._lock:
+            users = self._read().get("users", {})
+            return [
+                self._public_user(user)
+                for _, user in sorted(
+                    users.items(),
+                    key=lambda item: str(item[0]),
+                )
+            ]
+
     def can_register(self) -> bool:
         return self.allow_registration or self.user_count() == 0
 
@@ -155,6 +166,7 @@ class AuthManager:
             "user_id": str(user.get("user_id", "")),
             "username": str(user.get("username", "")),
             "role": str(user.get("role", "user")),
+            "created_at": int(user.get("created_at", 0) or 0),
         }
 
     @staticmethod

@@ -241,7 +241,7 @@ async def run(config: dict) -> None:
     auth_manager = AuthManager(config.get("auth", {}))
 
     runtime_symbols = user_store.all_symbols() if user_store else config["symbols"]
-    default_alert_score = float(config.get("thresholds", {}).get("anomaly_score", 70))
+    default_alert_score = float(config.get("thresholds", {}).get("anomaly_score", 60))
 
     detector = AnomalyDetector(
         symbols=runtime_symbols,
@@ -298,6 +298,12 @@ async def run(config: dict) -> None:
             ai_analysis=analysis,
             ai_summary=tuple(summarize_analysis(analysis)),
         )
+
+    def snapshot_with_signal_context(snapshot_data: dict) -> dict:
+        payload = clone_payload(snapshot_data) or {}
+        if store:
+            payload.update(store.signal_context(payload))
+        return payload
 
     def alert_ai_analyzer_candidates(snapshot_data: dict) -> list[AIAnalyzer]:
         symbol = str(snapshot_data.get("symbol", "")).upper()
@@ -365,6 +371,7 @@ async def run(config: dict) -> None:
         return await task
 
     async def get_alert_ai_analysis(symbol: str, snapshot_data: dict) -> str | None:
+        ai_snapshot = snapshot_with_signal_context(snapshot_data)
         for analyzer in alert_ai_analyzer_candidates(snapshot_data):
             timeout_seconds = max(3.0, min(float(analyzer.request_timeout), 12.0))
             try:
@@ -372,7 +379,7 @@ async def run(config: dict) -> None:
                     asyncio.shield(
                         ensure_ai_analysis(
                             symbol,
-                            snapshot_data,
+                            ai_snapshot,
                             force=True,
                             analyzer=analyzer,
                             period="alert",
@@ -396,7 +403,7 @@ async def run(config: dict) -> None:
             enriched_event = enrich_event_with_ai(event, analysis)
         alert.send(enriched_event)
         if store:
-            store.record_event(enriched_event)
+            store.record_event(enriched_event, snapshot_data)
             dashboard_state.set_events(store.recent(50))
         else:
             dashboard_state.add_event(enriched_event)
@@ -455,7 +462,7 @@ async def run(config: dict) -> None:
 
     failover_config = config.get("failover", {})
     def handle_source_switch(active_exchange: str, active_data_source: str, note: str) -> None:
-        detector.reset_windows(source_manager.symbols)
+        detector.reset_windows(source_manager.get_symbols())
         dashboard_state.set_source(
             exchange=active_exchange,
             data_source=active_data_source,
@@ -480,9 +487,12 @@ async def run(config: dict) -> None:
             if not user_store:
                 return
             symbols = user_store.all_symbols()
+            old_symbols = {str(symbol).upper() for symbol in source_manager.get_symbols()}
+            new_symbols = {str(symbol).upper() for symbol in symbols}
             detector.set_symbols(symbols)
             detector.symbol_thresholds = user_store.aggregate_symbol_thresholds()
-            detector.reset_windows(symbols)
+            if old_symbols != new_symbols:
+                detector.reset_windows(symbols)
             source_manager.set_symbols(symbols)
             dashboard_state.set_symbols(symbols)
             telegram_alert.set_config(
@@ -491,9 +501,12 @@ async def run(config: dict) -> None:
             )
 
         def update_symbols(symbols: list[str]) -> None:
+            old_symbols = {str(symbol).upper() for symbol in source_manager.get_symbols()}
+            new_symbols = {str(symbol).upper() for symbol in symbols}
             config["symbols"] = symbols
             detector.set_symbols(symbols)
-            detector.reset_windows(symbols)
+            if old_symbols != new_symbols:
+                detector.reset_windows(symbols)
             source_manager.set_symbols(symbols)
             dashboard_state.set_symbols(symbols)
             save_config(Path(config.get("_config_path", "config.yaml")), config)
@@ -513,6 +526,7 @@ async def run(config: dict) -> None:
             auth_manager=auth_manager,
             period_liquidation_provider=source_manager.liquidation_summary,
             source_health_provider=source_manager.source_health,
+            alert_store=store,
         )
         dashboard.start()
         dashboard.set_event_loop(asyncio.get_running_loop())
@@ -539,10 +553,16 @@ async def run(config: dict) -> None:
                 return dashboard._get_ai_analyzer(owner_id)
             return ai_analyzer
 
+        def telegram_bot_snapshot(symbol: str) -> dict | None:
+            snapshot = dashboard_state.get_symbol_data(symbol)
+            if not snapshot:
+                return None
+            return snapshot_with_signal_context(snapshot)
+
         telegram_bot_responder = TelegramBotResponder(
             enabled=True,
             get_users=telegram_bot_users,
-            get_snapshot=dashboard_state.get_symbol_data,
+            get_snapshot=telegram_bot_snapshot,
             get_ai_analyzer=telegram_bot_ai_analyzer,
             poll_interval_seconds=float(telegram_bot_config.get("poll_interval_seconds", 2)),
             request_timeout_seconds=int(telegram_bot_config.get("request_timeout_seconds", 20)),
@@ -585,7 +605,7 @@ async def run(config: dict) -> None:
                 else:
                     alert.send(event)
                     if store:
-                        store.record_event(event)
+                        store.record_event(event, snapshot_payload)
                         dashboard_state.set_events(store.recent(50))
                     else:
                         dashboard_state.add_event(event)

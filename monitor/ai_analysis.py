@@ -6,10 +6,10 @@ import threading
 from time import time
 from urllib.request import Request, urlopen
 
-from monitor.rules import evaluate_trigger_rules, normalize_trigger_rules
+from monitor.rules import evaluate_trigger_rules, normalize_trigger_rules, trigger_rule_status
 
 
-AI_ANALYSIS_SCHEMA_VERSION = "structure-levels-v2"
+AI_ANALYSIS_SCHEMA_VERSION = "scenario-v3"
 
 
 def summarize_analysis(text: str, max_items: int = 3, max_chars: int = 110) -> list[str]:
@@ -101,12 +101,16 @@ class AIAnalyzer:
     def should_activate(self, snapshot_data: dict) -> bool:
         return evaluate_trigger_rules(self.triggers, snapshot_data)
 
+    def trigger_status(self, snapshot_data: dict) -> dict:
+        return trigger_rule_status(self.triggers, snapshot_data)
+
     async def analyze(
         self,
         symbol: str,
         snapshot_data: dict,
         *,
         timeframe_data: dict | None = None,
+        confluence_data: dict | None = None,
         period: str | None = None,
         force: bool = False,
     ) -> str | None:
@@ -139,7 +143,13 @@ class AIAnalyzer:
 
         with self._lock:
             self._last_error = None
-        result = await asyncio.to_thread(self._call_api, snapshot_data, timeframe_data, period)
+        result = await asyncio.to_thread(
+            self._call_api,
+            snapshot_data,
+            timeframe_data,
+            confluence_data,
+            period,
+        )
         if result:
             with self._lock:
                 self._cache[cache_key] = (time(), result)
@@ -169,9 +179,15 @@ class AIAnalyzer:
             available_symbols or [],
         )
 
-    def _call_api(self, data: dict, timeframe_data: dict | None = None, period: str | None = None) -> str | None:
+    def _call_api(
+        self,
+        data: dict,
+        timeframe_data: dict | None = None,
+        confluence_data: dict | None = None,
+        period: str | None = None,
+    ) -> str | None:
         try:
-            prompt = self._build_prompt(data, timeframe_data, period)
+            prompt = self._build_prompt(data, timeframe_data, period, confluence_data)
             return self._call_prompt(prompt)
         except Exception as exc:
             with self._lock:
@@ -221,7 +237,72 @@ class AIAnalyzer:
         base = self._resolve_base_url() or "https://api.openai.com/v1"
         return f"{base}/chat/completions"
 
-    def _build_prompt(self, data: dict, timeframe_data: dict | None = None, period: str | None = None) -> str:
+    @staticmethod
+    def _stats_section(data: dict) -> str:
+        trigger_combo = data.get("trigger_combo") if isinstance(data.get("trigger_combo"), dict) else {}
+        signal_stats = data.get("signal_stats") if isinstance(data.get("signal_stats"), dict) else {}
+        combo_stats = data.get("combo_stats") if isinstance(data.get("combo_stats"), dict) else {}
+        lines = []
+        if trigger_combo:
+            lines.append(f"- 当前触发组合: {trigger_combo.get('label') or trigger_combo.get('key')}")
+        if signal_stats:
+            lines.append(
+                "- 同币同向后效: "
+                f"{signal_stats.get('label', '15m')} 样本 {int(signal_stats.get('sample_count') or 0)}, "
+                f"胜率 {float(signal_stats.get('win_rate') or 0):.1f}%, "
+                f"均值 {float(signal_stats.get('avg_close_bps') or 0):+.1f}bp, "
+                f"顺向 {float(signal_stats.get('avg_favorable_bps') or 0):.1f}bp, "
+                f"逆向 {float(signal_stats.get('avg_adverse_bps') or 0):.1f}bp, "
+                f"可信度 {signal_stats.get('reliability', 'low')}"
+            )
+        if combo_stats:
+            lines.append(
+                "- 同组合后效: "
+                f"{combo_stats.get('label', '15m')} 样本 {int(combo_stats.get('sample_count') or 0)}, "
+                f"胜率 {float(combo_stats.get('win_rate') or 0):.1f}%, "
+                f"均值 {float(combo_stats.get('avg_close_bps') or 0):+.1f}bp, "
+                f"顺向 {float(combo_stats.get('avg_favorable_bps') or 0):.1f}bp, "
+                f"逆向 {float(combo_stats.get('avg_adverse_bps') or 0):.1f}bp, "
+                f"可信度 {combo_stats.get('reliability', 'low')}"
+            )
+        if not lines:
+            lines.append("- 当前信号暂无足够后效样本，不能把单次异动当成高胜率信号。")
+        return "\n信号后效统计（必须约束结论强度）：\n" + "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _confluence_section(confluence_data: dict | None) -> str:
+        if not confluence_data:
+            return "\n多周期共振：暂不可用，请不要声称多周期已经确认。\n"
+        period_lines = []
+        for item in confluence_data.get("periods") or []:
+            period_lines.append(
+                f"- {item.get('period_label') or item.get('period')}: "
+                f"{item.get('structure_label') or item.get('structure_regime')} / "
+                f"偏向={item.get('bias')} / "
+                f"涨跌 {float(item.get('price_move_pct') or 0):+.2f}% / "
+                f"量能 {float(item.get('volume_multiplier') or 0):.2f}x / "
+                f"VWAP偏离 {float(item.get('vwap_deviation_pct') or 0):+.2f}%"
+            )
+        confirmations = "；".join(str(item) for item in confluence_data.get("confirmations") or []) or "暂无明确同向确认"
+        conflicts = "；".join(str(item) for item in confluence_data.get("conflicts") or []) or "暂无明显冲突"
+        return (
+            "\n多周期共振（用于判断是否只是短线噪音）：\n"
+            f"- 结论: {confluence_data.get('label')} / 方向={confluence_data.get('direction')} / "
+            f"共振分={float(confluence_data.get('score') or 0):.1f}/100\n"
+            f"- 摘要: {confluence_data.get('summary') or ''}\n"
+            f"- 同向证据: {confirmations}\n"
+            f"- 冲突证据: {conflicts}\n"
+            + "\n".join(period_lines)
+            + "\n"
+        )
+
+    def _build_prompt(
+        self,
+        data: dict,
+        timeframe_data: dict | None = None,
+        period: str | None = None,
+        confluence_data: dict | None = None,
+    ) -> str:
         liquidation_status = {
             "recent_event": "近1分钟有强平事件",
             "no_recent_event": "数据流活跃，近1分钟无强平事件",
@@ -233,6 +314,8 @@ class AIAnalyzer:
         }.get(str(data.get("microstructure_status") or "unavailable"), "未知")
         timeframe_section = ""
         period_focus = ""
+        stats_section = self._stats_section(data)
+        confluence_section = self._confluence_section(confluence_data)
         if timeframe_data:
             selected_period = str(timeframe_data.get("period_label") or period or "当前周期")
             candle_state = "已收线" if timeframe_data.get("candle_confirmed") else "进行中"
@@ -259,17 +342,25 @@ class AIAnalyzer:
                 f"- 周期最低: {timeframe_data.get('low_price')}\n"
                 f"- 周期收盘/最新价: {timeframe_data.get('price')}\n"
                 f"- 周期涨跌: {float(timeframe_data.get('price_move_pct', 0)):+.3f}%\n"
-                f"- 相对前收: {float(timeframe_data.get('prev_close_pct', 0)):+.3f}%\n"
                 f"- 周期成交额: {float(timeframe_data.get('quote_volume', 0)):,.0f} USDT\n"
                 f"- 周期量能倍数: {float(timeframe_data.get('volume_multiplier', 0)):.2f}x\n"
                 f"- 结构支撑: {timeframe_data.get('support_price')} "
                 f"(来源={support_source}, 触碰={int(timeframe_data.get('support_touch_count') or 0)}, "
                 f"摆动点={int(timeframe_data.get('support_pivot_count') or 0)}, "
-                f"强度={float(timeframe_data.get('support_strength') or 0):.2f})\n"
+                f"强度={float(timeframe_data.get('support_strength') or 0):.2f}, "
+                f"评分={float(timeframe_data.get('support_confluence_score') or 0):.1f}, "
+                f"状态={timeframe_data.get('support_status') or 'unknown'})\n"
                 f"- 结构压力: {timeframe_data.get('resistance_price')} "
                 f"(来源={resistance_source}, 触碰={int(timeframe_data.get('resistance_touch_count') or 0)}, "
                 f"摆动点={int(timeframe_data.get('resistance_pivot_count') or 0)}, "
-                f"强度={float(timeframe_data.get('resistance_strength') or 0):.2f})\n"
+                f"强度={float(timeframe_data.get('resistance_strength') or 0):.2f}, "
+                f"评分={float(timeframe_data.get('resistance_confluence_score') or 0):.1f}, "
+                f"状态={timeframe_data.get('resistance_status') or 'unknown'})\n"
+                f"- 结构状态: {timeframe_data.get('structure_regime') or 'unknown'}\n"
+                f"- 成交密集 POC: {timeframe_data.get('profile_poc_price')} "
+                f"({float(timeframe_data.get('profile_poc_quote_volume') or 0):,.0f} USDT)\n"
+                f"- 价值区间: {timeframe_data.get('value_area_low')} / {timeframe_data.get('value_area_high')}\n"
+                f"- 成交密集支撑/压力: {timeframe_data.get('support_profile_price')} / {timeframe_data.get('resistance_profile_price')}\n"
                 f"- 阶段最低/最高: {timeframe_data.get('period_low_price')} / {timeframe_data.get('period_high_price')}\n"
                 f"- 结构样本: {int(timeframe_data.get('structure_sample_count') or 0)} 根K线, "
                 f"聚类容差 {float(timeframe_data.get('structure_tolerance_pct') or 0):.3f}%\n"
@@ -306,6 +397,8 @@ class AIAnalyzer:
             f"- 量能倍数: {float(data.get('volume_multiplier', 0)):.2f}x\n"
             f"- OI 5分钟变化: {float(data.get('oi_change_pct_5m', 0)):+.3f}%\n"
             f"- 资金费率: {float(data.get('funding_rate', 0)):.4%}\n"
+            f"- 实时标记价: {data.get('mark_price') or '--'}\n"
+            f"- 实时标记价偏离: {float(data.get('mark_premium_bps', 0)):+.2f} bps\n"
             f"- 微观结构状态: {microstructure_status}\n"
             f"- 爆仓数据状态: {liquidation_status}\n"
             f"- 强平事件数1m: {int(data.get('liquidation_event_count_1m') or 0)}\n"
@@ -321,14 +414,18 @@ class AIAnalyzer:
             f"- 卖盘墙: {data.get('ask_wall_price')} / {float(data.get('ask_wall_notional', 0)):,.0f}\n"
             f"- 触发原因: {'; '.join(data.get('reasons', []))}\n"
             f"{timeframe_section}\n"
-            "请给出简洁、专业、可操作的建议（3-5条），重点关注：\n"
-            "1. 当前行情的核心驱动力\n"
-            "2. 短期可能的走势和风险\n"
-            "3. 结合支撑/压力、VWAP、盘口墙给出具体观察位\n"
-            "4. 对于杠杆交易者的具体操作建议\n"
+            f"{stats_section}"
+            f"{confluence_section}"
+            "请用中文输出固定 5 条，严格使用以下标题：\n"
+            "1. 主假设：说明当前更像延续、反抽、突破确认、假突破还是分歧等待，必须结合后效统计和多周期共振。\n"
+            "2. 延续条件：写清楚哪些价格/结构/VWAP/量能/OI 条件出现后，原方向才算增强。\n"
+            "3. 失效条件：写清楚哪个价位或哪类行为出现后，当前判断应放弃。\n"
+            "4. 反向风险：指出最可能让行情反走的因素，尤其是低样本、周期冲突、爆仓不可用或盘口变薄。\n"
+            "5. 观察计划：给出接下来 5m/15m/1h 应观察什么，不给绝对开仓指令。\n"
             f"{period_focus}"
+            "如果样本可信度为 low 或样本不足，必须明确降低结论强度。"
             "如果爆仓数据状态不可用，不要把爆仓金额为0解读为没有强平压力。"
-            "直接给出建议，不要重复数据。每条建议控制在一句话。"
+            "每条控制在一句话，不要重复罗列原始数据。"
         )
 
     def _build_question_prompt(
@@ -364,6 +461,8 @@ class AIAnalyzer:
             f"- 主动买入占比: {float(data.get('taker_buy_ratio_1m', 0.5)):.1%}\n"
             f"- OI 5分钟变化: {float(data.get('oi_change_pct_5m', 0)):+.3f}%\n"
             f"- 资金费率: {float(data.get('funding_rate', 0)):.4%}\n"
+            f"- 实时标记价: {data.get('mark_price') or '--'}\n"
+            f"- 实时标记价偏离: {float(data.get('mark_premium_bps', 0)):+.2f} bps\n"
             f"- 爆仓状态: {liquidation_status}\n"
             f"- 多头爆仓1m: {float(data.get('long_liquidation_quote_1m', 0)):,.0f} USDT\n"
             f"- 空头爆仓1m: {float(data.get('short_liquidation_quote_1m', 0)):,.0f} USDT\n"
@@ -373,8 +472,10 @@ class AIAnalyzer:
             f"- 区间VWAP: {data.get('window_vwap')}\n"
             f"- 买盘墙 / 卖盘墙: {data.get('bid_wall_price')} / {data.get('ask_wall_price')}\n"
             f"- 触发原因: {'; '.join(data.get('reasons', [])) or '暂无'}\n\n"
+            f"{self._stats_section(data)}\n"
             "请直接回答用户问题，控制在 4 条以内。"
-            "重点给出上涨/下跌倾向、主要依据、风险等级和接下来观察点，尽量指出支撑/压力或关键价位。"
+            "采用条件式回答：当前主假设、确认条件、失效条件、反向风险。"
+            "尽量指出支撑/压力或关键价位，不要只说泛泛观察。"
             "不要承诺收益，不要给绝对买卖指令；如果数据不足，要明确说数据不足。"
         )
 

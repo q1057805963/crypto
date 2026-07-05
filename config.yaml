@@ -61,28 +61,28 @@ ai:
   api_key: ''
   model: deepseek-v4-flash
   base_url: https://token.sensenova.cn
-  activation_threshold: 30
+  activation_threshold: 45
   triggers:
     mode: any
     conditions:
       score:
         enabled: true
-        threshold: 30
+        threshold: 45
       quote_volume_1m:
         enabled: false
-        threshold: 500000
+        threshold: 300000
       volume_multiplier:
         enabled: false
-        threshold: 3
+        threshold: 2.2
       price_move_pct_1m_abs:
         enabled: false
-        threshold: 0.8
+        threshold: 0.6
       oi_change_pct_5m_abs:
         enabled: false
-        threshold: 1.5
+        threshold: 0.8
       liquidation_total_quote_1m:
         enabled: false
-        threshold: 250000
+        threshold: 75000
   cache_ttl_seconds: 300
   retry_cooldown_seconds: 120
   request_timeout_seconds: 30
@@ -94,20 +94,20 @@ dashboard:
   port: 8765
   theme: dark
 thresholds:
-  price_move_pct_1m: 0.8
-  price_move_pct_5m: 1.8
-  volume_multiplier: 3.0
-  taker_buy_ratio_high: 0.7
-  taker_buy_ratio_low: 0.3
-  min_quote_volume_1m: 500000
-  anomaly_score: 70
-  oi_change_pct_5m: 1.5
-  funding_rate_abs: 0.0005
+  price_move_pct_1m: 0.6
+  price_move_pct_5m: 1.2
+  volume_multiplier: 2.2
+  taker_buy_ratio_high: 0.68
+  taker_buy_ratio_low: 0.32
+  min_quote_volume_1m: 300000
+  anomaly_score: 60
+  oi_change_pct_5m: 0.8
+  funding_rate_abs: 0.0003
   liquidation_enabled: true
-  liquidation_quote_1m: 250000
+  liquidation_quote_1m: 75000.0
   spread_enabled: true
-  spread_bps: 4.0
+  spread_bps: 3.0
   depth_imbalance_enabled: true
-  depth_imbalance_abs: 0.18
+  depth_imbalance_abs: 0.22
   depth_drop_enabled: true
-  depth_drop_pct_1m: 18.0
+  depth_drop_pct_1m: 15.0
