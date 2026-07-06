@@ -193,6 +193,7 @@ class SourceFailoverManager:
         symbols: list[str],
         stale_after_seconds: float,
         switch_cooldown_seconds: float,
+        primary_retry_seconds: float = 300.0,
         on_switch: Callable[[str, str, str], None] | None = None,
     ) -> None:
         self.config = config
@@ -201,6 +202,7 @@ class SourceFailoverManager:
         self.symbols = list(symbols)
         self.stale_after_seconds = max(float(stale_after_seconds), 5.0)
         self.switch_cooldown_seconds = max(float(switch_cooldown_seconds), 0.0)
+        self.primary_retry_seconds = max(float(primary_retry_seconds), 0.0)
         self.on_switch = on_switch
         self._active_index = 0
         self._active_context: SourceContext | None = None
@@ -357,11 +359,28 @@ class SourceFailoverManager:
         self._last_switch_at = now
         await self._activate(next_index, note)
 
+    async def _maybe_retry_primary(self) -> None:
+        if (
+            self.primary_retry_seconds <= 0
+            or self._active_index == 0
+            or len(self.specs) <= 1
+        ):
+            return
+        now = time.monotonic()
+        if now - self._last_switch_at < self.primary_retry_seconds:
+            return
+        primary = self.specs[0]
+        primary_label = source_label(primary.exchange, primary.data_source)
+        logging.info("Retrying primary source: %s", primary_label)
+        self._last_switch_at = now
+        await self._activate(0, f"尝试切回主数据源 {primary_label}")
+
     async def listen(self):
         await self._activate(self._active_index, "")
         timeout_seconds = min(max(self.stale_after_seconds / 3, 1.0), 5.0)
         while True:
             await self._reload_if_requested()
+            await self._maybe_retry_primary()
             try:
                 nonce, trade = await asyncio.wait_for(
                     self._queue.get(),

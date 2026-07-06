@@ -1,4 +1,6 @@
+import asyncio
 import json
+import threading
 import unittest
 
 from monitor.microstructure import MarketMicrostructureState
@@ -106,6 +108,76 @@ class OkxSwapWebSocketStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(trade["funding_rate"], 0.0001)
         self.assertEqual(trade["microstructure_status"], "active")
         self.assertGreater(trade["spread_bps"], 0)
+
+
+    async def test_liquidation_poll_failures_are_throttled(self) -> None:
+        microstructure_state = MarketMicrostructureState(["BTCUSDT"])
+        stream = OkxSwapWebSocketStream(
+            ["BTCUSDT"],
+            liquidation_poll_interval_seconds=15,
+            microstructure_state=microstructure_state,
+        )
+        calls = []
+
+        def failing_fetch(symbol, now):
+            calls.append(now)
+            raise RuntimeError("network down")
+
+        stream._rest_helper._fetch_liquidations = failing_fetch
+
+        stream._maybe_poll_liquidations("BTCUSDT", 1000.0)
+        first_task = stream._liquidation_tasks["BTCUSDT"]
+        await first_task
+        self.assertEqual(len(calls), 1)
+
+        stream._maybe_poll_liquidations("BTCUSDT", 1005.0)
+        self.assertIs(stream._liquidation_tasks["BTCUSDT"], first_task)
+        self.assertEqual(len(calls), 1)
+
+        stream._maybe_poll_liquidations("BTCUSDT", 1016.0)
+        self.assertIsNot(stream._liquidation_tasks["BTCUSDT"], first_task)
+        await stream._liquidation_tasks["BTCUSDT"]
+        self.assertEqual(len(calls), 2)
+
+    async def test_trade_handling_does_not_block_on_liquidation_poll(self) -> None:
+        microstructure_state = MarketMicrostructureState(["BTCUSDT"])
+        stream = OkxSwapWebSocketStream(
+            ["BTCUSDT"],
+            liquidation_poll_interval_seconds=1,
+            microstructure_state=microstructure_state,
+        )
+        stream._rest_helper._contracts_to_base_quantity = lambda symbol, price, contracts: contracts * 0.01
+        release = threading.Event()
+
+        def slow_fetch(symbol, now):
+            release.wait(timeout=5)
+            return []
+
+        stream._rest_helper._fetch_liquidations = slow_fetch
+
+        trade = await asyncio.wait_for(
+            stream._handle_message(
+                json.dumps(
+                    {
+                        "arg": {"channel": "trades", "instId": "BTC-USDT-SWAP"},
+                        "data": [
+                            {
+                                "ts": "1001000",
+                                "px": "50000",
+                                "sz": "4",
+                                "side": "buy",
+                                "tradeId": "42",
+                            }
+                        ],
+                    }
+                )
+            ),
+            timeout=1.0,
+        )
+
+        self.assertIsNotNone(trade)
+        release.set()
+        await stream._liquidation_tasks["BTCUSDT"]
 
 
 if __name__ == "__main__":

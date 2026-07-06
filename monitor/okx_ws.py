@@ -46,6 +46,7 @@ class OkxSwapWebSocketStream:
         self._state: dict[str, dict] = {}
         self._last_channel_at: dict[str, dict[str, float]] = {}
         self._last_liquidation_poll_at: dict[str, float] = {}
+        self._liquidation_tasks: dict[str, asyncio.Task] = {}
         self.liquidation_poll_interval_seconds = liquidation_poll_interval_seconds
         self._rest_helper = OkxSwapTickerPoller(
             symbols,
@@ -173,7 +174,7 @@ class OkxSwapWebSocketStream:
                 "funding_rate": self._state.get(symbol, {}).get("funding_rate", 0.0),
                 "mark_price": mark_price,
             }
-            await self._refresh_liquidations(symbol, event_time)
+            self._maybe_poll_liquidations(symbol, event_time)
             if self.microstructure_state:
                 latest_trade.update(self.microstructure_state.snapshot(symbol, event_time))
         return latest_trade
@@ -222,17 +223,26 @@ class OkxSwapWebSocketStream:
             value = quantity * price if price > 0 else contracts
         self._state.setdefault(symbol, {})["open_interest"] = value
 
-    async def _refresh_liquidations(self, symbol: str, now: float) -> None:
+    def _maybe_poll_liquidations(self, symbol: str, now: float) -> None:
         if not self.microstructure_state:
             return
         if now - self._last_liquidation_poll_at.get(symbol, 0) < self.liquidation_poll_interval_seconds:
             return
+        existing = self._liquidation_tasks.get(symbol)
+        if existing and not existing.done():
+            return
+        # 失败同样计入节流窗口，避免网络异常时每笔成交都触发重试
+        self._last_liquidation_poll_at[symbol] = now
+        self._liquidation_tasks[symbol] = asyncio.create_task(
+            self._refresh_liquidations(symbol, now)
+        )
+
+    async def _refresh_liquidations(self, symbol: str, now: float) -> None:
         try:
             liquidations = await asyncio.to_thread(self._rest_helper._fetch_liquidations, symbol, now)
             self.microstructure_state.mark_liquidation_feed(symbol, now)
             self._rest_helper._record_liquidations(symbol, liquidations, now)
             self._record_channel(symbol, "liquidations", now)
-            self._last_liquidation_poll_at[symbol] = now
         except Exception as exc:
             logging.warning("OKX liquidation poll failed for %s: %s", symbol, exc)
 

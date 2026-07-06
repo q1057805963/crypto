@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -230,6 +231,10 @@ async def run(config: dict) -> None:
         datefmt="%H:%M:%S",
         force=True,
     )
+    # 小核 VPS 默认线程池只有 cpu+4 个工人，强平轮询/Telegram/AI 并发时会排队
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=16, thread_name_prefix="cfm-io")
+    )
 
     users_config = config.get("users", {})
     user_store = None
@@ -403,8 +408,8 @@ async def run(config: dict) -> None:
             enriched_event = enrich_event_with_ai(event, analysis)
         alert.send(enriched_event)
         if store:
-            store.record_event(enriched_event, snapshot_data)
-            dashboard_state.set_events(store.recent(50))
+            await asyncio.to_thread(store.record_event, enriched_event, snapshot_data)
+            dashboard_state.set_events(await asyncio.to_thread(store.recent, 50))
         else:
             dashboard_state.add_event(enriched_event)
 
@@ -418,7 +423,10 @@ async def run(config: dict) -> None:
 
         async def runner() -> None:
             analysis = await get_alert_ai_analysis(symbol, snapshot_data)
-            telegram_alert.send_snapshot(enrich_snapshot_with_ai(snapshot_data, analysis))
+            await asyncio.to_thread(
+                telegram_alert.send_snapshot,
+                enrich_snapshot_with_ai(snapshot_data, analysis),
+            )
 
         task = track_task(asyncio.create_task(runner()))
         notification_tasks[symbol] = task
@@ -476,6 +484,9 @@ async def run(config: dict) -> None:
         stale_after_seconds=float(failover_config.get("stale_after_seconds", 20)),
         switch_cooldown_seconds=float(
             failover_config.get("switch_cooldown_seconds", 45)
+        ),
+        primary_retry_seconds=float(
+            failover_config.get("primary_retry_seconds", 300)
         ),
         on_switch=handle_source_switch,
     )
@@ -603,6 +614,24 @@ async def run(config: dict) -> None:
         )
         background_tasks.append(asyncio.create_task(telegram_bot_responder.run()))
 
+    if store:
+        followup_interval_seconds = max(
+            float(storage_config.get("followup_resolve_interval_seconds", 30)),
+            5.0,
+        )
+
+        async def followup_worker() -> None:
+            while True:
+                await asyncio.sleep(followup_interval_seconds)
+                try:
+                    resolved = await asyncio.to_thread(store.resolve_pending_followups)
+                    if resolved:
+                        dashboard_state.set_events(await asyncio.to_thread(store.recent, 50))
+                except Exception:
+                    logging.exception("Followup resolution worker failed")
+
+        background_tasks.append(asyncio.create_task(followup_worker()))
+
     try:
         async for trade in source_manager.listen():
             dashboard_state.set_source_health(source_manager.source_health())
@@ -615,14 +644,11 @@ async def run(config: dict) -> None:
                 if snapshot_data:
                     snapshot_payload = clone_payload(snapshot_data)
                     if snapshot_payload and telegram_alert.has_ready_targets(snapshot_payload):
-                        if has_alert_ai(snapshot_payload):
-                            queue_snapshot_notification(snapshot_payload)
-                        else:
-                            telegram_alert.send_snapshot(snapshot_payload)
-                if store:
-                    followups_updated = store.record_snapshot(snapshot)
-                    if followups_updated:
-                        dashboard_state.set_events(store.recent(50))
+                        queue_snapshot_notification(snapshot_payload)
+                if store and store.snapshot_due(snapshot):
+                    await asyncio.to_thread(
+                        store.record_snapshot, snapshot, resolve_followups=False
+                    )
                 if (
                     not user_store
                     and ai_analyzer.enabled
@@ -638,8 +664,8 @@ async def run(config: dict) -> None:
                 else:
                     alert.send(event)
                     if store:
-                        store.record_event(event, snapshot_payload)
-                        dashboard_state.set_events(store.recent(50))
+                        await asyncio.to_thread(store.record_event, event, snapshot_payload)
+                        dashboard_state.set_events(await asyncio.to_thread(store.recent, 50))
                     else:
                         dashboard_state.add_event(event)
     finally:

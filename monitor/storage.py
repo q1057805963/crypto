@@ -795,7 +795,11 @@ class AlertStore:
         except json.JSONDecodeError:
             return {}
 
-    def record_snapshot(self, snapshot: SymbolSnapshot) -> bool:
+    def snapshot_due(self, snapshot: SymbolSnapshot) -> bool:
+        last_recorded = self._last_snapshot_at.get(snapshot.symbol, 0.0)
+        return snapshot.updated_at - last_recorded >= self.snapshot_interval_seconds
+
+    def record_snapshot(self, snapshot: SymbolSnapshot, resolve_followups: bool = True) -> bool:
         last_recorded = self._last_snapshot_at.get(snapshot.symbol, 0.0)
         if snapshot.updated_at - last_recorded < self.snapshot_interval_seconds:
             return False
@@ -825,10 +829,71 @@ class AlertStore:
                     json.dumps(payload, ensure_ascii=False),
                 ),
             )
-            resolved = self._resolve_due_followups(conn, snapshot.symbol, snapshot.updated_at)
+            resolved = (
+                self._resolve_due_followups(conn, snapshot.symbol, snapshot.updated_at)
+                if resolve_followups
+                else False
+            )
 
         self._last_snapshot_at[snapshot.symbol] = snapshot.updated_at
         return resolved
+
+    def resolve_pending_followups(self, now_ts: float | None = None, limit: int = 20) -> bool:
+        """独立解析到期的后效回写，HTTP 调用不持有任何 SQLite 事务。"""
+        now_ts = float(now_ts if now_ts is not None else time())
+        with self._connect() as conn:
+            due_rows = conn.execute(
+                """
+                SELECT
+                    f.id,
+                    f.symbol,
+                    f.horizon_minutes,
+                    f.target_time,
+                    f.anchor_price,
+                    a.event_time
+                FROM alert_followups f
+                JOIN alerts a ON a.id = f.alert_id
+                WHERE f.status = 'pending' AND f.target_time <= ?
+                ORDER BY f.target_time ASC
+                LIMIT ?
+                """,
+                (now_ts, int(limit)),
+            ).fetchall()
+
+        resolved_any = False
+        for row in due_rows:
+            followup_id = int(row[0])
+            symbol = str(row[1] or "").upper()
+            horizon_minutes = int(row[2])
+            target_time = float(row[3] or 0)
+            anchor_price = float(row[4] or 0)
+            event_time = float(row[5] or 0)
+            if not symbol or anchor_price <= 0 or event_time <= 0:
+                continue
+
+            payload = self._resolve_followup_from_exchange(
+                symbol=symbol,
+                horizon_minutes=horizon_minutes,
+                event_time=event_time,
+                target_time=target_time,
+                anchor_price=anchor_price,
+            )
+            if not payload:
+                with self._connect() as conn:
+                    payload = self._followup_payload_from_snapshots(
+                        conn,
+                        symbol=symbol,
+                        horizon_minutes=horizon_minutes,
+                        event_time=event_time,
+                        target_time=target_time,
+                        anchor_price=anchor_price,
+                    )
+            if not payload:
+                continue
+            with self._connect() as conn:
+                self._update_followup(conn, followup_id, horizon_minutes, payload)
+            resolved_any = True
+        return resolved_any
 
     def _resolve_due_followups(
         self,
@@ -874,65 +939,81 @@ class AlertStore:
                 resolved_any = True
                 continue
 
-            end_snapshot = conn.execute(
-                """
-                SELECT updated_at, price
-                FROM signal_snapshots
-                WHERE symbol = ? AND updated_at >= ?
-                ORDER BY updated_at ASC
-                LIMIT 1
-                """,
-                (symbol.upper(), target_time),
-            ).fetchone()
-            if not end_snapshot:
+            payload = self._followup_payload_from_snapshots(
+                conn,
+                symbol=symbol.upper(),
+                horizon_minutes=horizon_minutes,
+                event_time=event_time,
+                target_time=target_time,
+                anchor_price=anchor_price,
+            )
+            if not payload:
                 continue
-
-            close_time = float(end_snapshot[0] or 0)
-            close_price = float(end_snapshot[1] or 0)
-            if close_time <= 0 or close_price <= 0:
-                continue
-
-            samples = conn.execute(
-                """
-                SELECT price
-                FROM signal_snapshots
-                WHERE symbol = ? AND updated_at > ? AND updated_at <= ?
-                ORDER BY updated_at ASC
-                """,
-                (symbol.upper(), event_time, close_time),
-            ).fetchall()
-
-            observed_prices = [anchor_price]
-            for sample in samples:
-                price = float(sample[0] or 0)
-                if price > 0:
-                    observed_prices.append(price)
-
-            high_price = max(observed_prices)
-            low_price = min(observed_prices)
-            close_bps = _bps_change(anchor_price, close_price)
-            max_up_bps = _bps_change(anchor_price, high_price)
-            max_down_bps = _bps_change(anchor_price, low_price)
-            sample_count = max(0, len(observed_prices) - 1)
-
-            payload = {
-                "label": _followup_label(horizon_minutes),
-                "horizon_minutes": horizon_minutes,
-                "target_time": target_time,
-                "close_time": close_time,
-                "anchor_price": anchor_price,
-                "close_price": close_price,
-                "high_price": high_price,
-                "low_price": low_price,
-                "close_bps": round(close_bps, 3),
-                "max_up_bps": round(max_up_bps, 3),
-                "max_down_bps": round(max_down_bps, 3),
-                "sample_count": sample_count,
-                "source": "signal_snapshots",
-            }
             self._update_followup(conn, followup_id, horizon_minutes, payload)
             resolved_any = True
         return resolved_any
+
+    def _followup_payload_from_snapshots(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        symbol: str,
+        horizon_minutes: int,
+        event_time: float,
+        target_time: float,
+        anchor_price: float,
+    ) -> dict | None:
+        end_snapshot = conn.execute(
+            """
+            SELECT updated_at, price
+            FROM signal_snapshots
+            WHERE symbol = ? AND updated_at >= ?
+            ORDER BY updated_at ASC
+            LIMIT 1
+            """,
+            (symbol, target_time),
+        ).fetchone()
+        if not end_snapshot:
+            return None
+
+        close_time = float(end_snapshot[0] or 0)
+        close_price = float(end_snapshot[1] or 0)
+        if close_time <= 0 or close_price <= 0:
+            return None
+
+        samples = conn.execute(
+            """
+            SELECT price
+            FROM signal_snapshots
+            WHERE symbol = ? AND updated_at > ? AND updated_at <= ?
+            ORDER BY updated_at ASC
+            """,
+            (symbol, event_time, close_time),
+        ).fetchall()
+
+        observed_prices = [anchor_price]
+        for sample in samples:
+            price = float(sample[0] or 0)
+            if price > 0:
+                observed_prices.append(price)
+
+        high_price = max(observed_prices)
+        low_price = min(observed_prices)
+        return {
+            "label": _followup_label(horizon_minutes),
+            "horizon_minutes": horizon_minutes,
+            "target_time": target_time,
+            "close_time": close_time,
+            "anchor_price": anchor_price,
+            "close_price": close_price,
+            "high_price": high_price,
+            "low_price": low_price,
+            "close_bps": round(_bps_change(anchor_price, close_price), 3),
+            "max_up_bps": round(_bps_change(anchor_price, high_price), 3),
+            "max_down_bps": round(_bps_change(anchor_price, low_price), 3),
+            "sample_count": max(0, len(observed_prices) - 1),
+            "source": "signal_snapshots",
+        }
 
     def _resolve_followup_from_exchange(
         self,

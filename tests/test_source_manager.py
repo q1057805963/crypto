@@ -158,5 +158,74 @@ class SourceManagerTests(unittest.TestCase):
         asyncio.run(run_test())
 
 
+    def test_retries_primary_source_after_interval(self) -> None:
+        def fake_build_source_context(config, symbols, spec):
+            return SourceContext(
+                exchange=spec.exchange,
+                data_source=spec.data_source,
+                stream=FakeStream(),
+                microstructure_state=FakeMicrostructureState(),
+                microstructure_stream=None,
+            )
+
+        async def run_test() -> None:
+            switches = []
+            manager = SourceFailoverManager(
+                config={},
+                specs=[SourceSpec("okx_swap", "websocket"), SourceSpec("okx_swap", "rest")],
+                symbols=["BTCUSDT"],
+                stale_after_seconds=20,
+                switch_cooldown_seconds=45,
+                primary_retry_seconds=300,
+                on_switch=lambda exchange, source, note: switches.append((exchange, source, note)),
+            )
+            with patch("monitor.source_manager.build_source_context", fake_build_source_context):
+                await manager._activate(1)
+                manager._last_switch_at = time.monotonic() - 301
+
+                await manager._maybe_retry_primary()
+
+                self.assertEqual(manager._active_index, 0)
+                self.assertEqual(manager.active_data_source, "websocket")
+                self.assertIn("尝试切回主数据源", switches[-1][2])
+                await manager.close()
+
+        asyncio.run(run_test())
+
+    def test_primary_retry_waits_for_interval_and_can_be_disabled(self) -> None:
+        def fake_build_source_context(config, symbols, spec):
+            return SourceContext(
+                exchange=spec.exchange,
+                data_source=spec.data_source,
+                stream=FakeStream(),
+                microstructure_state=FakeMicrostructureState(),
+                microstructure_stream=None,
+            )
+
+        async def run_test() -> None:
+            manager = SourceFailoverManager(
+                config={},
+                specs=[SourceSpec("okx_swap", "websocket"), SourceSpec("okx_swap", "rest")],
+                symbols=["BTCUSDT"],
+                stale_after_seconds=20,
+                switch_cooldown_seconds=45,
+                primary_retry_seconds=300,
+            )
+            with patch("monitor.source_manager.build_source_context", fake_build_source_context):
+                await manager._activate(1)
+
+                manager._last_switch_at = time.monotonic() - 10
+                await manager._maybe_retry_primary()
+                self.assertEqual(manager._active_index, 1)
+
+                manager.primary_retry_seconds = 0.0
+                manager._last_switch_at = time.monotonic() - 10_000
+                await manager._maybe_retry_primary()
+                self.assertEqual(manager._active_index, 1)
+                await manager.close()
+
+        asyncio.run(run_test())
+
+
 if __name__ == "__main__":
     unittest.main()

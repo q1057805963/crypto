@@ -171,6 +171,37 @@ class AlertStoreFollowupTests(unittest.TestCase):
         self.assertEqual(context["combo_stats"]["sample_count"], 1)
         self.assertIn("trigger_combo", context)
 
+    def test_resolve_pending_followups_resolves_due_rows_without_snapshot_path(self) -> None:
+        self.store.record_event(
+            build_event(),
+            {"support_price": 98.0, "resistance_price": 106.0},
+        )
+        for updated_at, price in [
+            (1060.0, 101.0),
+            (1120.0, 102.0),
+            (1180.0, 104.0),
+            (1240.0, 99.0),
+            (1300.0, 102.0),
+        ]:
+            self.store.record_snapshot(
+                build_snapshot(updated_at, price),
+                resolve_followups=False,
+            )
+
+        pending = self.store.recent(1)[0]["followups"]
+        self.assertTrue(all(item["status"] == "pending" for item in pending))
+
+        self.assertTrue(self.store.resolve_pending_followups(now_ts=1301.0))
+
+        followup_5m = self.store.recent(1)[0]["followups"][0]
+        self.assertEqual(followup_5m["label"], "5m")
+        self.assertEqual(followup_5m["status"], "resolved")
+        self.assertEqual(followup_5m["source"], "signal_snapshots")
+        self.assertAlmostEqual(followup_5m["close_bps"], 200.0, places=3)
+        self.assertAlmostEqual(followup_5m["max_up_bps"], 400.0, places=3)
+        self.assertAlmostEqual(followup_5m["max_down_bps"], -100.0, places=3)
+        self.assertEqual(followup_5m["sample_count"], 5)
+
     def test_followup_resolver_takes_precedence_over_snapshot_sampling(self) -> None:
         calls = []
 
