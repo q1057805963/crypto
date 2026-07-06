@@ -6,7 +6,7 @@ from time import time
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from monitor.telegram import send_telegram_message
+from monitor.telegram import send_telegram_chat_action, send_telegram_message
 
 
 class TelegramBotResponder:
@@ -16,20 +16,30 @@ class TelegramBotResponder:
         get_users,
         get_snapshot,
         get_ai_analyzer,
+        get_timeframe_context=None,
         poll_interval_seconds: float = 2,
         request_timeout_seconds: int = 20,
         ai_cooldown_seconds: int = 20,
+        history_ttl_seconds: int = 1800,
+        history_max_rounds: int = 3,
+        timeframe_context_timeout_seconds: float = 15,
     ) -> None:
         self.enabled = bool(enabled)
         self.get_users = get_users
         self.get_snapshot = get_snapshot
         self.get_ai_analyzer = get_ai_analyzer
+        self.get_timeframe_context = get_timeframe_context
         self.poll_interval_seconds = poll_interval_seconds
         self.request_timeout_seconds = request_timeout_seconds
         self.ai_cooldown_seconds = ai_cooldown_seconds
+        self.history_ttl_seconds = int(history_ttl_seconds)
+        self.history_max_rounds = int(history_max_rounds)
+        self.timeframe_context_timeout_seconds = float(timeframe_context_timeout_seconds)
         self._offsets: dict[str, int] = {}
         self._initialized_tokens: set[str] = set()
         self._last_question_at: dict[str, float] = {}
+        self._history: dict[str, list[dict]] = {}
+        self._last_symbol: dict[str, tuple[str, float]] = {}
         self._started_at = time()
 
     async def run(self) -> None:
@@ -115,19 +125,21 @@ class TelegramBotResponder:
             self._send(bot_token, chat_id, self._help_text(user))
             return
 
+        session_key = f"{bot_token}:{chat_id}"
         symbol = self._extract_symbol(text, user.get("symbols") or [])
+        if not symbol:
+            symbol = self._recent_symbol(session_key)
         if not symbol:
             self._send(bot_token, chat_id, self._help_text(user))
             return
 
-        cooldown_key = f"{bot_token}:{chat_id}"
         now = time()
-        last_question_at = self._last_question_at.get(cooldown_key, 0)
+        last_question_at = self._last_question_at.get(session_key, 0)
         if now - last_question_at < self.ai_cooldown_seconds:
             wait_seconds = int(self.ai_cooldown_seconds - (now - last_question_at))
             self._send(bot_token, chat_id, f"AI 分析冷却中，请约 {wait_seconds} 秒后再问。")
             return
-        self._last_question_at[cooldown_key] = now
+        self._last_question_at[session_key] = now
 
         snapshot = self.get_snapshot(symbol)
         if not snapshot:
@@ -142,18 +154,138 @@ class TelegramBotResponder:
             self._send(bot_token, chat_id, "AI API Key 未配置，请先在页面的 AI 设置里填写。")
             return
 
-        self._send(bot_token, chat_id, f"收到，正在分析 {symbol}...")
-        result = await analyzer.answer_question(
-            text,
-            snapshot,
-            [str(symbol).upper() for symbol in user.get("symbols", [])],
-        )
+        self._last_symbol[session_key] = (symbol, now)
+        history = self._recent_history(session_key)
+        available_symbols = [str(item).upper() for item in user.get("symbols", [])]
+
+        async def answer_worker() -> str | None:
+            timeframe_data, confluence_data = await self._load_timeframe_context(symbol, text)
+            return await analyzer.answer_question(
+                text,
+                snapshot,
+                available_symbols,
+                history=history,
+                timeframe_data=timeframe_data,
+                confluence_data=confluence_data,
+            )
+
+        answer_task = asyncio.create_task(answer_worker())
+        result = await self._wait_with_typing(bot_token, chat_id, answer_task)
         if not result:
             reason = analyzer.get_last_error() if analyzer else "analysis failed"
             self._send(bot_token, chat_id, f"AI 暂时没有返回结果：{reason}")
             return
 
-        self._send(bot_token, chat_id, result)
+        reply = self._sanitize_reply(result)
+        self._remember(session_key, question=text, answer=reply, symbol=symbol)
+        self._send(bot_token, chat_id, reply)
+
+    async def _wait_with_typing(
+        self,
+        bot_token: str,
+        chat_id: str,
+        task: asyncio.Task,
+        max_wait_seconds: float = 90,
+    ) -> str | None:
+        deadline = time() + max_wait_seconds
+        try:
+            while True:
+                await asyncio.to_thread(self._send_chat_action, bot_token, chat_id)
+                remaining = deadline - time()
+                if remaining <= 0:
+                    task.cancel()
+                    return None
+                try:
+                    return await asyncio.wait_for(asyncio.shield(task), timeout=min(4.5, remaining))
+                except asyncio.TimeoutError:
+                    continue
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+
+    async def _load_timeframe_context(self, symbol: str, text: str) -> tuple[dict | None, dict | None]:
+        if not self.get_timeframe_context:
+            return None, None
+        period = self._detect_period(text)
+        try:
+            context = await asyncio.wait_for(
+                asyncio.to_thread(self.get_timeframe_context, symbol, period),
+                timeout=self.timeframe_context_timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.debug("Telegram bot timeframe context failed for %s: %s", symbol, exc)
+            return None, None
+        if not context:
+            return None, None
+        timeframe_data, confluence_data = context
+        return timeframe_data, confluence_data
+
+    @staticmethod
+    def _detect_period(text: str) -> str | None:
+        lowered = str(text or "").lower()
+        period_rules = [
+            ("1d", ("1d", "日线", "日k", "天图", "1天", "一天", "daily")),
+            ("4h", ("4h", "4小时", "四小时")),
+            ("1h", ("1h", "1小时", "一小时", "60分")),
+            ("15m", ("15m", "15分", "十五分")),
+            ("5m", ("5m", "5分", "五分")),
+        ]
+        for period, keywords in period_rules:
+            if any(keyword in lowered for keyword in keywords):
+                return period
+        return None
+
+    def _recent_history(self, session_key: str) -> list[dict]:
+        now = time()
+        entries = [
+            entry
+            for entry in self._history.get(session_key, [])
+            if now - float(entry.get("at") or 0) <= self.history_ttl_seconds
+        ]
+        if entries:
+            self._history[session_key] = entries
+        else:
+            self._history.pop(session_key, None)
+        return list(entries)
+
+    def _remember(self, session_key: str, *, question: str, answer: str, symbol: str) -> None:
+        entries = self._recent_history(session_key)
+        entries.append(
+            {
+                "question": str(question),
+                "answer": str(answer),
+                "symbol": str(symbol).upper(),
+                "at": time(),
+            }
+        )
+        self._history[session_key] = entries[-self.history_max_rounds:]
+
+    def _recent_symbol(self, session_key: str) -> str | None:
+        record = self._last_symbol.get(session_key)
+        if not record:
+            return None
+        symbol, at = record
+        if time() - at > self.history_ttl_seconds:
+            self._last_symbol.pop(session_key, None)
+            return None
+        return symbol
+
+    @staticmethod
+    def _sanitize_reply(text: str) -> str:
+        cleaned = str(text or "")
+        cleaned = re.sub(r"```[a-zA-Z0-9_-]*", "", cleaned)
+        cleaned = cleaned.replace("**", "").replace("__", "")
+        cleaned = re.sub(r"^#{1,6}\s*", "", cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r"^(\s*)[*•]\s+", r"\1- ", cleaned, flags=re.MULTILINE)
+        return cleaned.strip()
+
+    @staticmethod
+    def _send_chat_action(bot_token: str, chat_id: str) -> None:
+        error = send_telegram_chat_action(bot_token, chat_id)
+        if error:
+            logging.debug("Telegram chat action to %s failed: %s", chat_id, error)
 
     @staticmethod
     def _match_user(users: list[dict], chat_id: str) -> dict | None:
@@ -177,9 +309,12 @@ class TelegramBotResponder:
             if symbol in normalized_text or base in normalized_text:
                 return symbol
 
-        ignored = {"ASK", "START", "HELP", "USDT", "LONG", "SHORT"}
+        ignored = {
+            "ASK", "START", "HELP", "USDT", "LONG", "SHORT",
+            "OI", "VWAP", "POC", "AI", "ATH", "ATL", "KDJ", "MACD", "RSI",
+        }
         for token in re.findall(r"[A-Za-z0-9]{2,20}", text.upper()):
-            if token in ignored:
+            if token in ignored or token.isdigit():
                 continue
             symbol = token if token.endswith("USDT") else f"{token}USDT"
             if not allowed or symbol in allowed:

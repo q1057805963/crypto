@@ -78,6 +78,20 @@ def send_telegram_message(bot_token: str, chat_id: str, text: str) -> str | None
         return str(exc)
 
 
+def send_telegram_chat_action(bot_token: str, chat_id: str, action: str = "typing") -> str | None:
+    payload = json.dumps({"chat_id": chat_id, "action": action}).encode("utf-8")
+    request = Request(
+        f"https://api.telegram.org/bot{bot_token}/sendChatAction",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=10):
+            return None
+    except Exception as exc:
+        return str(exc)
+
+
 def send_text_to_telegram_users(users: list[dict], text: str) -> dict:
     sent = 0
     errors = []

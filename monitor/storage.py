@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -381,8 +382,20 @@ class AlertStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
+    @contextmanager
+    def _connect(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def _init_db(self) -> None:
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS alerts (
@@ -482,7 +495,7 @@ class AlertStore:
         payload["trigger_combo"] = trigger_combo(payload)
         payload["decision"] = _decision_metrics(event, snapshot_data)
         event_time = float(event.event_time or time())
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO alerts(
@@ -537,7 +550,7 @@ class AlertStore:
             )
 
     def recent(self, limit: int = 50) -> list[dict]:
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT id, created_at, payload
@@ -585,7 +598,7 @@ class AlertStore:
     def signal_context(self, data: dict | None) -> dict:
         payload = dict(data or {})
         combo = trigger_combo(payload)
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn:
             stats_by_signal = self._load_signal_stats(conn)
             stats_by_combo = self._load_combo_stats(conn)
         context = {"trigger_combo": combo}
@@ -792,7 +805,7 @@ class AlertStore:
         payload["suggestions"] = list(payload["suggestions"])
         recorded_at = datetime.fromtimestamp(snapshot.updated_at).strftime("%Y-%m-%d %H:%M:%S")
 
-        with sqlite3.connect(self.path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO signal_snapshots(

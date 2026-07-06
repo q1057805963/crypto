@@ -170,6 +170,183 @@ class AIAnalyzerTests(unittest.TestCase):
             "第一条观察\n第二条观察",
         )
 
+    def test_build_question_prompt_is_intent_aware_and_conversational(self) -> None:
+        analyzer = AIAnalyzer({})
+        snapshot = {
+            "symbol": "BTCUSDT",
+            "price": 62000,
+            "score": 68,
+            "risk_level": "中风险",
+            "bias": "偏多：价格主动上行",
+            "confidence": 71,
+            "price_move_pct_1m": 0.72,
+            "price_move_pct_5m": 1.65,
+            "quote_volume_1m": 1800000,
+            "volume_multiplier": 2.7,
+            "taker_buy_ratio_1m": 0.69,
+            "oi_change_pct_5m": 1.1,
+            "funding_rate": 0.0002,
+            "mark_price": 62010,
+            "mark_premium_bps": 1.6,
+            "liquidation_data_status": "no_recent_event",
+            "long_liquidation_quote_1m": 0,
+            "short_liquidation_quote_1m": 42000,
+            "spread_bps": 1.2,
+            "depth_imbalance": 0.18,
+            "depth_drop_pct_1m": 4.0,
+            "support_price": 61200,
+            "resistance_price": 62500,
+            "support_distance_pct": 1.29,
+            "resistance_distance_pct": 0.81,
+            "window_vwap": 61780,
+            "vwap_deviation_pct": 0.36,
+            "range_position_pct": 76.0,
+            "bid_wall_price": 61850,
+            "bid_wall_notional": 780000,
+            "ask_wall_price": 62480,
+            "ask_wall_notional": 650000,
+            "reasons": ["1分钟价格波动 +0.72%", "成交额放大 2.7x"],
+            "suggestions": ["等待回踩不破 VWAP 再确认"],
+        }
+
+        prompt = analyzer._build_question_prompt("BTC 现在能追多吗？", snapshot, ["BTCUSDT"])
+
+        self.assertIn("用户意图初判（关键词粗判，仅供参考，以用户原话为准）：追涨/做多可行性", prompt)
+        self.assertIn("当前可用数据范围：实时快照、近1m/5m波动", prompt)
+        self.assertIn("至少引用两个关键数据", prompt)
+        self.assertIn("不要固定套用主假设/确认条件/失效条件/反向风险", prompt)
+        self.assertIn("系统观察建议: 等待回踩不破 VWAP 再确认", prompt)
+        self.assertIn("距支撑 / 距压力: 1.290% / 0.810%", prompt)
+        self.assertIn("用 Telegram 纯文本回复", prompt)
+
+    def test_question_intent_hint_prefers_short_side_keywords(self) -> None:
+        self.assertEqual(
+            AIAnalyzer._question_intent_hint("还能进空吗？"),
+            "下行风险/做空可行性",
+        )
+        self.assertEqual(
+            AIAnalyzer._question_intent_hint("现在追空还是等反弹？"),
+            "下行风险/做空可行性",
+        )
+        self.assertEqual(
+            AIAnalyzer._question_intent_hint("BTC 现在能追多吗？"),
+            "追涨/做多可行性",
+        )
+
+    def test_build_question_prompt_includes_history_and_structure_context(self) -> None:
+        analyzer = AIAnalyzer({})
+        snapshot = {
+            "symbol": "BTCUSDT",
+            "price": 62000,
+            "score": 55,
+            "reasons": [],
+            "suggestions": [],
+        }
+        history = [
+            {
+                "question": "BTC 现在能追多吗？",
+                "answer": "先别急着追，量能还没跟上，回踩 61800 不破再看。",
+                "symbol": "BTCUSDT",
+            }
+        ]
+        timeframe_data = {
+            "period_label": "1小时",
+            "candle_confirmed": True,
+            "open_price": 61500,
+            "high_price": 62400,
+            "low_price": 61300,
+            "price": 62000,
+            "price_move_pct": 0.81,
+            "volume_multiplier": 1.4,
+            "support_price": 61250,
+            "support_strength": 0.8,
+            "support_touch_count": 3,
+            "support_status": "holding",
+            "resistance_price": 62600,
+            "resistance_strength": 0.7,
+            "resistance_touch_count": 2,
+            "resistance_status": "capping",
+            "structure_regime": "range",
+            "range_position_pct": 62.0,
+            "profile_poc_price": 61800,
+            "value_area_low": 61500,
+            "value_area_high": 62300,
+            "window_vwap": 61850,
+            "vwap_deviation_pct": 0.24,
+            "support_distance_pct": 1.21,
+            "resistance_distance_pct": 0.97,
+            "period_long_liquidation_quote": 120000,
+            "period_short_liquidation_quote": 340000,
+        }
+        confluence_data = {
+            "label": "多头共振",
+            "direction": "up",
+            "score": 66.0,
+            "summary": "1h/4h 同向",
+            "confirmations": ["1h 站上 VWAP"],
+            "conflicts": [],
+            "periods": [],
+        }
+
+        prompt = analyzer._build_question_prompt(
+            "那 1 小时的支撑在哪里？",
+            snapshot,
+            ["BTCUSDT"],
+            history=history,
+            timeframe_data=timeframe_data,
+            confluence_data=confluence_data,
+        )
+
+        self.assertIn("最近对话（按时间先后", prompt)
+        self.assertIn("用户[BTCUSDT] 问：BTC 现在能追多吗？", prompt)
+        self.assertIn("你答：先别急着追", prompt)
+        self.assertIn("用户关注的 1小时 周期结构数据", prompt)
+        self.assertIn("结构支撑: 61250", prompt)
+        self.assertIn("多周期共振", prompt)
+        self.assertIn("未提供的周期不要凭空下结论", prompt)
+        self.assertIn("请自然衔接你上一轮的结论", prompt)
+        self.assertNotIn("不能凭空确认长周期结构", prompt)
+
+    def test_build_question_prompt_without_structure_keeps_scope_guardrail(self) -> None:
+        analyzer = AIAnalyzer({})
+        prompt = analyzer._build_question_prompt(
+            "BTC 4小时结构怎么样？",
+            {"symbol": "BTCUSDT", "price": 62000, "reasons": [], "suggestions": []},
+            ["BTCUSDT"],
+        )
+
+        self.assertIn("不能凭空确认长周期结构", prompt)
+        self.assertNotIn("最近对话（按时间先后", prompt)
+
+    def test_question_api_uses_question_style_generation_settings(self) -> None:
+        analyzer = AIAnalyzer(
+            {
+                "enabled": True,
+                "api_key": "secret",
+                "max_tokens": 500,
+                "question_max_tokens": 760,
+                "question_temperature": 0.62,
+            }
+        )
+        calls = []
+
+        def fake_call_prompt(prompt: str, **kwargs) -> str:
+            calls.append({"prompt": prompt, **kwargs})
+            return "ok"
+
+        analyzer._call_prompt = fake_call_prompt
+
+        result = analyzer._call_question_api("ETH 会不会急跌？", {"symbol": "ETHUSDT"}, ["ETHUSDT"])
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls[0]["temperature"], 0.62)
+        self.assertEqual(calls[0]["max_tokens"], 760)
+        self.assertIn("Telegram", calls[0]["system_prompt"])
+        self.assertIn(
+            "用户意图初判（关键词粗判，仅供参考，以用户原话为准）：下行风险/做空可行性",
+            calls[0]["prompt"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

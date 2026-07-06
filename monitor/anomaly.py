@@ -343,10 +343,15 @@ class AnomalyDetector:
         quote_volume_1m = sum(trade["quote_quantity"] for trade in trades_1m)
         quote_volume_window = sum(trade["quote_quantity"] for trade in window.trades)
         base_volume_window = sum(float(trade.get("quantity") or 0) for trade in window.trades)
-        observed_window_minutes = max(window.observed_seconds(now) / 60, 1)
-        window_minutes = min(max(self.window_seconds / 60, 1), observed_window_minutes)
-        baseline_per_minute = max(quote_volume_window / window_minutes, 1)
-        volume_multiplier = quote_volume_1m / baseline_per_minute
+        observed_minutes = window.observed_seconds(now) / 60
+        # 基线必须排除当前这1分钟，否则爆量本身会抬高基线，倍数被封顶在窗口分钟数以内。
+        baseline_volume = max(quote_volume_window - quote_volume_1m, 0.0)
+        baseline_minutes = max(observed_minutes - 1.0, 0.0)
+        if baseline_minutes >= 1.0 and baseline_volume > 0:
+            baseline_per_minute = max(baseline_volume / baseline_minutes, 1.0)
+            volume_multiplier = min(quote_volume_1m / baseline_per_minute, 50.0)
+        else:
+            volume_multiplier = 1.0
         window_vwap = (quote_volume_window / base_volume_window) if base_volume_window > 0 else latest_price
         vwap_deviation_pct = self._pct_change(window_vwap, latest_price)
         support_price = min(float(trade.get("price") or latest_price) for trade in window.trades)
@@ -383,6 +388,11 @@ class AnomalyDetector:
             short_liquidation_quote_1m=short_liquidation_quote_1m,
         )
         direction = self._direction(price_move_pct_1m, buy_volume_1m, sell_volume_1m)
+        oi_threshold = float(self.thresholds.get("oi_change_pct_5m", 0.8))
+        volume_threshold = float(self.thresholds.get("volume_multiplier", 2.2))
+        funding_threshold = float(self.thresholds.get("funding_rate_abs", 0.0003))
+        spread_threshold = float(self.thresholds.get("spread_bps", 3.0))
+        depth_drop_threshold = float(self.thresholds.get("depth_drop_pct_1m", 15.0))
         bias = self._bias(
             direction,
             price_move_pct_5m,
@@ -392,6 +402,10 @@ class AnomalyDetector:
             short_liquidation_quote_1m if liquidation_scoring_enabled else 0,
             spread_bps if spread_scoring_enabled else 0,
             depth_drop_pct_1m if depth_drop_scoring_enabled else 0,
+            oi_threshold=oi_threshold,
+            funding_threshold=funding_threshold,
+            spread_threshold=spread_threshold,
+            depth_drop_threshold=depth_drop_threshold,
         )
         risk_level = self._risk_level(score)
         confidence = self._confidence(
@@ -414,6 +428,11 @@ class AnomalyDetector:
             long_liquidation_quote_1m=long_liquidation_quote_1m if liquidation_scoring_enabled else 0,
             short_liquidation_quote_1m=short_liquidation_quote_1m if liquidation_scoring_enabled else 0,
             spread_bps=spread_bps if spread_scoring_enabled else 0,
+            oi_threshold=oi_threshold,
+            volume_threshold=volume_threshold,
+            funding_threshold=funding_threshold,
+            spread_threshold=spread_threshold,
+            depth_drop_threshold=depth_drop_threshold,
         )
 
         return {
@@ -584,7 +603,7 @@ class AnomalyDetector:
             18,
         )
         if volume_multiplier >= volume_threshold:
-            score += volume_score
+            score += volume_score * liquidity_factor
             reasons.append(f"成交额放大 {volume_multiplier:.1f}x")
 
         taker_score = 0.0
@@ -718,12 +737,21 @@ class AnomalyDetector:
         return min(score, 100), reasons
 
     @staticmethod
-    def _component_score(value: float, trigger: float, full: float, cap: float) -> float:
+    def _component_score(
+        value: float,
+        trigger: float,
+        full: float,
+        cap: float,
+        floor_ratio: float = 0.3,
+    ) -> float:
         if cap <= 0 or trigger <= 0 or value < trigger:
             return 0.0
         if full <= trigger:
             return cap
-        return min((value - trigger) / (full - trigger) * cap, cap)
+        # 刚触发就应有基础分，否则"触发原因"里列了条件、异常分却几乎不涨。
+        base = cap * floor_ratio
+        scaled = (value - trigger) / (full - trigger) * (cap - base)
+        return min(base + scaled, cap)
 
     def _threshold_enabled(self, key: str, default: bool = True) -> bool:
         value = self.thresholds.get(key, default)
@@ -789,22 +817,27 @@ class AnomalyDetector:
         short_liquidation_quote_1m: float,
         spread_bps: float,
         depth_drop_pct_1m: float,
+        *,
+        oi_threshold: float = 0.8,
+        funding_threshold: float = 0.0003,
+        spread_threshold: float = 3.0,
+        depth_drop_threshold: float = 15.0,
     ) -> str:
-        if depth_drop_pct_1m >= 15 and spread_bps >= 3:
+        if depth_drop_pct_1m >= depth_drop_threshold and spread_bps >= spread_threshold:
             return "插针风险：盘口明显变薄"
         if direction == "up" and short_liquidation_quote_1m > max(long_liquidation_quote_1m * 1.2, 0):
             return "偏多：疑似空头回补/逼空"
         if direction == "down" and long_liquidation_quote_1m > max(short_liquidation_quote_1m * 1.2, 0):
             return "偏空：疑似多头踩踏"
-        if direction == "up" and oi_change_pct_5m >= 0.8:
+        if direction == "up" and oi_change_pct_5m >= oi_threshold:
             return "偏多：疑似新增资金推动"
-        if direction == "down" and oi_change_pct_5m >= 0.8:
+        if direction == "down" and oi_change_pct_5m >= oi_threshold:
             return "偏空：疑似新增空头或连锁止损"
         if direction == "up":
             return "偏多：价格主动上行"
         if direction == "down":
             return "偏空：价格主动下行"
-        if abs(funding_rate) >= 0.0003:
+        if abs(funding_rate) >= funding_threshold:
             return "拥挤：注意反向波动"
         if abs(price_move_pct_5m) >= 1:
             return "波动：方向待确认"
@@ -843,6 +876,12 @@ class AnomalyDetector:
         long_liquidation_quote_1m: float,
         short_liquidation_quote_1m: float,
         spread_bps: float,
+        *,
+        oi_threshold: float = 0.8,
+        volume_threshold: float = 2.2,
+        funding_threshold: float = 0.0003,
+        spread_threshold: float = 3.0,
+        depth_drop_threshold: float = 15.0,
     ) -> list[str]:
         suggestions = []
 
@@ -853,15 +892,15 @@ class AnomalyDetector:
         else:
             suggestions.append("方向暂不清晰，先看下一轮价格是否脱离当前区间")
 
-        if oi_change_pct_5m >= 0.8:
+        if oi_change_pct_5m >= oi_threshold:
             suggestions.append("持仓增加代表有新仓进入，重点看价格是否跟随持仓同向延续")
-        elif oi_change_pct_5m <= -0.8:
+        elif oi_change_pct_5m <= -oi_threshold:
             suggestions.append("持仓下降更像平仓推动，持续性通常弱于新增持仓行情")
 
-        if volume_multiplier >= 2.2:
+        if volume_multiplier >= volume_threshold:
             suggestions.append("成交额明显放大，等待第二次放量确认，避免追在第一根脉冲顶部")
 
-        if abs(funding_rate) >= 0.0003:
+        if abs(funding_rate) >= funding_threshold:
             suggestions.append("资金费率偏离，说明多空拥挤，注意反向清算或插针")
 
         if long_liquidation_quote_1m > short_liquidation_quote_1m * 1.2 and long_liquidation_quote_1m > 0:
@@ -869,7 +908,7 @@ class AnomalyDetector:
         elif short_liquidation_quote_1m > long_liquidation_quote_1m * 1.2 and short_liquidation_quote_1m > 0:
             suggestions.append("空头爆仓占优，若价格仍能站稳，逼空延续概率会更高")
 
-        if depth_drop_pct_1m >= 15 or spread_bps >= 3:
+        if depth_drop_pct_1m >= depth_drop_threshold or spread_bps >= spread_threshold:
             suggestions.append("盘口正在变薄，追单前先确认点差和挂单深度是否恢复")
 
         if abs(price_move_pct_1m) >= 1 and abs(price_move_pct_5m) >= 2:

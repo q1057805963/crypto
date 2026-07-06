@@ -22,7 +22,7 @@ from monitor.source_manager import (
 from monitor.storage import AlertStore
 from monitor.telegram import TelegramAlert, normalize_telegram_users
 from monitor.telegram_bot import TelegramBotResponder
-from monitor.timeframe_analysis import TimeframeAnalysisService
+from monitor.timeframe_analysis import TIMEFRAME_CONFIG, TimeframeAnalysisService
 from monitor.user_config import UserConfigStore
 
 
@@ -559,11 +559,44 @@ async def run(config: dict) -> None:
                 return None
             return snapshot_with_signal_context(snapshot)
 
+        bot_timeframes = TimeframeAnalysisService(cache_ttl_seconds=60)
+
+        def telegram_bot_timeframe_context(
+            symbol: str,
+            period: str | None,
+        ) -> tuple[dict | None, dict | None]:
+            exchange = source_manager.active_exchange
+            timeframe_data = None
+            confluence_data = None
+            if period and period in TIMEFRAME_CONFIG:
+                try:
+                    timeframe_data = bot_timeframes.analyze(
+                        symbol=symbol,
+                        period=period,
+                        exchange=exchange,
+                    )
+                    timeframe_data.update(
+                        source_manager.liquidation_summary(
+                            symbol,
+                            int(TIMEFRAME_CONFIG[period]["seconds"]),
+                        )
+                    )
+                except Exception as exc:
+                    logging.debug("Bot timeframe analyze failed for %s %s: %s", symbol, period, exc)
+                    timeframe_data = None
+            try:
+                confluence_data = bot_timeframes.confluence(symbol=symbol, exchange=exchange)
+            except Exception as exc:
+                logging.debug("Bot confluence failed for %s: %s", symbol, exc)
+                confluence_data = None
+            return timeframe_data, confluence_data
+
         telegram_bot_responder = TelegramBotResponder(
             enabled=True,
             get_users=telegram_bot_users,
             get_snapshot=telegram_bot_snapshot,
             get_ai_analyzer=telegram_bot_ai_analyzer,
+            get_timeframe_context=telegram_bot_timeframe_context,
             poll_interval_seconds=float(telegram_bot_config.get("poll_interval_seconds", 2)),
             request_timeout_seconds=int(telegram_bot_config.get("request_timeout_seconds", 20)),
             ai_cooldown_seconds=int(telegram_bot_config.get("ai_cooldown_seconds", 20)),

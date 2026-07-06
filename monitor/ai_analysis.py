@@ -62,6 +62,11 @@ class AIAnalyzer:
         self.activation_threshold = float(config.get("activation_threshold", 60))
         self.triggers = self._normalize_triggers(config)
         self.max_tokens = int(config.get("max_tokens", 500))
+        self.question_max_tokens = int(
+            config.get("question_max_tokens", max(self.max_tokens, 700))
+        )
+        self.analysis_temperature = float(config.get("temperature", 0.3))
+        self.question_temperature = float(config.get("question_temperature", 0.55))
         self.cache_ttl = int(config.get("cache_ttl_seconds", 300))
         self.retry_cooldown = int(config.get("retry_cooldown_seconds", 120))
         self.request_timeout = int(config.get("request_timeout_seconds", 30))
@@ -160,6 +165,10 @@ class AIAnalyzer:
         question: str,
         snapshot_data: dict | None,
         available_symbols: list[str] | None = None,
+        *,
+        history: list[dict] | None = None,
+        timeframe_data: dict | None = None,
+        confluence_data: dict | None = None,
     ) -> str | None:
         if not self.enabled:
             with self._lock:
@@ -177,6 +186,9 @@ class AIAnalyzer:
             question,
             snapshot_data,
             available_symbols or [],
+            history or [],
+            timeframe_data,
+            confluence_data,
         )
 
     def _call_api(
@@ -188,7 +200,12 @@ class AIAnalyzer:
     ) -> str | None:
         try:
             prompt = self._build_prompt(data, timeframe_data, period, confluence_data)
-            return self._call_prompt(prompt)
+            return self._call_prompt(
+                prompt,
+                system_prompt=self._system_prompt(),
+                temperature=self.analysis_temperature,
+                max_tokens=self.max_tokens,
+            )
         except Exception as exc:
             with self._lock:
                 self._last_error = str(exc)
@@ -200,20 +217,42 @@ class AIAnalyzer:
         question: str,
         snapshot_data: dict | None,
         available_symbols: list[str],
+        history: list[dict] | None = None,
+        timeframe_data: dict | None = None,
+        confluence_data: dict | None = None,
     ) -> str | None:
         try:
-            prompt = self._build_question_prompt(question, snapshot_data, available_symbols)
-            return self._call_prompt(prompt)
+            prompt = self._build_question_prompt(
+                question,
+                snapshot_data,
+                available_symbols,
+                history=history,
+                timeframe_data=timeframe_data,
+                confluence_data=confluence_data,
+            )
+            return self._call_prompt(
+                prompt,
+                system_prompt=self._question_system_prompt(),
+                temperature=self.question_temperature,
+                max_tokens=self.question_max_tokens,
+            )
         except Exception as exc:
             with self._lock:
                 self._last_error = str(exc)
             logging.warning("AI question failed: %s", exc)
             return None
 
-    def _call_prompt(self, prompt: str) -> str | None:
+    def _call_prompt(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> str | None:
         if self.provider == "anthropic":
-            return self._call_anthropic(prompt)
-        return self._call_openai(prompt)
+            return self._call_anthropic(prompt, system_prompt, temperature, max_tokens)
+        return self._call_openai(prompt, system_prompt, temperature, max_tokens)
 
     @staticmethod
     def _provider_defaults() -> dict[str, str]:
@@ -428,18 +467,102 @@ class AIAnalyzer:
             "每条控制在一句话，不要重复罗列原始数据。"
         )
 
+    @staticmethod
+    def _question_intent_hint(question: str) -> str:
+        text = str(question or "").lower()
+        intent_rules = [
+            (
+                ("开空", "做空", "追空", "进空", "short", "急跌", "会跌", "下跌", "砸", "瀑布", "跳水"),
+                "下行风险/做空可行性",
+            ),
+            (("追", "开多", "做多", "能进", "进多", "追涨", "long", "buy"), "追涨/做多可行性"),
+            (("支撑", "压力", "关键位", "价位", "止损", "失效", "破位"), "关键价位/失效边界"),
+            (("风险", "危险", "套", "爆仓", "强平", "插针"), "风险排查"),
+            (("为什么", "原因", "触发", "异动"), "异动原因解释"),
+            (("怎么看", "怎么样", "如何", "现在", "当前"), "当前状态概览"),
+        ]
+        for keywords, label in intent_rules:
+            if any(keyword in text for keyword in keywords):
+                return label
+        return "综合判断"
+
+    @staticmethod
+    def _history_section(history: list[dict] | None) -> str:
+        entries = [
+            item
+            for item in (history or [])
+            if isinstance(item, dict) and str(item.get("question") or "").strip()
+        ]
+        if not entries:
+            return ""
+        lines = ["最近对话（按时间先后，用于衔接追问；结论仍以最新数据为准）："]
+        for item in entries[-3:]:
+            question = re.sub(r"\s+", " ", str(item.get("question") or "")).strip()
+            answer = re.sub(r"\s+", " ", str(item.get("answer") or "")).strip()
+            if len(question) > 120:
+                question = f"{question[:119].rstrip()}..."
+            if len(answer) > 240:
+                answer = f"{answer[:239].rstrip()}..."
+            symbol = str(item.get("symbol") or "").strip().upper()
+            marker = f"[{symbol}] " if symbol else ""
+            lines.append(f"- 用户{marker}问：{question}")
+            if answer:
+                lines.append(f"  你答：{answer}")
+        return "\n".join(lines) + "\n\n"
+
+    @staticmethod
+    def _question_structure_section(timeframe_data: dict | None) -> str:
+        if not timeframe_data:
+            return ""
+        period_label = timeframe_data.get("period_label") or timeframe_data.get("period") or "所选周期"
+        candle_state = "已收线" if timeframe_data.get("candle_confirmed") else "进行中"
+        return (
+            f"\n用户关注的 {period_label} 周期结构数据（长周期问题以此为准）：\n"
+            f"- K线状态: {candle_state}\n"
+            f"- 周期开/高/低/收: {timeframe_data.get('open_price')} / {timeframe_data.get('high_price')} / "
+            f"{timeframe_data.get('low_price')} / {timeframe_data.get('price')}\n"
+            f"- 周期涨跌: {float(timeframe_data.get('price_move_pct', 0) or 0):+.3f}% | "
+            f"量能倍数: {float(timeframe_data.get('volume_multiplier', 0) or 0):.2f}x\n"
+            f"- 结构支撑: {timeframe_data.get('support_price')} "
+            f"(强度={float(timeframe_data.get('support_strength') or 0):.2f}, "
+            f"触碰={int(timeframe_data.get('support_touch_count') or 0)}, "
+            f"状态={timeframe_data.get('support_status') or 'unknown'})\n"
+            f"- 结构压力: {timeframe_data.get('resistance_price')} "
+            f"(强度={float(timeframe_data.get('resistance_strength') or 0):.2f}, "
+            f"触碰={int(timeframe_data.get('resistance_touch_count') or 0)}, "
+            f"状态={timeframe_data.get('resistance_status') or 'unknown'})\n"
+            f"- 结构状态: {timeframe_data.get('structure_regime') or 'unknown'} | "
+            f"区间位置: {float(timeframe_data.get('range_position_pct', 0) or 0):.1f}%\n"
+            f"- 成交密集POC: {timeframe_data.get('profile_poc_price')} | "
+            f"价值区间: {timeframe_data.get('value_area_low')} ~ {timeframe_data.get('value_area_high')}\n"
+            f"- 周期VWAP: {timeframe_data.get('window_vwap')} "
+            f"(偏离 {float(timeframe_data.get('vwap_deviation_pct', 0) or 0):+.3f}%)\n"
+            f"- 距支撑/距压力: {float(timeframe_data.get('support_distance_pct', 0) or 0):.3f}% / "
+            f"{float(timeframe_data.get('resistance_distance_pct', 0) or 0):.3f}%\n"
+            f"- 周期强平: 多头 {float(timeframe_data.get('period_long_liquidation_quote', 0) or 0):,.0f} / "
+            f"空头 {float(timeframe_data.get('period_short_liquidation_quote', 0) or 0):,.0f} USDT\n"
+        )
+
     def _build_question_prompt(
         self,
         question: str,
         data: dict | None,
         available_symbols: list[str],
+        history: list[dict] | None = None,
+        timeframe_data: dict | None = None,
+        confluence_data: dict | None = None,
     ) -> str:
+        intent_hint = self._question_intent_hint(question)
+        history_section = self._history_section(history)
         if not data:
             symbols_text = ", ".join(available_symbols[:30]) or "暂无"
             return (
                 f"用户通过 Telegram Bot 提问：{question}\n\n"
+                f"用户意图初判（关键词粗判，仅供参考，以用户原话为准）：{intent_hint}\n"
+                f"{history_section}"
                 f"当前可查询合约：{symbols_text}\n"
-                "请用中文简洁回复，提醒用户需要带上明确合约，例如 BTC、ETH、SOL。"
+                "请用中文自然简洁地回复，提醒用户带上明确合约，例如 BTC、ETH、SOL。"
+                "如果用户已经写了合约但不在可查询列表里，请说明当前没有该合约数据。"
             )
 
         liquidation_status = {
@@ -447,13 +570,35 @@ class AIAnalyzer:
             "no_recent_event": "强平数据已接入，近1分钟未捕获强平订单",
             "unavailable": "强平数据不可用",
         }.get(str(data.get("liquidation_data_status") or "unavailable"), "未知")
+        reasons_text = "; ".join(data.get("reasons", [])) or "暂无"
+        suggestions_text = "; ".join(data.get("suggestions", [])) or "暂无"
+        has_structure_context = bool(timeframe_data or confluence_data)
+        if has_structure_context:
+            scope_text = (
+                "当前可用数据范围：实时快照、近1m/5m波动、盘口/强平状态、历史后效统计，"
+                "以及下方给出的周期结构和多周期共振数据；未提供的周期不要凭空下结论。\n\n"
+            )
+            structure_sections = (
+                f"{self._question_structure_section(timeframe_data)}"
+                f"{self._confluence_section(confluence_data)}"
+            )
+        else:
+            scope_text = (
+                "当前可用数据范围：实时快照、近1m/5m波动、盘口/强平状态和历史后效统计；"
+                "没有更长周期K线细节时，请明确说明不能凭空确认长周期结构。\n\n"
+            )
+            structure_sections = ""
         return (
             f"用户通过 Telegram Bot 针对 {data.get('symbol')} 提问：{question}\n\n"
+            f"用户意图初判（关键词粗判，仅供参考，以用户原话为准）：{intent_hint}\n"
+            f"{history_section}"
+            f"{scope_text}"
             "以下是该 USDT 永续合约的当前监控快照：\n"
             f"- 当前价格: {data.get('price')}\n"
             f"- 异常分: {data.get('score', 0)}/100\n"
             f"- 风险等级: {data.get('risk_level', '低风险')}\n"
             f"- 当前倾向: {data.get('bias', '')}\n"
+            f"- 置信度: {float(data.get('confidence', 0)):.1f}/100\n"
             f"- 1分钟波动: {float(data.get('price_move_pct_1m', 0)):+.3f}%\n"
             f"- 5分钟波动: {float(data.get('price_move_pct_5m', 0)):+.3f}%\n"
             f"- 1分钟成交额: {float(data.get('quote_volume_1m', 0)):,.0f} USDT\n"
@@ -467,16 +612,30 @@ class AIAnalyzer:
             f"- 多头爆仓1m: {float(data.get('long_liquidation_quote_1m', 0)):,.0f} USDT\n"
             f"- 空头爆仓1m: {float(data.get('short_liquidation_quote_1m', 0)):,.0f} USDT\n"
             f"- 点差: {float(data.get('spread_bps', 0)):.2f} bps\n"
+            f"- 盘口失衡: {float(data.get('depth_imbalance', 0)):+.3f}\n"
             f"- 盘口深度下降: {float(data.get('depth_drop_pct_1m', 0)):.1f}%\n"
             f"- 区间支撑 / 压力: {data.get('support_price')} / {data.get('resistance_price')}\n"
+            f"- 距支撑 / 距压力: {float(data.get('support_distance_pct', 0)):.3f}% / {float(data.get('resistance_distance_pct', 0)):.3f}%\n"
             f"- 区间VWAP: {data.get('window_vwap')}\n"
+            f"- 偏离VWAP: {float(data.get('vwap_deviation_pct', 0)):+.3f}%\n"
+            f"- 区间位置: {float(data.get('range_position_pct', 50)):.1f}%\n"
             f"- 买盘墙 / 卖盘墙: {data.get('bid_wall_price')} / {data.get('ask_wall_price')}\n"
-            f"- 触发原因: {'; '.join(data.get('reasons', [])) or '暂无'}\n\n"
-            f"{self._stats_section(data)}\n"
-            "请直接回答用户问题，控制在 4 条以内。"
-            "采用条件式回答：当前主假设、确认条件、失效条件、反向风险。"
-            "尽量指出支撑/压力或关键价位，不要只说泛泛观察。"
-            "不要承诺收益，不要给绝对买卖指令；如果数据不足，要明确说数据不足。"
+            f"- 买盘墙金额 / 卖盘墙金额: {float(data.get('bid_wall_notional', 0)):,.0f} / {float(data.get('ask_wall_notional', 0)):,.0f} USDT\n"
+            f"- 触发原因: {reasons_text}\n"
+            f"- 系统观察建议: {suggestions_text}\n"
+            f"{self._stats_section(data)}"
+            f"{structure_sections}\n"
+            "回复方式：\n"
+            "- 先用一句话直接回应用户真正问的点，语气可以自然，但结论必须有条件。\n"
+            "- 接着只展开与问题相关的证据，2-5 个短段或要点即可；标题可以自由命名，不要固定套用主假设/确认条件/失效条件/反向风险。\n"
+            "- 至少引用两个关键数据，例如价格、异常分、1m/5m波动、成交额、量能倍数、OI、VWAP、支撑压力、爆仓或盘口。\n"
+            "- 如果用户问能不能追、做多或做空，要给出参与前确认、失效位置或撤退条件，但不能给绝对买卖指令。\n"
+            "- 如果用户问会不会急跌、反弹或风险点，优先围绕触发条件、支撑/压力、OI、主动成交、爆仓和盘口深度回答。\n"
+            "- 如果提供了周期结构或多周期共振数据，长周期判断以这些数据为准，并优先引用结构支撑/压力。\n"
+            "- 如果提供了最近对话且这是追问，请自然衔接你上一轮的结论；观点变化时点明是哪个数据变了，不要整段重复旧回答。\n"
+            "- 如果后效样本可信度为 low、样本不足或关键数据不可用，要降低结论强度；爆仓数据不可用时，不能把0爆仓解读为没有强平压力。\n"
+            "- 用 Telegram 纯文本回复：不要使用 Markdown 标记（如 **、#、表格、代码块），列表用短横线即可。\n"
+            "- 避免机械复读字段，像专业交易风控助理在 Telegram 里对话一样回答。"
         )
 
     def _system_prompt(self) -> str:
@@ -486,15 +645,30 @@ class AIAnalyzer:
             "以及多空博弈下的风险评估。你的分析简洁专业，直击要害。"
         )
 
-    def _call_openai(self, prompt: str) -> str | None:
+    def _question_system_prompt(self) -> str:
+        return (
+            "你是一名加密货币合约交易风控分析师，正在 Telegram 中和用户多轮对话。"
+            "你会先听懂用户问的是追多、做空、急跌风险、关键价位还是异动原因，"
+            "再用给定行情数据作答；遇到追问时衔接自己上一轮的结论，观点变了要说明是哪个数据变了。"
+            "表达要自然、有判断、有边界，只输出 Telegram 纯文本，"
+            "不能编造未提供的数据，也不能给绝对收益承诺或无条件买卖指令。"
+        )
+
+    def _call_openai(
+        self,
+        prompt: str,
+        system_prompt: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> str | None:
         payload = json.dumps({
             "model": self.model,
             "messages": [
-                {"role": "system", "content": self._system_prompt()},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
-            "max_tokens": self.max_tokens,
-            "temperature": 0.3,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
         }).encode("utf-8")
         req = Request(
             self._openai_endpoint(),
@@ -553,11 +727,18 @@ class AIAnalyzer:
             seen.add(part)
         return "\n".join(deduped)
 
-    def _call_anthropic(self, prompt: str) -> str | None:
+    def _call_anthropic(
+        self,
+        prompt: str,
+        system_prompt: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> str | None:
         payload = json.dumps({
             "model": self.model,
-            "max_tokens": self.max_tokens,
-            "system": self._system_prompt(),
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "system": system_prompt,
             "messages": [{"role": "user", "content": prompt}],
         }).encode("utf-8")
         base = self.base_url.rstrip("/") if self.base_url else "https://api.anthropic.com"
