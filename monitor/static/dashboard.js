@@ -1358,7 +1358,7 @@
         const bullet = line.match(/^[-•·]\s+(.+)$/);
         if (bullet) {
           const bulletTitled = bullet[1].match(/^([^:：]{2,16})[:：]\s*(.+)$/);
-          if (bulletTitled && !current) {
+          if (bulletTitled) {
             startSection(bulletTitled[1], bulletTitled[2]);
             return;
           }
