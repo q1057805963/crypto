@@ -725,6 +725,11 @@ class AIAnalyzer:
             text = self._extract_text(data)
             if not text:
                 raise ValueError(f"missing text in AI response keys: {sorted(data.keys())}")
+            if self._is_truncated(data):
+                logging.warning(
+                    "AI response truncated at max_tokens=%d (model=%s)", max_tokens, self.model
+                )
+                text = f"{text.rstrip()}\n（内容已达模型输出上限被截断）"
             return text
 
     @staticmethod
@@ -769,6 +774,28 @@ class AIAnalyzer:
             seen.add(part)
         return "\n".join(deduped)
 
+    @staticmethod
+    def _is_truncated(data: dict) -> bool:
+        reasons: set[str] = set()
+
+        def collect(value) -> None:
+            if isinstance(value, list):
+                for item in value:
+                    collect(item)
+                return
+            if not isinstance(value, dict):
+                return
+            for key in ("stop_reason", "finish_reason"):
+                reason = value.get(key)
+                if isinstance(reason, str):
+                    reasons.add(reason)
+            choices = value.get("choices")
+            if isinstance(choices, list):
+                collect(choices)
+
+        collect(data)
+        return bool(reasons & {"length", "max_tokens"})
+
     def _call_anthropic(
         self,
         prompt: str,
@@ -801,4 +828,9 @@ class AIAnalyzer:
             text = self._extract_text(data)
             if not text:
                 raise ValueError(f"missing text in AI response keys: {sorted(data.keys())}")
+            if self._is_truncated(data):
+                logging.warning(
+                    "AI response truncated at max_tokens=%d (model=%s)", max_tokens, self.model
+                )
+                text = f"{text.rstrip()}\n（内容已达模型输出上限被截断）"
             return text
