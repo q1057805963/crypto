@@ -1316,47 +1316,69 @@
     }
 
     function aiSections(text) {
-      const lines = String(text || "").split("\n").map((line) => line.trim()).filter(Boolean);
-      if (!lines.length) return [];
+      const rawLines = String(text || "").split("\n");
       const sections = [];
       let current = null;
 
       function flushCurrent() {
         if (!current) return;
-        const body = current.bodyLines.join(" ").trim();
-        sections.push({ title: current.title, body: body || "等待补充内容" });
+        const body = current.bodyLines.join("\n").trim();
+        if (body || current.title) {
+          const fallback = sections.length ? "补充" : "AI 摘要";
+          sections.push({ title: current.title || fallback, body: body || "等待补充内容" });
+        }
         current = null;
       }
 
-      lines.forEach((line) => {
-        const markdownHeading = line.match(/^(?:\d+[\.、]\s*)?\*\*(.+?)\*\*[:：]?\s*(.*)$/);
-        if (markdownHeading) {
-          flushCurrent();
-          current = { title: markdownHeading[1], bodyLines: [] };
-          if (markdownHeading[2]) current.bodyLines.push(markdownHeading[2]);
+      function startSection(title, firstBody) {
+        flushCurrent();
+        current = { title: (title || "").trim(), bodyLines: [] };
+        if (firstBody && firstBody.trim()) current.bodyLines.push(firstBody.trim());
+      }
+
+      function appendBody(line) {
+        if (!current) current = { title: sections.length ? "" : "AI 摘要", bodyLines: [] };
+        current.bodyLines.push(line);
+      }
+
+      rawLines.forEach((rawLine) => {
+        let line = rawLine.trim();
+        if (!line) return;
+        if (/^(`{3,}.*|-{3,}|\*{3,}|={3,}|_{3,})$/.test(line)) return;
+
+        const mdHeading = line.match(/^#{1,6}\s*(.+)$/);
+        if (mdHeading) {
+          const title = mdHeading[1].replace(/\*\*/g, "").replace(/^\d+[\.、]\s*/, "").trim();
+          startSection(title);
+          return;
+        }
+
+        line = line.replace(/\*\*/g, "");
+
+        const bullet = line.match(/^[-•·]\s+(.+)$/);
+        if (bullet) {
+          const bulletTitled = bullet[1].match(/^([^:：]{2,16})[:：]\s*(.+)$/);
+          if (bulletTitled && !current) {
+            startSection(bulletTitled[1], bulletTitled[2]);
+            return;
+          }
+          appendBody(`- ${bullet[1]}`);
           return;
         }
 
         const titledLine = line.match(/^(?:\d+[\.、]\s*)?([^:：]{2,20})[:：]\s*(.+)$/);
         if (titledLine) {
-          flushCurrent();
-          sections.push({ title: titledLine[1], body: titledLine[2] });
+          startSection(titledLine[1], titledLine[2]);
           return;
         }
 
         const numberedLine = line.match(/^(\d+)[\.、]\s*(.+)$/);
         if (numberedLine) {
-          flushCurrent();
-          sections.push({ title: `要点 ${numberedLine[1]}`, body: numberedLine[2] });
+          startSection(`要点 ${numberedLine[1]}`, numberedLine[2]);
           return;
         }
 
-        if (current) {
-          current.bodyLines.push(line);
-          return;
-        }
-
-        sections.push({ title: sections.length ? `补充 ${sections.length + 1}` : "AI 摘要", body: line });
+        appendBody(line);
       });
 
       flushCurrent();
@@ -1446,7 +1468,7 @@
         ? `<div class="ai-grid">${sections.map((item) => `
             <div class="ai-card">
               <div class="ai-card-title">${esc(item.title)}</div>
-              <div class="ai-card-copy">${esc(item.body)}</div>
+              <div class="ai-card-copy">${esc(item.body).replace(/\n/g, "<br>")}</div>
             </div>
           `).join("")}</div>`
         : `<div class="detail-placeholder">AI 返回了空内容，请稍后重试。</div>`;
