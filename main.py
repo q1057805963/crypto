@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import logging
 import os
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
@@ -51,6 +52,20 @@ def _env_flag(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def prevent_system_sleep() -> None:
+    """运行期间阻止 Windows 自动休眠（屏幕仍可熄灭），进程退出后自动恢复。"""
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    es_continuous = 0x80000000
+    es_system_required = 0x00000001
+    if ctypes.windll.kernel32.SetThreadExecutionState(es_continuous | es_system_required):
+        logging.info("System auto-sleep disabled while monitor is running")
+    else:
+        logging.warning("SetThreadExecutionState failed; system may sleep during monitoring")
 
 
 def _migrate_telegram_config(telegram: dict) -> dict:
@@ -235,6 +250,7 @@ async def run(config: dict) -> None:
     asyncio.get_running_loop().set_default_executor(
         ThreadPoolExecutor(max_workers=16, thread_name_prefix="cfm-io")
     )
+    prevent_system_sleep()
 
     users_config = config.get("users", {})
     user_store = None
