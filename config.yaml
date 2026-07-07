@@ -88,7 +88,7 @@ ai:
   cache_ttl_seconds: 300
   retry_cooldown_seconds: 120
   request_timeout_seconds: 30
-  max_tokens: 1000
+  max_tokens: 3000
   auto_analyze_enabled: false
 dashboard:
   enabled: true

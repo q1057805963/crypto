@@ -1330,9 +1330,9 @@
         current = null;
       }
 
-      function startSection(title, firstBody) {
+      function startSection(title, firstBody, fromNumbered = false) {
         flushCurrent();
-        current = { title: (title || "").trim(), bodyLines: [] };
+        current = { title: (title || "").trim(), bodyLines: [], fromNumbered };
         if (firstBody && firstBody.trim()) current.bodyLines.push(firstBody.trim());
       }
 
@@ -1358,7 +1358,7 @@
         const bullet = line.match(/^[-•·]\s+(.+)$/);
         if (bullet) {
           const bulletTitled = bullet[1].match(/^([^:：]{2,16})[:：]\s*(.+)$/);
-          if (bulletTitled) {
+          if (bulletTitled && !(current && current.fromNumbered)) {
             startSection(bulletTitled[1], bulletTitled[2]);
             return;
           }
@@ -1368,13 +1368,18 @@
 
         const titledLine = line.match(/^(?:\d+[\.、]\s*)?([^:：]{2,20})[:：]\s*(.+)$/);
         if (titledLine) {
-          startSection(titledLine[1], titledLine[2]);
+          const numberedTitle = /^\d+[\.、]/.test(line);
+          if (!numberedTitle && current && current.fromNumbered) {
+            appendBody(line);
+            return;
+          }
+          startSection(titledLine[1], titledLine[2], numberedTitle);
           return;
         }
 
         const numberedLine = line.match(/^(\d+)[\.、]\s*(.+)$/);
         if (numberedLine) {
-          startSection(`要点 ${numberedLine[1]}`, numberedLine[2]);
+          startSection(`要点 ${numberedLine[1]}`, numberedLine[2], true);
           return;
         }
 
@@ -1394,7 +1399,7 @@
       return [
         header,
         "",
-        ...sections.map((item, index) => `${index + 1}. ${item.title}\n${item.body}`)
+        ...sections.map((item) => `${item.title}\n${item.body}`)
       ].join("\n\n");
     }
 
