@@ -61,7 +61,7 @@ class AIAnalyzer:
         self.base_url = str(config.get("base_url", "")).rstrip("/")
         self.activation_threshold = float(config.get("activation_threshold", 60))
         self.triggers = self._normalize_triggers(config)
-        self.max_tokens = int(config.get("max_tokens", 500))
+        self.max_tokens = int(config.get("max_tokens", 1000))
         self.question_max_tokens = int(
             config.get("question_max_tokens", max(self.max_tokens, 700))
         )
@@ -504,6 +504,7 @@ class AIAnalyzer:
             f"{period_focus}"
             "如果样本可信度为 low 或样本不足，必须明确降低结论强度。"
             "如果爆仓数据状态不可用，不要把爆仓金额为0解读为没有强平压力。"
+            "全文控制在 600 字以内，宁可少写一条也必须把失效边界和观察信号写完整，"
             "语言自然、有判断、有取舍，别像机器人逐条填表。"
         )
 
