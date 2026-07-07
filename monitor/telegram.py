@@ -242,7 +242,6 @@ class TelegramAlert:
     @staticmethod
     def _format_snapshot(snapshot: dict, user: dict | None = None) -> str:
         reasons = "\n".join(f"- {reason}" for reason in snapshot.get("reasons", [])) or "- 暂无"
-        suggestions = "\n".join(f"- {item}" for item in snapshot.get("suggestions", [])) or "- 继续观察"
         trigger_context = TelegramAlert._trigger_context(snapshot, user)
         ai_summary = [
             str(item).strip()
@@ -250,11 +249,15 @@ class TelegramAlert:
             if str(item).strip()
         ]
         ai_analysis = str(snapshot.get("ai_analysis", "") or "").strip()
-        ai_block = ""
-        if ai_summary:
-            ai_block = "\n\nAI分析:\n" + "\n".join(f"- {item}" for item in ai_summary)
-        elif ai_analysis:
-            ai_block = f"\n\nAI分析:\n- {ai_analysis}"
+        ai_items = ai_summary or ([ai_analysis] if ai_analysis else [])
+        if ai_items:
+            suggestion_title = "观察建议(AI):"
+            suggestions = "\n".join(f"- {item.lstrip('- ').strip()}" for item in ai_items)
+        else:
+            suggestion_title = "观察建议:"
+            suggestions = "\n".join(
+                f"- {item}" for item in snapshot.get("suggestions", [])
+            ) or "- 继续观察"
         support = float(snapshot.get("support_price", 0) or 0)
         resistance = float(snapshot.get("resistance_price", 0) or 0)
         bid_wall_price = float(snapshot.get("bid_wall_price", 0) or 0)
@@ -274,7 +277,7 @@ class TelegramAlert:
             f"买盘墙: {bid_wall_text} | 卖盘墙: {ask_wall_text}\n"
             f"多头爆仓1m: {float(snapshot.get('long_liquidation_quote_1m', 0) or 0):,.0f} | 空头爆仓1m: {float(snapshot.get('short_liquidation_quote_1m', 0) or 0):,.0f}\n"
             f"点差: {float(snapshot.get('spread_bps', 0) or 0):.2f} bps | 深度下降: {float(snapshot.get('depth_drop_pct_1m', 0) or 0):.1f}%\n"
-            f"\n推送条件:\n{trigger_context}\n\n触发原因:\n{reasons}\n\n观察建议:\n{suggestions}{ai_block}"
+            f"\n推送条件:\n{trigger_context}\n\n触发原因:\n{reasons}\n\n{suggestion_title}\n{suggestions}"
         )
 
     @staticmethod

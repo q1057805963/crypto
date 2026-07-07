@@ -335,6 +335,40 @@ class AIAnalyzer:
             + "\n"
         )
 
+    def _build_alert_prompt(self, data: dict) -> str:
+        liquidation_status = {
+            "recent_event": "近1分钟有强平事件",
+            "no_recent_event": "数据流活跃，近1分钟无强平事件",
+            "unavailable": "强平/盘口微观结构流未接入或暂不可用",
+        }.get(str(data.get("liquidation_data_status") or "unavailable"), "未知")
+        return (
+            f"{data['symbol']} USDT永续合约刚触发异动告警，即将推送到 Telegram。数据如下：\n"
+            f"- 异常分: {data.get('score', 0)}/100 | 风险等级: {data.get('risk_level', '低风险')} | 倾向: {data.get('bias', '')}\n"
+            f"- 价格: {data.get('price')}\n"
+            f"- 1分钟波动: {float(data.get('price_move_pct_1m', 0)):+.3f}% | 5分钟波动: {float(data.get('price_move_pct_5m', 0)):+.3f}%\n"
+            f"- 1分钟成交额: {float(data.get('quote_volume_1m', 0)):,.0f} USDT | 量能倍数: {float(data.get('volume_multiplier', 0)):.2f}x\n"
+            f"- 主动买入占比: {float(data.get('taker_buy_ratio_1m', 0.5)):.1%}\n"
+            f"- OI 5分钟变化: {float(data.get('oi_change_pct_5m', 0)):+.3f}% | 资金费率: {float(data.get('funding_rate', 0)):.4%}\n"
+            f"- 爆仓数据状态: {liquidation_status}\n"
+            f"- 多头爆仓1m: {float(data.get('long_liquidation_quote_1m', 0)):,.0f} | 空头爆仓1m: {float(data.get('short_liquidation_quote_1m', 0)):,.0f}\n"
+            f"- 盘口点差: {float(data.get('spread_bps', 0)):.2f} bps | 深度下降: {float(data.get('depth_drop_pct_1m', 0)):.1f}% | 盘口失衡: {float(data.get('depth_imbalance', 0)):+.3f}\n"
+            f"- 区间支撑/压力: {data.get('support_price')} / {data.get('resistance_price')}\n"
+            f"- 区间VWAP: {data.get('window_vwap')} (偏离 {float(data.get('vwap_deviation_pct', 0)):+.3f}%)\n"
+            f"- 买盘墙: {data.get('bid_wall_price')} ({float(data.get('bid_wall_notional', 0)):,.0f}) | "
+            f"卖盘墙: {data.get('ask_wall_price')} ({float(data.get('ask_wall_notional', 0)):,.0f})\n"
+            f"- 触发原因: {'; '.join(data.get('reasons', []))}\n"
+            f"{self._stats_section(data)}"
+            "请为这条告警生成『观察建议』，要求：\n"
+            "- 输出 3-5 行，每行一条独立建议，短横线开头，Telegram 纯文本，不用 Markdown。\n"
+            "- 第一条先定性：这次异动更像什么（如多头踩踏、主动出货、逼空、假突破、试盘），以及接下来更可能的路径。\n"
+            "- 建议必须绑定本次数据里的具体数字：至少引用支撑/压力/盘口墙/VWAP 中的一个具体价位，"
+            "并结合量能、主动成交、OI 或爆仓中的至少两项来支撑判断，不要写放之四海而皆准的套话。\n"
+            "- 必须有一条给出明确的失效/反转确认条件（具体价位或行为）。\n"
+            "- 结论强度受后效统计约束，样本不足或可信度 low 时要明说；"
+            "爆仓数据不可用时，不要把爆仓金额 0 解读为没有强平压力。\n"
+            "- 每行控制在 60 字以内，不给绝对买卖指令。"
+        )
+
     def _build_prompt(
         self,
         data: dict,
@@ -342,6 +376,8 @@ class AIAnalyzer:
         period: str | None = None,
         confluence_data: dict | None = None,
     ) -> str:
+        if period == "alert" and not timeframe_data:
+            return self._build_alert_prompt(data)
         liquidation_status = {
             "recent_event": "近1分钟有强平事件",
             "no_recent_event": "数据流活跃，近1分钟无强平事件",
@@ -455,16 +491,20 @@ class AIAnalyzer:
             f"{timeframe_section}\n"
             f"{stats_section}"
             f"{confluence_section}"
-            "请用中文输出固定 5 条，严格使用以下标题：\n"
-            "1. 主假设：说明当前更像延续、反抽、突破确认、假突破还是分歧等待，必须结合后效统计和多周期共振。\n"
-            "2. 延续条件：写清楚哪些价格/结构/VWAP/量能/OI 条件出现后，原方向才算增强。\n"
-            "3. 失效条件：写清楚哪个价位或哪类行为出现后，当前判断应放弃。\n"
-            "4. 反向风险：指出最可能让行情反走的因素，尤其是低样本、周期冲突、爆仓不可用或盘口变薄。\n"
-            "5. 观察计划：给出接下来 5m/15m/1h 应观察什么，不给绝对开仓指令。\n"
+            "请像一线合约交易台的风控分析师在给同事讲盘一样输出，Telegram/网页纯文本，不用 Markdown 标记：\n"
+            "- 第一行用一句话给出核心判断：这波更像什么（延续、反抽、突破确认、假突破、踩踏、分歧等待等），"
+            "方向倾向和把握程度，必须结合后效统计和多周期共振来定调。\n"
+            "- 随后写 3-5 条要点，围绕这组数据里最突出的驱动或矛盾来组织，小标题自拟，"
+            "不要固定套用主假设/延续条件/失效条件/反向风险/观察计划这类模板标题，也不要每次都同一套结构。\n"
+            "- 判断必须落到具体数字上：结构支撑/压力、VWAP、盘口墙、量能、OI、爆仓中至少引用三个，"
+            "用来支撑推理，而不是机械复读字段。\n"
+            "- 必须写清失效边界：哪个具体价位被破坏或哪类行为出现后，当前判断作废、应当认错。\n"
+            "- 结尾说清接下来最该盯的 1-2 个信号（如二次放量、回踩是否缩量、OI 是否跟随、关键位争夺），"
+            "不给绝对开仓指令。\n"
             f"{period_focus}"
             "如果样本可信度为 low 或样本不足，必须明确降低结论强度。"
             "如果爆仓数据状态不可用，不要把爆仓金额为0解读为没有强平压力。"
-            "每条控制在一句话，不要重复罗列原始数据。"
+            "语言自然、有判断、有取舍，别像机器人逐条填表。"
         )
 
     @staticmethod
@@ -642,7 +682,8 @@ class AIAnalyzer:
         return (
             "你是一名加密货币合约交易风险分析专家，精通USDT永续合约、"
             "杠杆交易策略、资金费率套利、持仓量分析、盘口微观结构解读、"
-            "以及多空博弈下的风险评估。你的分析简洁专业，直击要害。"
+            "以及多空博弈下的风险评估。你的分析像资深交易员讲盘：直击要害、"
+            "有明确观点和失效边界，从数据推出结论而不是罗列数据，绝不套模板凑字数。"
         )
 
     def _question_system_prompt(self) -> str:

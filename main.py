@@ -292,7 +292,9 @@ async def run(config: dict) -> None:
     def enrich_snapshot_with_ai(snapshot_data: dict, analysis: str | None) -> dict:
         payload = clone_payload(snapshot_data) or {}
         payload["ai_analysis"] = analysis or ""
-        payload["ai_summary"] = summarize_analysis(analysis) if analysis else []
+        payload["ai_summary"] = (
+            summarize_analysis(analysis, max_items=6, max_chars=160) if analysis else []
+        )
         return payload
 
     def enrich_event_with_ai(event: AnomalyEvent, analysis: str | None) -> AnomalyEvent:

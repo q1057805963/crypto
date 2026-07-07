@@ -149,9 +149,48 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertIn("不要把旧的单根最高最低当作主支撑压力", prompt)
         self.assertIn("同组合后效", prompt)
         self.assertIn("多周期偏多共振", prompt)
-        self.assertIn("主假设", prompt)
-        self.assertIn("延续条件", prompt)
-        self.assertIn("失效条件", prompt)
+        self.assertIn("核心判断", prompt)
+        self.assertIn("失效边界", prompt)
+        self.assertIn("不要固定套用主假设/延续条件/失效条件/反向风险/观察计划这类模板标题", prompt)
+
+    def test_build_prompt_uses_alert_style_for_alert_period(self) -> None:
+        analyzer = AIAnalyzer({})
+        snapshot = {
+            "symbol": "HYPEUSDT",
+            "score": 60,
+            "risk_level": "中风险",
+            "bias": "偏空：疑似多头踩踏",
+            "price": 70.031,
+            "price_move_pct_1m": -0.638,
+            "price_move_pct_5m": -1.057,
+            "quote_volume_1m": 1818320,
+            "volume_multiplier": 4.4,
+            "taker_buy_ratio_1m": 0.12,
+            "oi_change_pct_5m": -1.061,
+            "funding_rate": 0.000087,
+            "liquidation_data_status": "recent_event",
+            "long_liquidation_quote_1m": 21912,
+            "short_liquidation_quote_1m": 0,
+            "spread_bps": 0.14,
+            "depth_drop_pct_1m": 0.0,
+            "support_price": 70.03,
+            "resistance_price": 70.789,
+            "window_vwap": 70.4,
+            "vwap_deviation_pct": -0.5,
+            "bid_wall_price": 70.167,
+            "bid_wall_notional": 500000,
+            "ask_wall_price": 70.18,
+            "ask_wall_notional": 600000,
+            "reasons": ["1分钟价格波动 -0.64%", "成交额放大 4.4x"],
+        }
+
+        prompt = analyzer._build_prompt(snapshot, period="alert")
+
+        self.assertIn("异动告警", prompt)
+        self.assertIn("观察建议", prompt)
+        self.assertIn("失效/反转确认条件", prompt)
+        self.assertIn("不要写放之四海而皆准的套话", prompt)
+        self.assertNotIn("用户当前更关心", prompt)
 
     def test_extract_text_supports_anthropic_style_content(self) -> None:
         payload = {
