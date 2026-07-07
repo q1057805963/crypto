@@ -1315,92 +1315,11 @@
       return `<div class="ai-status"><strong>${esc(meta.status)}</strong><span>${esc(timeText)}</span></div>`;
     }
 
-    function aiSections(text) {
-      const rawLines = String(text || "").split("\n");
-      const sections = [];
-      let current = null;
-
-      function flushCurrent() {
-        if (!current) return;
-        const body = current.bodyLines.join("\n").trim();
-        if (body || current.title) {
-          const fallback = sections.length ? "补充" : "AI 摘要";
-          sections.push({ title: current.title || fallback, body: body || "等待补充内容" });
-        }
-        current = null;
-      }
-
-      function startSection(title, firstBody, fromNumbered = false) {
-        flushCurrent();
-        current = { title: (title || "").trim(), bodyLines: [], fromNumbered };
-        if (firstBody && firstBody.trim()) current.bodyLines.push(firstBody.trim());
-      }
-
-      function appendBody(line) {
-        if (!current) current = { title: sections.length ? "" : "AI 摘要", bodyLines: [] };
-        current.bodyLines.push(line);
-      }
-
-      rawLines.forEach((rawLine) => {
-        let line = rawLine.trim();
-        if (!line) return;
-        if (/^(`{3,}.*|-{3,}|\*{3,}|={3,}|_{3,})$/.test(line)) return;
-
-        const mdHeading = line.match(/^#{1,6}\s*(.+)$/);
-        if (mdHeading) {
-          const title = mdHeading[1].replace(/\*\*/g, "").replace(/^\d+[\.、]\s*/, "").trim();
-          startSection(title);
-          return;
-        }
-
-        line = line.replace(/\*\*/g, "");
-
-        const bullet = line.match(/^[-•·]\s+(.+)$/);
-        if (bullet) {
-          const bulletTitled = bullet[1].match(/^([^:：]{2,16})[:：]\s*(.+)$/);
-          if (bulletTitled && !(current && current.fromNumbered)) {
-            startSection(bulletTitled[1], bulletTitled[2]);
-            return;
-          }
-          appendBody(`- ${bullet[1]}`);
-          return;
-        }
-
-        const titledLine = line.match(/^(?:\d+[\.、]\s*)?([^:：]{2,20})[:：]\s*(.+)$/);
-        if (titledLine) {
-          const numberedTitle = /^\d+[\.、]/.test(line);
-          if (!numberedTitle && current && current.fromNumbered) {
-            appendBody(line);
-            return;
-          }
-          startSection(titledLine[1], titledLine[2], numberedTitle);
-          return;
-        }
-
-        const numberedLine = line.match(/^(\d+)[\.、]\s*(.+)$/);
-        if (numberedLine) {
-          startSection(`要点 ${numberedLine[1]}`, numberedLine[2], true);
-          return;
-        }
-
-        appendBody(line);
-      });
-
-      flushCurrent();
-      return sections;
-    }
-
     function aiOpinionText(symbol, period = detailPeriod()) {
       const text = String(aiResults[aiAnalysisKey(symbol, period)] || "").trim();
       if (!text) return "";
-      const sections = aiSections(text);
-      if (!sections.length) return text;
       const header = `${String(symbol || "").toUpperCase()} ${detailPeriodLabel(period)} AI 观点`;
-      return [
-        header,
-        "",
-        ...sections.map((item) => `${item.title}\n${item.body}`)
-      ].join("\n\n");
+      return `${header}\n\n${text}`;
     }
 
     function hasAIAnalysis(symbol, period = detailPeriod()) {
@@ -1464,20 +1383,12 @@
       const period = detailPeriod();
       const periodLabel = detailPeriodLabel(period);
       const key = aiAnalysisKey(symbol, period);
-      const text = aiResults[key];
+      const text = String(aiResults[key] || "").trim();
       if (!text) {
         return `${aiStatusLine(symbol)}<div class="detail-placeholder">等待 AI 基于当前 ${esc(periodLabel)} 档位生成观察建议。</div>`;
       }
-      const sections = aiSections(text);
-      const cardsHtml = sections.length
-        ? `<div class="ai-grid">${sections.map((item) => `
-            <div class="ai-card">
-              <div class="ai-card-title">${esc(item.title)}</div>
-              <div class="ai-card-copy">${esc(item.body).replace(/\n/g, "<br>")}</div>
-            </div>
-          `).join("")}</div>`
-        : `<div class="detail-placeholder">AI 返回了空内容，请稍后重试。</div>`;
-      return aiStatusLine(symbol) + cardsHtml;
+      const opinionHtml = `<div class="ai-card ai-opinion"><div class="ai-card-copy">${esc(text).replace(/\n/g, "<br>")}</div></div>`;
+      return aiStatusLine(symbol) + opinionHtml;
     }
 
     function detailTabButton(tab, label) {
