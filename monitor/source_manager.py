@@ -195,9 +195,11 @@ class SourceFailoverManager:
         switch_cooldown_seconds: float,
         primary_retry_seconds: float = 300.0,
         on_switch: Callable[[str, str, str], None] | None = None,
+        instrument_directories=None,
     ) -> None:
         self.config = config
         self.specs = specs
+        self.instrument_directories = instrument_directories
         self._lock = threading.Lock()
         self.symbols = list(symbols)
         self.stale_after_seconds = max(float(stale_after_seconds), 5.0)
@@ -314,7 +316,20 @@ class SourceFailoverManager:
     async def _activate(self, index: int, note: str = "") -> None:
         await self._stop_active()
         self._active_index = index
-        self._active_context = build_source_context(self.config, self.get_symbols(), self.specs[index])
+        spec = self.specs[index]
+        symbols = self.get_symbols()
+        if self.instrument_directories:
+            allowed, skipped = self.instrument_directories.filter_for_exchange(
+                spec.exchange, symbols
+            )
+            if skipped:
+                logging.info(
+                    "%s 无以下合约，该数据源期间暂停订阅: %s",
+                    source_label(spec.exchange, spec.data_source),
+                    ", ".join(skipped),
+                )
+                symbols = allowed
+        self._active_context = build_source_context(self.config, symbols, spec)
         self._nonce += 1
         current_nonce = self._nonce
         self._last_trade_at = time.monotonic()

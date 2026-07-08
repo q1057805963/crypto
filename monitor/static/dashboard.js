@@ -2409,7 +2409,7 @@
         if (!response.ok || !data.ok) throw new Error(data.error || "保存失败");
         inputTouched = false;
         await refresh();
-        updatedEl.textContent = "监控列表已更新";
+        updatedEl.textContent = data.warning ? `监控列表已更新（${data.warning}）` : "监控列表已更新";
       } catch (error) {
         updatedEl.textContent = error.message || "保存失败";
       } finally {

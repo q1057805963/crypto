@@ -170,6 +170,7 @@ class DashboardServer:
         period_liquidation_provider=None,
         source_health_provider=None,
         alert_store=None,
+        instrument_directories=None,
     ) -> None:
         self.state = state
         self.host = host
@@ -186,6 +187,7 @@ class DashboardServer:
         self.period_liquidation_provider = period_liquidation_provider
         self.source_health_provider = source_health_provider
         self.alert_store = alert_store
+        self.instrument_directories = instrument_directories
         self._ai_analyzers: dict[str, AIAnalyzer] = {}
         self._event_loop = None
         self._server: ThreadingHTTPServer | None = None
@@ -465,12 +467,38 @@ class DashboardServer:
                     symbols = normalize_symbols(payload.get("symbols", []))
                     if not symbols:
                         raise ValueError("symbols cannot be empty")
+                    warning = ""
+                    if server_ref.instrument_directories:
+                        report = server_ref.instrument_directories.validate(
+                            symbols,
+                            str(server_ref.config.get("exchange", "binance")),
+                        )
+                        if report["missing"]:
+                            raise ValueError(
+                                "以下标的在币安/OKX 均无 USDT 永续合约，未保存: "
+                                + ", ".join(report["missing"])
+                                + "（请核对币种代码，如 BTC 或 BTCUSDT）"
+                            )
+                        notes = []
+                        if report["off_primary"]:
+                            notes.append(
+                                f"{', '.join(report['off_primary'])} 仅 {report['secondary_label']} 有合约，"
+                                f"{report['primary_label']}数据源期间无实时数据"
+                            )
+                        if report["unchecked"]:
+                            notes.append(
+                                "暂时无法连接交易所，未能校验: " + ", ".join(report["unchecked"])
+                            )
+                        warning = "；".join(notes)
                     if server_ref.user_config_store:
                         server_ref.user_config_store.update_symbols(self._user_id(), symbols)
                         server_ref._notify_user_config_change()
                     else:
                         on_symbols_change(symbols)
-                    self._send_json({"ok": True, "symbols": symbols})
+                    response = {"ok": True, "symbols": symbols}
+                    if warning:
+                        response["warning"] = warning
+                    self._send_json(response)
                 except Exception as exc:
                     self._send_json({"ok": False, "error": str(exc)}, status=400)
 

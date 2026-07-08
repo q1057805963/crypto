@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from typing import AsyncIterator
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
@@ -66,7 +67,7 @@ class BinanceFuturesTickerPoller:
 
     def _fetch_ticker(self, symbol: str) -> dict:
         request = Request(
-            f"{self.url}?symbol={symbol}",
+            f"{self.url}?symbol={quote(symbol, safe='')}",
             headers={"User-Agent": "crypto-futures-monitor/0.1"},
         )
         with urlopen(request, timeout=10) as response:
@@ -91,7 +92,7 @@ class BinanceFuturesTickerPoller:
 
     def _fetch_open_interest(self, symbol: str) -> float:
         request = Request(
-            f"{self.open_interest_url}?symbol={symbol}",
+            f"{self.open_interest_url}?symbol={quote(symbol, safe='')}",
             headers={"User-Agent": "crypto-futures-monitor/0.1"},
         )
         with urlopen(request, timeout=10) as response:
@@ -100,7 +101,7 @@ class BinanceFuturesTickerPoller:
 
     def _fetch_funding_rate(self, symbol: str) -> float:
         request = Request(
-            f"{self.premium_index_url}?symbol={symbol}",
+            f"{self.premium_index_url}?symbol={quote(symbol, safe='')}",
             headers={"User-Agent": "crypto-futures-monitor/0.1"},
         )
         with urlopen(request, timeout=10) as response:

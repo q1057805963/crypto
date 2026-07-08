@@ -158,6 +158,48 @@ class SourceManagerTests(unittest.TestCase):
         asyncio.run(run_test())
 
 
+    def test_activate_filters_symbols_not_on_active_exchange(self) -> None:
+        activations = []
+
+        class FakeDirectories:
+            def filter_for_exchange(self, exchange: str, symbols: list[str]):
+                if exchange.startswith("okx"):
+                    allowed = [s for s in symbols if s != "BINANCEONLYUSDT"]
+                else:
+                    allowed = list(symbols)
+                return allowed, [s for s in symbols if s not in allowed]
+
+        def fake_build_source_context(config, symbols, spec):
+            activations.append((spec.exchange, list(symbols)))
+            return SourceContext(
+                exchange=spec.exchange,
+                data_source=spec.data_source,
+                stream=FakeStream(),
+                microstructure_state=FakeMicrostructureState(),
+                microstructure_stream=None,
+            )
+
+        async def run_test() -> None:
+            manager = SourceFailoverManager(
+                config={},
+                specs=[SourceSpec("binance", "websocket"), SourceSpec("okx_swap", "websocket")],
+                symbols=["BTCUSDT", "BINANCEONLYUSDT"],
+                stale_after_seconds=20,
+                switch_cooldown_seconds=45,
+                instrument_directories=FakeDirectories(),
+            )
+            with patch("monitor.source_manager.build_source_context", fake_build_source_context):
+                await manager._activate(0)
+                self.assertEqual(activations[-1], ("binance", ["BTCUSDT", "BINANCEONLYUSDT"]))
+
+                await manager._activate(1)
+                self.assertEqual(activations[-1], ("okx_swap", ["BTCUSDT"]))
+                # 完整列表保持不变，切回币安时恢复订阅
+                self.assertEqual(manager.get_symbols(), ["BTCUSDT", "BINANCEONLYUSDT"])
+                await manager.close()
+
+        asyncio.run(run_test())
+
     def test_retries_primary_source_after_interval(self) -> None:
         def fake_build_source_context(config, symbols, spec):
             return SourceContext(

@@ -298,29 +298,37 @@ class BinanceFuturesMicrostructureStream:
 
     def set_symbols(self, symbols: list[str]) -> None:
         self.symbols = [symbol.upper() for symbol in symbols]
+        # 中文合约名无法放进 URL 的 streams 参数，改为连接后发 SUBSCRIBE 消息
         streams = []
         for symbol in self.symbols:
             symbol_name = symbol.lower()
             streams.append(f"{symbol_name}@depth{self.depth_levels}@{self.depth_interval}")
             streams.append(f"{symbol_name}@forceOrder")
-        self.url = f"wss://fstream.binance.com/stream?streams={'/'.join(streams)}"
+        self._streams = streams
+        self.url = "wss://fstream.binance.com/stream"
 
     async def run(self, state: MarketMicrostructureState) -> None:
         backoff_seconds = 1
         while True:
-            url = self.url
+            streams = self._streams
             try:
                 logging.info("Connecting to Binance Futures microstructure streams")
                 async with websockets.connect(
-                    url,
+                    self.url,
                     ping_interval=20,
                     ping_timeout=20,
                     close_timeout=5,
                     max_queue=4096,
                 ) as websocket:
+                    await websocket.send(
+                        json.dumps(
+                            {"method": "SUBSCRIBE", "params": streams, "id": 1},
+                            ensure_ascii=False,
+                        )
+                    )
                     backoff_seconds = 1
                     while True:
-                        if url != self.url:
+                        if streams != self._streams:
                             logging.info("Microstructure symbol list changed, reconnecting stream")
                             break
 

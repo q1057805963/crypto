@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+from urllib.request import getproxies
 
 import yaml
 
@@ -15,6 +16,7 @@ from monitor.ai_analysis import AIAnalyzer, summarize_analysis
 from monitor.alert import ConsoleAlert
 from monitor.anomaly import AnomalyDetector, AnomalyEvent
 from monitor.dashboard import DashboardServer, DashboardState
+from monitor.instruments import InstrumentDirectories
 from monitor.source_manager import (
     SourceFailoverManager,
     build_source_specs,
@@ -239,6 +241,26 @@ def apply_env_overrides(config: dict) -> dict:
     return config
 
 
+def sync_system_proxies() -> None:
+    """把系统代理（Windows 注册表等）同步到环境变量。
+
+    urllib 会自动读取系统代理，但 websockets 库只认 HTTP(S)_PROXY 环境变量；
+    不同步的话所有 WebSocket 都是直连，在需要代理的网络下必然失败。
+    """
+    proxies = getproxies()
+    for scheme, env_name in (("http", "HTTP_PROXY"), ("https", "HTTPS_PROXY")):
+        url = proxies.get(scheme)
+        if not url:
+            continue
+        if os.environ.get(env_name) or os.environ.get(env_name.lower()):
+            continue
+        os.environ[env_name] = url
+        logging.info("Using system proxy for %s: %s", scheme, url)
+    bypass = proxies.get("no")
+    if bypass and not os.environ.get("NO_PROXY") and not os.environ.get("no_proxy"):
+        os.environ["NO_PROXY"] = bypass
+
+
 async def run(config: dict) -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -246,6 +268,7 @@ async def run(config: dict) -> None:
         datefmt="%H:%M:%S",
         force=True,
     )
+    sync_system_proxies()
     # 小核 VPS 默认线程池只有 cpu+4 个工人，强平轮询/Telegram/AI 并发时会排队
     asyncio.get_running_loop().set_default_executor(
         ThreadPoolExecutor(max_workers=16, thread_name_prefix="cfm-io")
@@ -481,6 +504,8 @@ async def run(config: dict) -> None:
     configured_data_source = str(config.get("data_source", "auto")).lower()
     data_source = normalized_data_source(exchange, configured_data_source)
     source_specs = build_source_specs(config, exchange, data_source)
+    instrument_directories = InstrumentDirectories()
+    instrument_directories.start_background_refresh()
     dashboard_state = DashboardState(
         runtime_symbols,
         data_source=source_specs[0].data_source,
@@ -508,6 +533,7 @@ async def run(config: dict) -> None:
             failover_config.get("primary_retry_seconds", 300)
         ),
         on_switch=handle_source_switch,
+        instrument_directories=instrument_directories,
     )
 
     dashboard = None
@@ -557,6 +583,7 @@ async def run(config: dict) -> None:
             period_liquidation_provider=source_manager.liquidation_summary,
             source_health_provider=source_manager.source_health,
             alert_store=store,
+            instrument_directories=instrument_directories,
         )
         dashboard.start()
         dashboard.set_event_loop(asyncio.get_running_loop())
