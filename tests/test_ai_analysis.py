@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from time import time
 
@@ -7,11 +8,59 @@ from monitor.ai_analysis import AIAnalyzer
 class AIAnalyzerTests(unittest.TestCase):
     def test_cache_is_scoped_by_symbol_and_period(self) -> None:
         analyzer = AIAnalyzer({})
-        analyzer._cache[analyzer._cache_key("BTCUSDT", "5m")] = (time(), "five minute view")
+        analyzer._cache[analyzer._cache_key("BTCUSDT", "5m")] = (time(), "five minute view", None)
 
         self.assertEqual(analyzer.get_cached("BTCUSDT", "5m"), "five minute view")
         self.assertIsNone(analyzer.get_cached("BTCUSDT", "1h"))
         self.assertIsNone(analyzer.get_cached("ETHUSDT", "5m"))
+
+    def test_get_cached_rejects_entry_when_snapshot_data_differs(self) -> None:
+        analyzer = AIAnalyzer({})
+        snapshot = {"symbol": "DOGEUSDT", "price": 0.07242, "score": 9.2, "bias": "偏空"}
+        fingerprint = analyzer.snapshot_fingerprint(snapshot, period="alert")
+        self.assertIsNotNone(fingerprint)
+        analyzer._cache[analyzer._cache_key("DOGEUSDT", "alert")] = (
+            time(),
+            "stale stampede view",
+            fingerprint,
+        )
+
+        self.assertEqual(
+            analyzer.get_cached("DOGEUSDT", "alert", snapshot_data=snapshot),
+            "stale stampede view",
+        )
+        changed = dict(snapshot, price=0.07262, score=0.0, bias="观察")
+        self.assertIsNone(analyzer.get_cached("DOGEUSDT", "alert", snapshot_data=changed))
+        # 不带数据时保持旧行为：只按 TTL 返回最近一次分析（仅用于展示）
+        self.assertEqual(analyzer.get_cached("DOGEUSDT", "alert"), "stale stampede view")
+
+    def test_analyze_regenerates_when_snapshot_changes_within_ttl(self) -> None:
+        analyzer = AIAnalyzer(
+            {
+                "enabled": True,
+                "api_key": "secret",
+                "activation_threshold": 1,
+                "retry_cooldown_seconds": 0,
+            }
+        )
+        calls: list[str] = []
+
+        def fake_call_prompt(prompt: str, **kwargs) -> str:
+            calls.append(prompt)
+            return f"analysis #{len(calls)}"
+
+        analyzer._call_prompt = fake_call_prompt
+        snapshot = {"symbol": "DOGEUSDT", "price": 0.07242, "score": 9.2, "bias": "偏空"}
+        changed = dict(snapshot, price=0.07262, score=5.0, bias="观察")
+
+        first = asyncio.run(analyzer.analyze("DOGEUSDT", snapshot, period="alert"))
+        repeated = asyncio.run(analyzer.analyze("DOGEUSDT", snapshot, period="alert"))
+        refreshed = asyncio.run(analyzer.analyze("DOGEUSDT", changed, period="alert"))
+
+        self.assertEqual(first, "analysis #1")
+        self.assertEqual(repeated, "analysis #1")
+        self.assertEqual(refreshed, "analysis #2")
+        self.assertEqual(len(calls), 2)
 
     def test_trigger_status_reports_score_threshold_match(self) -> None:
         analyzer = AIAnalyzer(
@@ -151,7 +200,7 @@ class AIAnalyzerTests(unittest.TestCase):
         self.assertIn("多周期偏多共振", prompt)
         self.assertIn("核心判断", prompt)
         self.assertIn("失效边界", prompt)
-        self.assertIn("不要固定套用主假设/延续条件/失效条件/反向风险/观察计划这类模板标题", prompt)
+        self.assertIn("不用编号、小标题和列表符号", prompt)
 
     def test_build_prompt_uses_alert_style_for_alert_period(self) -> None:
         analyzer = AIAnalyzer({})

@@ -371,11 +371,12 @@ async def run(config: dict) -> None:
         analyzer = analyzer or ai_analyzer
         if not analyzer.enabled or not analyzer.api_key or not snapshot_data:
             return None
-        cached = analyzer.get_cached(symbol, period=period)
+        cached = analyzer.get_cached(symbol, period=period, snapshot_data=snapshot_data)
         if cached:
             return cached
         symbol = symbol.upper()
-        task_key = (id(analyzer), f"{symbol}::{period or ''}")
+        fingerprint = analyzer.snapshot_fingerprint(snapshot_data, period=period)
+        task_key = (id(analyzer), f"{symbol}::{period or ''}::{fingerprint or 'nofp'}")
         existing = analysis_tasks.get(task_key)
         if existing and not existing.done():
             return await existing
@@ -414,7 +415,7 @@ async def run(config: dict) -> None:
                     return result
             except asyncio.TimeoutError:
                 logging.warning("AI analysis timeout for %s during alert enrichment", symbol)
-                cached = analyzer.get_cached(symbol, period="alert")
+                cached = analyzer.get_cached(symbol, period="alert", snapshot_data=ai_snapshot)
                 if cached:
                     return cached
         return None

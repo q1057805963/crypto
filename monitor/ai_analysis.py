@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -48,7 +49,8 @@ def summarize_analysis(text: str, max_items: int = 3, max_chars: int = 110) -> l
 class AIAnalyzer:
     def __init__(self, config: dict) -> None:
         self._apply(config)
-        self._cache: dict[str, tuple[float, str]] = {}
+        # cache entry: (timestamp, text, prompt_fingerprint)
+        self._cache: dict[str, tuple[float, str, str | None]] = {}
         self._last_attempt: dict[str, float] = {}
         self._last_error: str | None = None
         self._lock = threading.Lock()
@@ -92,12 +94,52 @@ class AIAnalyzer:
             self._last_attempt.clear()
             self._last_error = None
 
-    def get_cached(self, symbol: str, period: str | None = None) -> str | None:
-        with self._lock:
-            entry = self._cache.get(self._cache_key(symbol, period))
-            if entry and time() - entry[0] < self.cache_ttl:
-                return entry[1]
+    def snapshot_fingerprint(
+        self,
+        snapshot_data: dict,
+        *,
+        timeframe_data: dict | None = None,
+        confluence_data: dict | None = None,
+        period: str | None = None,
+    ) -> str | None:
+        """对将发给模型的 prompt 取哈希：任何模型可见的数据变化都会改变指纹。"""
+        try:
+            prompt = self._build_prompt(snapshot_data, timeframe_data, period, confluence_data)
+        except Exception:
             return None
+        return hashlib.sha1(prompt.encode("utf-8")).hexdigest()
+
+    def _cached_text(self, cache_key: str, fingerprint: str | None) -> str | None:
+        with self._lock:
+            entry = self._cache.get(cache_key)
+        if not entry or time() - entry[0] >= self.cache_ttl:
+            return None
+        if fingerprint is not None:
+            stored = entry[2] if len(entry) > 2 else None
+            if stored != fingerprint:
+                return None
+        return entry[1]
+
+    def get_cached(
+        self,
+        symbol: str,
+        period: str | None = None,
+        *,
+        snapshot_data: dict | None = None,
+        timeframe_data: dict | None = None,
+        confluence_data: dict | None = None,
+    ) -> str | None:
+        fingerprint = None
+        if snapshot_data is not None:
+            fingerprint = self.snapshot_fingerprint(
+                snapshot_data,
+                timeframe_data=timeframe_data,
+                confluence_data=confluence_data,
+                period=period,
+            )
+            if not fingerprint:
+                return None
+        return self._cached_text(self._cache_key(symbol, period), fingerprint)
 
     def get_last_error(self) -> str | None:
         with self._lock:
@@ -133,8 +175,17 @@ class AIAnalyzer:
                 self._last_error = "ai trigger not met"
             return None
 
+        try:
+            prompt = self._build_prompt(snapshot_data, timeframe_data, period, confluence_data)
+        except Exception as exc:
+            with self._lock:
+                self._last_error = str(exc)
+            logging.warning("AI analysis failed: %s", exc)
+            return None
+        fingerprint = hashlib.sha1(prompt.encode("utf-8")).hexdigest()
+
         cache_key = self._cache_key(symbol, period)
-        cached = self.get_cached(symbol, period)
+        cached = self._cached_text(cache_key, fingerprint)
         if cached and not force:
             return cached
 
@@ -148,16 +199,10 @@ class AIAnalyzer:
 
         with self._lock:
             self._last_error = None
-        result = await asyncio.to_thread(
-            self._call_api,
-            snapshot_data,
-            timeframe_data,
-            confluence_data,
-            period,
-        )
+        result = await asyncio.to_thread(self._call_api, prompt)
         if result:
             with self._lock:
-                self._cache[cache_key] = (time(), result)
+                self._cache[cache_key] = (time(), result, fingerprint)
         return result
 
     async def answer_question(
@@ -191,15 +236,8 @@ class AIAnalyzer:
             confluence_data,
         )
 
-    def _call_api(
-        self,
-        data: dict,
-        timeframe_data: dict | None = None,
-        confluence_data: dict | None = None,
-        period: str | None = None,
-    ) -> str | None:
+    def _call_api(self, prompt: str) -> str | None:
         try:
-            prompt = self._build_prompt(data, timeframe_data, period, confluence_data)
             return self._call_prompt(
                 prompt,
                 system_prompt=self._system_prompt(),
