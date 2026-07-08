@@ -38,6 +38,32 @@
     const authScreen = document.getElementById("auth-screen");
     const authTitle = document.getElementById("auth-title");
     const authHint = document.getElementById("auth-hint");
+
+    // 独立于轮询刷新的通知层：状态栏文字每次 refresh 都会被覆盖，
+    // 数据源切换/标的校验这类需要被看到的提示统一走 toast
+    const toastStackEl = document.createElement("div");
+    toastStackEl.id = "toast-stack";
+    document.body.appendChild(toastStackEl);
+
+    function showToast(message, level = "info", durationMs = 10000) {
+      if (!message) return;
+      const item = document.createElement("div");
+      item.className = `toast toast-${level}`;
+      const text = document.createElement("span");
+      text.className = "toast-text";
+      text.textContent = message;
+      const close = document.createElement("button");
+      close.type = "button";
+      close.className = "toast-close";
+      close.textContent = "×";
+      close.addEventListener("click", () => item.remove());
+      item.appendChild(text);
+      item.appendChild(close);
+      toastStackEl.appendChild(item);
+      while (toastStackEl.children.length > 4) toastStackEl.firstChild.remove();
+      if (durationMs > 0) setTimeout(() => item.remove(), durationMs);
+    }
+    let lastSourceNote = "";
     const authUsername = document.getElementById("auth-username");
     const authPassword = document.getElementById("auth-password");
     const authError = document.getElementById("auth-error");
