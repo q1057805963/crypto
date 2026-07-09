@@ -197,6 +197,21 @@ class DashboardServer:
         self._auth_attempts: dict[str, list[float]] = {}
         self.timeframe_analysis = TimeframeAnalysisService()
 
+    def _exchange_for_symbol(self, symbol: str) -> str:
+        source = self.state.get_source()
+        default_exchange = str(source.get("exchange", "binance_usdm"))
+        if not self.instrument_directories:
+            return default_exchange
+        from monitor.source_manager import is_okx_exchange
+        directory = self.instrument_directories._directory_for(default_exchange)
+        if directory.supports(symbol.upper()) is not False:
+            return default_exchange
+        other_exchange = "okx_swap" if not is_okx_exchange(default_exchange) else "binance"
+        other_dir = self.instrument_directories._directory_for(other_exchange)
+        if other_dir.supports(symbol.upper()) is not False:
+            return other_exchange
+        return default_exchange
+
     def set_event_loop(self, loop) -> None:
         self._event_loop = loop
 
@@ -797,11 +812,11 @@ class DashboardServer:
                     self._send_json({"ok": False, "error": "unsupported period"}, status=400)
                     return
                 try:
-                    source = state.get_source()
+                    exchange = server_ref._exchange_for_symbol(symbol)
                     analysis = server_ref.timeframe_analysis.analyze(
                         symbol=symbol,
                         period=period,
-                        exchange=str(source.get("exchange", "binance_usdm")),
+                        exchange=exchange,
                         force=force,
                     )
                     if server_ref.period_liquidation_provider:
@@ -825,10 +840,10 @@ class DashboardServer:
                     self._send_json({"ok": False, "error": "symbol required"}, status=400)
                     return
                 try:
-                    source = state.get_source()
+                    exchange = server_ref._exchange_for_symbol(symbol)
                     analysis = server_ref.timeframe_analysis.confluence(
                         symbol=symbol,
-                        exchange=str(source.get("exchange", "binance_usdm")),
+                        exchange=exchange,
                         force=force,
                     )
                     self._send_json({"ok": True, "analysis": analysis})
@@ -885,12 +900,15 @@ class DashboardServer:
 
             def _send_json(self, data: dict, status: int = 200) -> None:
                 body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                    pass
 
             def log_message(self, format: str, *args: object) -> None:
                 return
@@ -900,12 +918,15 @@ class DashboardServer:
                 self._send_bytes(body, content_type)
 
             def _send_bytes(self, body: bytes, content_type: str) -> None:
-                self.send_response(200)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                    pass
 
         return Handler
 

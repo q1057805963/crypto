@@ -172,6 +172,9 @@ def build_source_context(config: dict, symbols: list[str], spec: SourceSpec) -> 
             funding_poll_interval_seconds=float(
                 config.get("funding_poll_interval_seconds", 60)
             ),
+            liquidation_poll_interval_seconds=float(
+                microstructure_config.get("rest_liquidation_poll_interval_seconds", 15)
+            ),
             microstructure_state=microstructure_state,
         )
 
@@ -215,6 +218,7 @@ class SourceFailoverManager:
         self._last_trade_at = 0.0
         self._last_switch_at = 0.0
         self._reload_requested = False
+        self._supplement_task: asyncio.Task | None = None
 
     @property
     def active_exchange(self) -> str:
@@ -270,6 +274,19 @@ class SourceFailoverManager:
             **health,
         }
 
+    def exchange_for_symbol(self, symbol: str) -> str:
+        """返回该标的应使用的交易所（用于 K 线等按标的选源场景）。"""
+        symbol = str(symbol).upper()
+        if not self.instrument_directories:
+            return self.active_exchange
+        primary_exchange = self.active_exchange
+        if self.instrument_directories._directory_for(primary_exchange).supports(symbol) is not False:
+            return primary_exchange
+        other = "binance" if is_okx_exchange(primary_exchange) else "okx_swap"
+        if self.instrument_directories._directory_for(other).supports(symbol) is not False:
+            return other
+        return primary_exchange
+
     def get_symbols(self) -> list[str]:
         with self._lock:
             return list(self.symbols)
@@ -305,9 +322,10 @@ class SourceFailoverManager:
         )
 
     async def _stop_active(self) -> None:
-        tasks = [task for task in (self._reader_task, self._micro_task) if task]
+        tasks = [task for task in (self._reader_task, self._micro_task, self._supplement_task) if task]
         self._reader_task = None
         self._micro_task = None
+        self._supplement_task = None
         for task in tasks:
             task.cancel()
         if tasks:
@@ -318,6 +336,7 @@ class SourceFailoverManager:
         self._active_index = index
         spec = self.specs[index]
         symbols = self.get_symbols()
+        skipped: list[str] = []
         if self.instrument_directories:
             allowed, skipped = self.instrument_directories.filter_for_exchange(
                 spec.exchange, symbols
@@ -345,6 +364,7 @@ class SourceFailoverManager:
                     self._active_context.microstructure_state
                 )
             )
+        self._start_supplement(spec, skipped if self.instrument_directories else [], current_nonce)
         if self.on_switch:
             self.on_switch(
                 self._active_context.exchange,
@@ -412,6 +432,79 @@ class SourceFailoverManager:
                     await self._switch_to_next(
                         f"no trades for {int(time.monotonic() - self._last_trade_at)}s"
                     )
+
+    def _start_supplement(self, primary_spec: SourceSpec, skipped: list[str], nonce: int) -> None:
+        if not skipped:
+            return
+        if is_okx_exchange(primary_spec.exchange):
+            supplement_exchange = "binance"
+        else:
+            supplement_exchange = "okx_swap"
+        if self.instrument_directories:
+            can_supplement, _ = self.instrument_directories.filter_for_exchange(
+                supplement_exchange, skipped
+            )
+        else:
+            can_supplement = skipped
+        if not can_supplement:
+            return
+
+        poll_interval = float(self.config.get("rest_poll_interval_seconds", 5))
+        per_symbol_delay = int(self.config.get("rest_per_symbol_delay_ms", 150))
+        oi_interval = float(self.config.get("oi_poll_interval_seconds", 30))
+        funding_interval = float(self.config.get("funding_poll_interval_seconds", 60))
+
+        if is_okx_exchange(supplement_exchange):
+            micro_config = self.config.get("microstructure", {})
+            poller = OkxSwapTickerPoller(
+                can_supplement,
+                poll_interval_seconds=poll_interval,
+                per_symbol_delay_ms=per_symbol_delay,
+                oi_poll_interval_seconds=oi_interval,
+                funding_poll_interval_seconds=funding_interval,
+                depth_poll_interval_seconds=float(
+                    micro_config.get("rest_depth_poll_interval_seconds", poll_interval)
+                ),
+                liquidation_poll_interval_seconds=float(
+                    micro_config.get("rest_liquidation_poll_interval_seconds", 15)
+                ),
+                microstructure_state=(
+                    self._active_context.microstructure_state
+                    if self._active_context and micro_config.get("enabled", True)
+                    else None
+                ),
+            )
+        else:
+            micro_config = self.config.get("microstructure", {})
+            poller = BinanceFuturesTickerPoller(
+                can_supplement,
+                poll_interval_seconds=poll_interval,
+                per_symbol_delay_ms=per_symbol_delay,
+                oi_poll_interval_seconds=oi_interval,
+                funding_poll_interval_seconds=funding_interval,
+                liquidation_poll_interval_seconds=float(
+                    micro_config.get("rest_liquidation_poll_interval_seconds", 15)
+                ),
+                microstructure_state=(
+                    self._active_context.microstructure_state
+                    if self._active_context
+                    else None
+                ),
+            )
+
+        queue = self._queue
+
+        async def _supplement_pump() -> None:
+            async for trade in poller.listen():
+                await queue.put((nonce, trade))
+
+        self._supplement_task = asyncio.create_task(_supplement_pump())
+        supplement_label = source_label(supplement_exchange, "rest")
+        logging.info(
+            "Supplementary source: %s for %s",
+            supplement_label,
+            ", ".join(can_supplement),
+        )
 
     async def close(self) -> None:
         await self._stop_active()

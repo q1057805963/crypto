@@ -2411,6 +2411,10 @@
         lastEvents = data.events || [];
         renderEvents(lastEvents);
         const timeText = new Date().toLocaleTimeString();
+        if (data.source_note && data.source_note !== lastSourceNote) {
+          showToast(data.source_note, "warn", 15000);
+        }
+        lastSourceNote = data.source_note || "";
         updatedEl.textContent = data.source_note ? `${data.source_note} · ${timeText}` : `已更新 ${timeText}`;
       } catch (error) {
         updatedEl.textContent = "面板连接中断";
@@ -2435,7 +2439,8 @@
         if (!response.ok || !data.ok) throw new Error(data.error || "保存失败");
         inputTouched = false;
         await refresh();
-        updatedEl.textContent = data.warning ? `监控列表已更新（${data.warning}）` : "监控列表已更新";
+        updatedEl.textContent = "监控列表已更新";
+        if (data.warning) showToast(data.warning, "warn", 15000);
       } catch (error) {
         updatedEl.textContent = error.message || "保存失败";
       } finally {

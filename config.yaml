@@ -1,4 +1,4 @@
-exchange: binance
+exchange: okx_swap
 data_source: websocket
 failover:
   enabled: true
@@ -6,12 +6,10 @@ failover:
   switch_cooldown_seconds: 45
   primary_retry_seconds: 900
   candidates:
-  - exchange: binance
+  - exchange: okx_swap
     data_source: websocket
   - exchange: binance
     data_source: rest
-  - exchange: okx_swap
-    data_source: websocket
   - exchange: okx_swap
     data_source: rest
 rest_poll_interval_seconds: 5

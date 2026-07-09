@@ -16,6 +16,7 @@ class BinanceFuturesTickerPoller:
         per_symbol_delay_ms: int,
         oi_poll_interval_seconds: float,
         funding_poll_interval_seconds: float,
+        liquidation_poll_interval_seconds: float = 15.0,
         microstructure_state=None,
     ) -> None:
         self._lock = threading.Lock()
@@ -28,11 +29,13 @@ class BinanceFuturesTickerPoller:
         self.premium_index_url = "https://fapi.binance.com/fapi/v1/premiumIndex"
         self.oi_poll_interval_seconds = oi_poll_interval_seconds
         self.funding_poll_interval_seconds = funding_poll_interval_seconds
+        self.liquidation_poll_interval_seconds = liquidation_poll_interval_seconds
         self._last: dict[str, dict] = {}
         self._open_interest: dict[str, float] = {}
         self._funding_rate: dict[str, float] = {}
         self._last_oi_poll_at: dict[str, float] = {}
         self._last_funding_poll_at: dict[str, float] = {}
+        self._last_liquidation_mark_at: dict[str, float] = {}
         self.set_symbols(symbols)
 
     def set_symbols(self, symbols: list[str]) -> None:
@@ -89,6 +92,13 @@ class BinanceFuturesTickerPoller:
                 self._last_funding_poll_at[symbol] = now
             except Exception as exc:
                 logging.warning("Funding rate poll failed for %s: %s", symbol, exc)
+
+        if (
+            self.microstructure_state
+            and now - self._last_liquidation_mark_at.get(symbol, 0) >= self.liquidation_poll_interval_seconds
+        ):
+            self._last_liquidation_mark_at[symbol] = now
+            self.microstructure_state.mark_liquidation_feed(symbol, now)
 
     def _fetch_open_interest(self, symbol: str) -> float:
         request = Request(

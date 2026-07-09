@@ -482,9 +482,11 @@ async def run(config: dict) -> None:
     followup_timeframes = TimeframeAnalysisService(cache_ttl_seconds=0)
 
     def resolve_alert_followup(request: dict) -> dict | None:
+        symbol = str(request.get("symbol", ""))
+        exchange = source_manager.exchange_for_symbol(symbol)
         return followup_timeframes.resolve_followup(
-            symbol=str(request.get("symbol", "")),
-            exchange=source_manager.active_exchange,
+            symbol=symbol,
+            exchange=exchange,
             horizon_minutes=int(request.get("horizon_minutes") or 0),
             event_time=float(request.get("event_time") or 0),
             target_time=float(request.get("target_time") or 0),
@@ -505,6 +507,7 @@ async def run(config: dict) -> None:
     data_source = normalized_data_source(exchange, configured_data_source)
     source_specs = build_source_specs(config, exchange, data_source)
     instrument_directories = InstrumentDirectories()
+    instrument_directories.refresh_all()
     instrument_directories.start_background_refresh()
     dashboard_state = DashboardState(
         runtime_symbols,
@@ -622,7 +625,7 @@ async def run(config: dict) -> None:
             symbol: str,
             period: str | None,
         ) -> tuple[dict | None, dict | None]:
-            exchange = source_manager.active_exchange
+            exchange = source_manager.exchange_for_symbol(symbol)
             timeframe_data = None
             confluence_data = None
             if period and period in TIMEFRAME_CONFIG:
