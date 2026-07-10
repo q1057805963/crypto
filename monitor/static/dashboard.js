@@ -98,6 +98,9 @@
     let pendingDetailRefresh = false;
     let pendingAIRefreshSymbol = null;
     let symbolOrderDrag = null;
+    // K 线图跨渲染持久化：renderDetail 每次用 innerHTML 重建面板，
+    // canvas 图表不能跟着重建，只把 host 节点搬回新容器并按需更新数据
+    const klineState = { key: null, chart: null, series: null, host: null, legend: null, lastTime: 0, lastClose: null, count: 0 };
     const DETAIL_INTERACTION_LOCK_MS = 900;
     const AI_ANALYSIS_CACHE_VERSION = "scenario-v3";
     const TIMEFRAME_OPTIONS = ["5m", "15m", "1h", "4h", "1d"];
@@ -510,6 +513,15 @@
       });
     }
 
+    function fmtVolume(value) {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return "--";
+      if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+      if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+      return Math.round(n).toString();
+    }
+
     function formatAge(seconds) {
       const value = Number(seconds);
       if (!Number.isFinite(value)) return "暂无";
@@ -707,6 +719,193 @@
           </svg>
         </div>
       `;
+    }
+
+    function destroyKlineChart() {
+      if (klineState.chart) {
+        klineState.chart.remove();
+      }
+      if (klineState.host && klineState.host.parentNode) {
+        klineState.host.parentNode.removeChild(klineState.host);
+      }
+      if (klineState.legend && klineState.legend.parentNode) {
+        klineState.legend.parentNode.removeChild(klineState.legend);
+      }
+      klineState.key = null;
+      klineState.chart = null;
+      klineState.series = null;
+      klineState.host = null;
+      klineState.legend = null;
+      klineState.lastTime = 0;
+      klineState.lastClose = null;
+      klineState.count = 0;
+    }
+
+    function klineCandleData(data) {
+      const times = data.time_series || [];
+      const opens = data.open_series || [];
+      const highs = data.high_series || [];
+      const lows = data.low_series || [];
+      const closes = data.price_series || [];
+      const tzOffset = new Date().getTimezoneOffset() * -60;
+      const candles = [];
+      for (let i = 0; i < times.length; i++) {
+        const open = opens[i];
+        const high = highs[i];
+        const low = lows[i];
+        const close = closes[i];
+        if (open == null || high == null || low == null || close == null) continue;
+        candles.push({ time: Math.round(times[i]) + tzOffset, open, high, low, close });
+      }
+      return candles;
+    }
+
+    function klinePricePrecision(candles) {
+      if (!candles.length) return 2;
+      const sample = candles[candles.length - 1].close;
+      if (sample >= 1000) return 1;
+      if (sample >= 100) return 2;
+      if (sample >= 1) return 4;
+      const s = sample.toString();
+      const dot = s.indexOf(".");
+      if (dot < 0) return 2;
+      const decimals = s.length - dot - 1;
+      return Math.min(Math.max(decimals, 4), 8);
+    }
+
+    function klineMinMove(candles) {
+      const precision = klinePricePrecision(candles);
+      return 1 / Math.pow(10, precision);
+    }
+
+    function ensureKlineChart(key, containerId, data, livePrice) {
+      const container = document.getElementById(containerId);
+      if (!container) return;
+      if (typeof LightweightCharts === "undefined") return;
+      const candles = klineCandleData(data);
+      if (candles.length < 2) {
+        destroyKlineChart();
+        container.innerHTML = chartEmptyHtml("K 线样本不足，等待下一次周期刷新");
+        return;
+      }
+
+      // 用实时价格更新最后一根（未确认）K 线
+      if (livePrice && candles.length > 0) {
+        const last = candles[candles.length - 1];
+        last.close = livePrice;
+        if (livePrice > last.high) last.high = livePrice;
+        if (livePrice < last.low) last.low = livePrice;
+      }
+
+      if (klineState.key !== key || !klineState.chart) {
+        destroyKlineChart();
+        const host = document.createElement("div");
+        host.className = "kline-host";
+        container.appendChild(host);
+        const legend = document.createElement("div");
+        legend.className = "kline-legend";
+        container.appendChild(legend);
+        const isDark = document.documentElement.getAttribute("data-theme") === "dark";
+        const chart = LightweightCharts.createChart(host, {
+          autoSize: true,
+          layout: {
+            background: { type: "solid", color: "transparent" },
+            textColor: isDark ? "#8a8fa3" : "#6b7080",
+            fontFamily: "inherit",
+            fontSize: 10,
+          },
+          grid: {
+            vertLines: { visible: false },
+            horzLines: { color: isDark ? "rgba(255,255,255,0.04)" : "rgba(0,0,0,0.04)" },
+          },
+          crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+          rightPriceScale: {
+            borderVisible: false,
+            scaleMargins: { top: 0.08, bottom: 0.08 },
+            minimumWidth: 90,
+          },
+          timeScale: {
+            borderVisible: false,
+            timeVisible: true,
+            secondsVisible: false,
+            tickMarkFormatter: (time, tickMarkType) => {
+              const d = new Date(time * 1000);
+              const hh = d.getUTCHours().toString().padStart(2, "0");
+              const mm = d.getUTCMinutes().toString().padStart(2, "0");
+              if (tickMarkType >= 3) return hh + ":" + mm;
+              const y = d.getUTCFullYear();
+              const mo = String(d.getUTCMonth() + 1).padStart(2, "0");
+              const dd = String(d.getUTCDate()).padStart(2, "0");
+              if (tickMarkType >= 2) return mo + "-" + dd;
+              return y + "-" + mo + "-" + dd;
+            },
+          },
+          localizationOptions: {
+            timeFormatter: (time) => {
+              const d = new Date(time * 1000);
+              const y = d.getUTCFullYear();
+              const mo = String(d.getUTCMonth() + 1).padStart(2, "0");
+              const dd = String(d.getUTCDate()).padStart(2, "0");
+              const hh = d.getUTCHours().toString().padStart(2, "0");
+              const mm = d.getUTCMinutes().toString().padStart(2, "0");
+              return y + "-" + mo + "-" + dd + " " + hh + ":" + mm;
+            },
+          },
+          handleScroll: { mouseWheel: true, pressedMouseMove: true },
+          handleScale: { mouseWheel: true, pinch: true },
+        });
+        const series = chart.addCandlestickSeries({
+          upColor: "#26a69a",
+          downColor: "#ef5350",
+          borderUpColor: "#26a69a",
+          borderDownColor: "#ef5350",
+          wickUpColor: "#26a69a",
+          wickDownColor: "#ef5350",
+          priceFormat: {
+            type: "price",
+            precision: klinePricePrecision(candles),
+            minMove: klineMinMove(candles),
+          },
+        });
+        series.setData(candles);
+        chart.timeScale().fitContent();
+
+        chart.subscribeCrosshairMove((param) => {
+          if (!param || !param.time || !param.seriesData) {
+            legend.innerHTML = "";
+            return;
+          }
+          const d = param.seriesData.get(series);
+          if (!d) { legend.innerHTML = ""; return; }
+          const cls = d.close >= d.open ? "kl-up" : "kl-dn";
+          const prec = klinePricePrecision(candles);
+          const fmt = (v) => v.toFixed(prec);
+          const pct = ((d.close - d.open) / d.open * 100).toFixed(2);
+          const sign = pct >= 0 ? "+" : "";
+          const dt = new Date(param.time * 1000);
+          const timeStr = dt.getUTCFullYear() + "-" + String(dt.getUTCMonth() + 1).padStart(2, "0") + "-" + String(dt.getUTCDate()).padStart(2, "0") + " " + dt.getUTCHours().toString().padStart(2, "0") + ":" + dt.getUTCMinutes().toString().padStart(2, "0");
+          legend.innerHTML = `<span class="${cls}">${timeStr} O:${fmt(d.open)} H:${fmt(d.high)} L:${fmt(d.low)} C:${fmt(d.close)} ${sign}${pct}%</span>`;
+        });
+
+        klineState.key = key;
+        klineState.chart = chart;
+        klineState.series = series;
+        klineState.host = host;
+        klineState.legend = legend;
+      } else {
+        if (klineState.host.parentNode !== container) {
+          container.appendChild(klineState.host);
+        }
+        if (klineState.legend && klineState.legend.parentNode !== container) {
+          container.appendChild(klineState.legend);
+        }
+        const last = candles[candles.length - 1];
+        klineState.series.update(last);
+      }
+      const last = candles[candles.length - 1];
+      klineState.count = candles.length;
+      klineState.lastTime = last.time;
+      klineState.lastClose = last.close;
     }
 
     function meterHtml(label, percent, display, tone = "blue", note = "") {
@@ -2254,6 +2453,17 @@
       pendingDetailRefresh = false;
       if (activeTab === "ai") pendingAIRefreshSymbol = null;
       restoreDetailScroll(symbol.symbol, preservedScroll, activeTab);
+      const klinePeriod = detailPeriod();
+      const klineData = klinePeriod !== "realtime" ? cachedTimeframeAnalysis(symbol.symbol, klinePeriod) : null;
+      if (klineData) {
+        const klineKey = `${symbol.symbol}::${klinePeriod}`;
+        const livePrice = Number(symbol.price) || null;
+        requestAnimationFrame(() => {
+          ensureKlineChart(klineKey, `kline-${symbol.symbol}-${klinePeriod}`, klineData, livePrice);
+        });
+      } else {
+        destroyKlineChart();
+      }
     }
 
     function renderEvents(events) {
@@ -3104,12 +3314,9 @@
         `;
       }
       const priceTone = valueClass(data.price_move_pct);
-      const markTone = valueClass(data.mark_move_pct);
-      const priceChart = lineChartSvg(data.price_series || [], priceTone);
-      const volumeChart = barChartSvg(data.volume_series || [], Number(data.volume_multiplier || 0) >= 1 ? "blue" : "mixed");
-      const markChart = (data.mark_price_series || []).length >= 2
-        ? lineChartSvg(data.mark_price_series, markTone)
-        : chartEmptyHtml("标记价序列不足");
+      const klineContainerId = `kline-${symbol.symbol}-${period}`;
+      const volumeLabel = `${fmtVolume(data.quote_volume)} USDT`;
+      const markLabel = data.mark_move_pct === null || data.mark_move_pct === undefined ? "--" : fmtPctMaybe(data.mark_move_pct, true);
       return `
         <section class="period-section">
           ${header}
@@ -3131,6 +3338,10 @@
               <div class="period-pill-value ${Number(data.volume_multiplier || 0) >= 1.5 ? "up" : "muted"}">${fmtNumber(data.volume_multiplier, 2)}x</div>
             </div>
             <div class="period-pill">
+              <div class="period-pill-label">成交额</div>
+              <div class="period-pill-value">${volumeLabel}</div>
+            </div>
+            <div class="period-pill">
               <div class="period-pill-label">标记价偏离</div>
               <div class="period-pill-value ${valueClass(data.mark_premium_bps)}">${data.mark_premium_bps === null || data.mark_premium_bps === undefined ? "--" : `${fmtSignedNumber(data.mark_premium_bps, 1)} bps`}</div>
             </div>
@@ -3139,10 +3350,12 @@
               <div class="period-pill-value ${confluenceTone(confluence)}">${confluence ? fmtNumber(confluence.score, 1) : "--"}</div>
             </div>
           </div>
-          <div class="visual-grid">
-            ${chartCard(`${data.period_label} 价格轨迹`, fmtPctMaybe(data.price_move_pct, true), priceChart, "span-2")}
-            ${chartCard(`${data.period_label} 成交额`, `${fmtNumber(data.quote_volume, 0)} USDT`, volumeChart)}
-            ${chartCard(`${data.period_label} 标记价`, data.mark_move_pct === null || data.mark_move_pct === undefined ? mutedValue() : fmtPctMaybe(data.mark_move_pct, true), markChart)}
+          <div class="chart-card kline-card">
+            <div class="chart-head">
+              <div class="chart-title">${esc(data.period_label)} K 线</div>
+              <div class="chart-meta">${fmtPctMaybe(data.price_move_pct, true)}${markLabel !== "--" ? ` · 标记价 ${markLabel}` : ""}</div>
+            </div>
+            <div class="kline-container" id="${klineContainerId}"></div>
           </div>
         </section>
       `;
